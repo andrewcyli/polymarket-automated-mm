@@ -1,6 +1,7 @@
 # Poly-Maker
 
-A market making bot for Polymarket prediction markets. This bot automates the process of providing liquidity to markets on Polymarket by maintaining orders on both sides of the book with configurable parameters. A summary of my experience running this bot is available [here](https://x.com/defiance_cr/status/1906774862254800934)
+Disclaimer, I forked and recreated these codes from the original creator @defiance_cr and continued to add features on top.
+A market making bot for Polymarket prediction markets. This bot automates the process of providing liquidity to markets on Polymarket by maintaining orders on both sides of the book with configurable parameters.
 
 ## Overview
 
@@ -65,7 +66,6 @@ Make sure your wallet has done at least one trade thru the UI so that the permis
 
 6. **Set up Google Sheets integration**:
    - Create a Google Service Account and download credentials to the main directory
-   - Copy the [sample Google Sheet](https://docs.google.com/spreadsheets/d/1Kt6yGY7CZpB75cLJJAdWo7LSp9Oz7pjqfuVWwgtn7Ns/edit?gid=1884499063#gid=1884499063)
    - Add your Google service account to the sheet with edit permissions
    - Update `SPREADSHEET_URL` in your `.env` file
 
