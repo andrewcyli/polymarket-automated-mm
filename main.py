@@ -51,7 +51,12 @@ def setup_session_logging(run_id: int, logger: logging.Logger):
 def apply_cc_config(config: BotConfig, cc_config: dict):
     """
     Apply Command Center config overrides to the v15 BotConfig.
-    Only overrides values that are explicitly set in the CC config.
+    
+    Hybrid Budget System (Option D):
+    - CC controls high-level budget: sessionBudget, budgetPerMarket
+    - mmOrderSize is auto-derived: budgetPerMarket / 2
+    - v15's internal strategy budget system is disabled (100% to MM)
+    - Only exposure caps are kept for safety
     """
     # Target assets - handle both list and comma-separated string
     target_assets = cc_config.get("targetAssets", [])
@@ -73,38 +78,63 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     if window_durations:
         config.timeframes = window_durations
 
-    # Bankroll
+    # ── Hybrid Budget System ────────────────────────────────────────
+    # CC provides: kellyBankroll, sessionBudget, budgetPerMarket
+    # Bot derives: mm_order_size = budgetPerMarket / 2
+    
     bankroll = cc_config.get("kellyBankroll")
     if bankroll and bankroll > 0:
         config.kelly_bankroll = float(bankroll)
 
-    # Market Making parameters
-    mm_order_size = cc_config.get("mmOrderSize")
-    if mm_order_size and mm_order_size > 0:
-        config.mm_order_size = float(mm_order_size)
+    session_budget = cc_config.get("sessionBudget")
+    budget_per_market = cc_config.get("budgetPerMarket")
+    
+    # Derive mm_order_size from budgetPerMarket (half for UP, half for DOWN)
+    if budget_per_market and budget_per_market > 0:
+        config.mm_order_size = round(float(budget_per_market) / 2.0, 2)
+        # Set per-market position cap to full budgetPerMarket (allows both sides)
+        config.max_position_per_market = float(budget_per_market)
+        print(f"  Budget per market: ${budget_per_market:.2f} -> order size: ${config.mm_order_size:.2f}/side")
 
-    mm_spread = cc_config.get("mmSpread")
-    if mm_spread and mm_spread > 0:
-        config.mm_base_spread = float(mm_spread)
+    # Session budget controls total exposure cap
+    if session_budget and session_budget > 0:
+        config.max_total_exposure = float(session_budget)
+        print(f"  Session budget: ${session_budget:.2f} (max total exposure)")
+
+    # Spread parameters
+    mm_spread_min = cc_config.get("mmSpreadMin")
+    if mm_spread_min and mm_spread_min > 0:
+        config.mm_base_spread = float(mm_spread_min)
+    
+    mm_spread_max = cc_config.get("mmSpreadMax")
+    if mm_spread_max and mm_spread_max > 0:
+        config.mm_spread_max = float(mm_spread_max)
 
     # Risk parameters
     max_concurrent = cc_config.get("maxConcurrentWindows")
     if max_concurrent and max_concurrent > 0:
         config.max_concurrent_windows = int(max_concurrent)
 
-    max_per_market = cc_config.get("maxPositionPerMarket")
-    if max_per_market and max_per_market > 0:
-        config.max_position_per_market = float(max_per_market)
+    max_loss_pct = cc_config.get("maxLossPct")
+    if max_loss_pct is not None and max_loss_pct > 0:
+        config.hard_loss_stop_pct = float(max_loss_pct)
 
-    stop_loss = cc_config.get("stopLossThreshold")
-    if stop_loss is not None:
-        config.hard_loss_stop_pct = abs(float(stop_loss)) / 100.0 if abs(stop_loss) > 1 else abs(float(stop_loss))
+    loss_cooldown = cc_config.get("lossCooldownSec")
+    if loss_cooldown is not None and loss_cooldown > 0:
+        config.hard_loss_cooloff = float(loss_cooldown)
+
+    reserve_ratio = cc_config.get("reserveRatio")
+    if reserve_ratio is not None and reserve_ratio >= 0:
+        config.deploy_reserve_pct = float(reserve_ratio)
 
     # Dry run mode
     mode = cc_config.get("mode", "dry_run")
     config.dry_run = (mode != "live")
 
-    # ── Only Market Making ──────────────────────────────────────────
+    # ── Disable v15's internal strategy budget system ───────────────
+    # Give 100% of strategy budget to MM since it's the only active strategy
+    config.strategy_budget_pct = {"mm": 1.0, "sniper": 0.0, "arb": 0.0, "contrarian": 0.0}
+    
     # Disable all non-MM strategies: Sniper, Arb, Contrarian
     config.sniper_enabled = False
     config.arb_enabled = False
@@ -115,24 +145,6 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     config.immediate_pair_completion = False
     config.blind_redeem_enabled = False
     config.hedge_max_loss_per_share = 0.0  # Disable hedging
-
-    # Auto-scale mm_order_size based on bankroll and concurrent windows
-    # Each window needs 2 orders (UP + DOWN), so budget per order:
-    # deployable = bankroll * 0.80 (reserve 20%)
-    # mm_budget = deployable * 0.80 (MM gets 80% of strategy budget)
-    # budget_per_window = mm_budget / max_concurrent_windows
-    # budget_per_order = budget_per_window / 2 (UP + DOWN)
-    max_windows = config.max_concurrent_windows
-    deployable = config.kelly_bankroll * (1.0 - config.deploy_reserve_pct)
-    mm_budget = deployable * config.strategy_budget_pct.get("mm", 0.80)
-    budget_per_order = mm_budget / (max_windows * 2)
-    
-    # If the configured order size exceeds what the budget allows, scale it down
-    if config.mm_order_size > budget_per_order:
-        old_size = config.mm_order_size
-        config.mm_order_size = round(budget_per_order, 2)
-        print(f"  Auto-scaled mm_order_size: ${old_size:.2f} -> ${config.mm_order_size:.2f} "
-              f"(bankroll=${config.kelly_bankroll:.0f}, {max_windows} windows)")
 
     return config
 
@@ -181,8 +193,10 @@ class PolyMakerBot(PolymarketBot):
             self.logger.info(f"CC config applied: assets={self.config.assets_15m}, "
                            f"timeframes={self.config.timeframes}, "
                            f"bankroll=${self.config.kelly_bankroll:.0f}, "
-                           f"dry_run={self.config.dry_run}, "
-                           f"max_per_market=${self.config.max_position_per_market:.0f}")
+                           f"session_budget=${self.config.max_total_exposure:.0f}, "
+                           f"budget_per_market=${self.config.max_position_per_market:.0f}, "
+                           f"order_size=${self.config.mm_order_size:.0f}/side, "
+                           f"dry_run={self.config.dry_run}")
 
         # Validate credentials for live mode
         if not self.config.dry_run:
@@ -304,8 +318,9 @@ class PolyMakerBot(PolymarketBot):
         self.logger.info("  Assets 5m:  {}".format(", ".join(a.upper() for a in self.config.assets_5m)))
         self.logger.info("  Bankroll:   ${:.0f}".format(self.config.kelly_bankroll))
         self.logger.info("  Kelly:      {:.0%} fraction".format(self.config.kelly_fraction))
-        self.logger.info("  MM spread:  {:.3f} | Size: ${:.0f}".format(
-            self.config.mm_base_spread, self.config.mm_order_size))
+        self.logger.info("  MM spread:  {:.3f} | Size: ${:.0f}/side | Per-market: ${:.0f}".format(
+            self.config.mm_base_spread, self.config.mm_order_size,
+            self.config.max_position_per_market))
         self.logger.info("  Strategies: MM={} | Sniper={} | Arb={} | Contrarian={}".format(
             "ON" if self.config.mm_enabled else "OFF",
             "ON" if self.config.sniper_enabled else "OFF",
@@ -346,14 +361,19 @@ class PolyMakerBot(PolymarketBot):
                 self.logger.warning("  Bankroll auto-detect FAILED. Using KELLY_BANKROLL=${:.0f}".format(
                     self.config.kelly_bankroll))
 
-        # V15.1-1: Scale exposure with bankroll
-        self.config.max_total_exposure = self.config.kelly_bankroll * 0.80
-        self.config.max_position_per_market = min(
-            self.config.max_position_per_market,
-            self.config.max_total_exposure * 0.45)
-        self.logger.info("  Exposure limits: max_total=${:.0f} | max_per_market=${:.0f} | bankroll=${:.0f}".format(
+        # V15.1-1: Exposure limits
+        # If CC set sessionBudget, max_total_exposure is already set by apply_cc_config.
+        # If CC set budgetPerMarket, max_position_per_market is already set.
+        # Only apply v15 defaults if CC didn't set them.
+        if not self._cc_config or not self._cc_config.get("sessionBudget"):
+            self.config.max_total_exposure = self.config.kelly_bankroll * 0.80
+        if not self._cc_config or not self._cc_config.get("budgetPerMarket"):
+            self.config.max_position_per_market = min(
+                self.config.max_position_per_market,
+                self.config.max_total_exposure * 0.45)
+        self.logger.info("  Exposure limits: max_total=${:.0f} | max_per_market=${:.0f} | order_size=${:.0f}/side | bankroll=${:.0f}".format(
             self.config.max_total_exposure, self.config.max_position_per_market,
-            self.config.kelly_bankroll))
+            self.config.mm_order_size, self.config.kelly_bankroll))
 
         self.running = True
         cycle = 0
