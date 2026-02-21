@@ -1,6 +1,4 @@
 import poly_data.global_state as global_state
-import poly_data.global_state as global_state
-from poly_data.utils import get_sheet_df
 import time
 import pandas as pd
 
