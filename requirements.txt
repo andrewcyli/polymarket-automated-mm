@@ -1,22 +1,29 @@
-py-clob-client==0.20.0
-python-dotenv==1.0.0
+# Core Polymarket trading client
+py-clob-client
+
+# Web3 and blockchain interaction
+web3
+eth-account
+
+# Data processing and analysis
 pandas
-gspread
-gspread-dataframe
+numpy
 sortedcontainers
-black==24.4.2
-eth-account>=0.11.0
-eth-utils>=4.0.0
-poly_eip712_structs==0.0.1
-py_order_utils==0.3.2
-pytest==8.2.2
-requests==2.32.3
-websockets==12.0
-cryptography==42.0.8
-google-auth
-web3>=6.0.0
-discord-webhook
-streamlit>=1.28.0
-plotly>=5.18.0
-psutil>=5.9.0
-schedule>=1.2.0
+
+# Environment and configuration
+python-dotenv
+
+# HTTP requests
+requests
+
+# WebSocket support
+websockets
+certifi
+
+# Optional: Google Sheets integration (legacy, not required for Command Center mode)
+# gspread
+# google-auth
+# gspread-dataframe
+
+# Optional: Discord notifications
+# discord-webhook
