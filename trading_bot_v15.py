@@ -2275,7 +2275,9 @@ class TradingEngine:
                            if isinstance(result, dict) else str(result))
                 self.logger.warning(f"    Order rejected: {err_msg}")
         except Exception as e:
+            import traceback
             self.logger.error(f"    Order failed: {e}")
+            self.logger.error(f"    Traceback: {traceback.format_exc()}")
         return None
 
     def record_fill(self, token_id, side, price, size, fee=0):

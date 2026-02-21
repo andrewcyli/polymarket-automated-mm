@@ -92,6 +92,10 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     if max_concurrent and max_concurrent > 0:
         config.max_concurrent_windows = int(max_concurrent)
 
+    max_per_market = cc_config.get("maxPositionPerMarket")
+    if max_per_market and max_per_market > 0:
+        config.max_position_per_market = float(max_per_market)
+
     stop_loss = cc_config.get("stopLossThreshold")
     if stop_loss is not None:
         config.hard_loss_stop_pct = abs(float(stop_loss)) / 100.0 if abs(stop_loss) > 1 else abs(float(stop_loss))
@@ -177,7 +181,24 @@ class PolyMakerBot(PolymarketBot):
             self.logger.info(f"CC config applied: assets={self.config.assets_15m}, "
                            f"timeframes={self.config.timeframes}, "
                            f"bankroll=${self.config.kelly_bankroll:.0f}, "
-                           f"dry_run={self.config.dry_run}")
+                           f"dry_run={self.config.dry_run}, "
+                           f"max_per_market=${self.config.max_position_per_market:.0f}")
+
+        # Validate credentials for live mode
+        if not self.config.dry_run:
+            missing = []
+            if not self.config.private_key:
+                missing.append("PRIVATE_KEY (or POLY_PRIVATE_KEY or PK)")
+            if not self.config.proxy_wallet:
+                missing.append("PROXY_WALLET (or POLY_PROXY_WALLET or POLYMARKET_PROXY_ADDRESS)")
+            if not self.config.api_key:
+                missing.append("API_KEY (or POLY_API_KEY or CLOB_API_KEY)")
+            if missing:
+                self.logger.error("\n  *** MISSING CREDENTIALS FOR LIVE MODE ***")
+                for m in missing:
+                    self.logger.error(f"    - {m}")
+                self.logger.error("  Set these in your .env file and restart.\n")
+                sys.exit(1)
 
     def _shutdown(self, signum, frame):
         """Override shutdown to also stop CC run."""
