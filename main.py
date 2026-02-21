@@ -53,15 +53,23 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     Apply Command Center config overrides to the v15 BotConfig.
     Only overrides values that are explicitly set in the CC config.
     """
-    # Target assets
+    # Target assets - handle both list and comma-separated string
     target_assets = cc_config.get("targetAssets", [])
+    if isinstance(target_assets, str):
+        target_assets = [a.strip() for a in target_assets.split(",") if a.strip()]
     if target_assets:
         assets_lower = [a.lower() for a in target_assets]
         config.assets_15m = assets_lower
         config.assets_5m = assets_lower
 
-    # Window durations
+    # Window durations - handle both list and comma-separated string
     window_durations = cc_config.get("windowDurations", [])
+    if isinstance(window_durations, str):
+        try:
+            import json
+            window_durations = json.loads(window_durations)
+        except Exception:
+            window_durations = [w.strip() for w in window_durations.split(",") if w.strip()]
     if window_durations:
         config.timeframes = window_durations
 
@@ -91,6 +99,24 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     # Dry run mode
     mode = cc_config.get("mode", "dry_run")
     config.dry_run = (mode != "live")
+
+    # Auto-scale mm_order_size based on bankroll and concurrent windows
+    # Each window needs 2 orders (UP + DOWN), so budget per order:
+    # deployable = bankroll * 0.80 (reserve 20%)
+    # mm_budget = deployable * 0.80 (MM gets 80% of strategy budget)
+    # budget_per_window = mm_budget / max_concurrent_windows
+    # budget_per_order = budget_per_window / 2 (UP + DOWN)
+    max_windows = config.max_concurrent_windows
+    deployable = config.kelly_bankroll * (1.0 - config.deploy_reserve_pct)
+    mm_budget = deployable * config.strategy_budget_pct.get("mm", 0.80)
+    budget_per_order = mm_budget / (max_windows * 2)
+    
+    # If the configured order size exceeds what the budget allows, scale it down
+    if config.mm_order_size > budget_per_order:
+        old_size = config.mm_order_size
+        config.mm_order_size = round(budget_per_order, 2)
+        print(f"  Auto-scaled mm_order_size: ${old_size:.2f} -> ${config.mm_order_size:.2f} "
+              f"(bankroll=${config.kelly_bankroll:.0f}, {max_windows} windows)")
 
     return config
 
