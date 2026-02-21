@@ -231,7 +231,11 @@ async def main():
                 ending_bankroll=_get_current_bankroll(),
             )
         
+        # Set the shutdown event to break the main loop
         shutdown_event.set()
+        
+        # Raise KeyboardInterrupt to properly exit the async event loop
+        raise KeyboardInterrupt("Graceful shutdown initiated")
     
     signal.signal(signal.SIGINT, _handle_shutdown)
     signal.signal(signal.SIGTERM, _handle_shutdown)
@@ -248,20 +252,27 @@ async def main():
 
     # Main loop - maintain websocket connections with backoff
     backoff_time = 5
-    while not shutdown_event.is_set():
-        try:
-            # Connect to market and user websockets simultaneously
-            # Subscribe using token IDs from subscribed_assets, not condition_ids
-            await asyncio.gather(
-                connect_market_websocket(list(global_state.subscribed_assets)),
-                connect_user_websocket()
-            )
-            logger.info("Reconnecting to the websocket")
-            backoff_time = 5  # Reset backoff on success
-        except Exception as e:
-            logger.error(f"Error in main loop: {e}")
-            await asyncio.sleep(backoff_time)
-            backoff_time = min(backoff_time * 2, 60)  # Exponential backoff up to 60 seconds
+    try:
+        while not shutdown_event.is_set():
+            try:
+                # Connect to market and user websockets simultaneously
+                # Subscribe using token IDs from subscribed_assets, not condition_ids
+                await asyncio.gather(
+                    connect_market_websocket(list(global_state.subscribed_assets)),
+                    connect_user_websocket()
+                )
+                logger.info("Reconnecting to the websocket")
+                backoff_time = 5  # Reset backoff on success
+            except KeyboardInterrupt:
+                # Ctrl+C pressed - break out of loop
+                break
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}")
+                await asyncio.sleep(backoff_time)
+                backoff_time = min(backoff_time * 2, 60)  # Exponential backoff up to 60 seconds
+    except KeyboardInterrupt:
+        # Graceful shutdown already handled by signal handler
+        pass
 
 if __name__ == "__main__":
     asyncio.run(main())
