@@ -4,7 +4,8 @@ Fetches market data and trading parameters from the PolyMaker Command Center.
 """
 import pandas as pd
 from polymaker_client import cc
-import poly_data.global_state as global_state
+import requests
+import time
 
 def _parse_list_field(value):
     """
@@ -18,12 +19,32 @@ def _parse_list_field(value):
     else:
         return []
 
+def _get_market_timestamp(window):
+    """
+    Calculate the market timestamp for a given window.
+    Markets are created at rounded intervals (5m = 300s, 15m = 900s).
+    """
+    current_time = int(time.time())
+    
+    if window == '5m':
+        interval = 300  # 5 minutes
+    elif window == '15m':
+        interval = 900  # 15 minutes
+    else:
+        return None
+    
+    # Round to nearest interval
+    return (current_time // interval) * interval
+
 def discover_markets(target_assets, window_durations, max_markets=10):
     """
-    Auto-discover active Polymarket markets based on target assets and window durations.
+    Auto-discover active Polymarket crypto up/down markets.
+    
+    Markets follow the pattern: {asset}-updown-{window}-{unix_timestamp}
+    Example: btc-updown-5m-1771692000
     
     Args:
-        target_assets: List of crypto assets (e.g., ['BTC', 'ETH', 'XRP'])
+        target_assets: List of crypto assets (e.g., ['BTC', 'ETH', 'XRP', 'SOL'])
         window_durations: List of time windows (e.g., ['5m', '15m'])
         max_markets: Maximum number of markets to return
         
@@ -31,68 +52,76 @@ def discover_markets(target_assets, window_durations, max_markets=10):
         pd.DataFrame with columns: question, token1, token2, condition_id, answer1, answer2, 
                                    max_spread, rewards_daily_rate, neg_risk, min_size
     """
-    if not global_state.client:
-        print("⚠️  Polymarket client not available for market discovery")
-        return pd.DataFrame()
-    
     try:
         print(f"🔍 Discovering markets for {target_assets} with windows {window_durations}...")
         
-        # Get sampling markets from Polymarket (active markets with rewards)
-        markets_response = global_state.client.get_sampling_markets(next_cursor="")
-        if not markets_response or 'data' not in markets_response:
-            print("⚠️  No markets returned from Polymarket API")
-            return pd.DataFrame()
-        
-        markets_data = markets_response['data']
-        print(f"  Found {len(markets_data)} total markets from Polymarket")
-        
-        # Filter markets by target assets and window durations
         matched_markets = []
-        for market in markets_data:
-            question = market.get('question', '').lower()
-            
-            # Check if question contains any target asset
-            has_asset = any(asset.lower() in question for asset in target_assets)
-            if not has_asset:
-                continue
-            
-            # Check if question contains any window duration
-            has_window = any(window.lower() in question for window in window_durations)
-            if not has_window:
-                continue
-            
-            # Extract market data
-            tokens = market.get('tokens', [])
-            if len(tokens) < 2:
-                continue
-            
-            rewards = market.get('rewards', {})
-            
-            # Find USDC reward rate
-            reward_rate = 0
-            for rate_info in rewards.get('rates', []):
-                # USDC.e on Polygon
-                if rate_info.get('asset_address', '').lower() == '0x2791bca1f2de4661ed88a30c99a7a9449aa84174'.lower():
-                    reward_rate = rate_info.get('rewards_daily_rate', 0)
-                    break
-            
-            market_data = {
-                'question': market.get('question', ''),
-                'token1': tokens[0].get('token_id', ''),
-                'token2': tokens[1].get('token_id', ''),
-                'condition_id': market.get('condition_id', ''),
-                'answer1': tokens[0].get('outcome', ''),
-                'answer2': tokens[1].get('outcome', ''),
-                'max_spread': rewards.get('max_spread', 5),
-                'rewards_daily_rate': reward_rate,
-                'neg_risk': market.get('neg_risk', False),
-                'min_size': rewards.get('min_size', 10),
-                'market_slug': market.get('market_slug', ''),
-                'end_date_iso': market.get('end_date_iso', ''),
-            }
-            
-            matched_markets.append(market_data)
+        
+        # For each asset and window, calculate the current market timestamp
+        for asset in target_assets:
+            for window in window_durations:
+                timestamp = _get_market_timestamp(window)
+                if not timestamp:
+                    continue
+                
+                slug = f"{asset.lower()}-updown-{window}-{timestamp}"
+                url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+                
+                try:
+                    resp = requests.get(url, timeout=10)
+                    if resp.status_code != 200:
+                        print(f"  ⚠️  API returned {resp.status_code} for {slug}")
+                        continue
+                    
+                    data = resp.json()
+                    if not data:
+                        print(f"  ⚠️  No market found for {slug}")
+                        continue
+                    
+                    event = data[0]
+                    market = event.get('markets', [{}])[0]
+                    
+                    if not market:
+                        continue
+                    
+                    # Extract token IDs from clobTokenIds string
+                    token_ids_str = market.get('clobTokenIds', '')
+                    # Format: "[\"token1\", \"token2\"]" -> ['token1', 'token2']
+                    token_ids = token_ids_str.strip('[]"').split('", "') if token_ids_str else []
+                    
+                    if len(token_ids) < 2:
+                        print(f"  ⚠️  Invalid token IDs for {slug}")
+                        continue
+                    
+                    # Extract reward info
+                    rewards = market.get('rewards', {})
+                    reward_rate = rewards.get('rewardsMaxSpread', 0) if isinstance(rewards, dict) else 0
+                    
+                    market_data = {
+                        'question': event.get('title', f"{asset.upper()} Up or Down {window}"),
+                        'token1': token_ids[0],
+                        'token2': token_ids[1],
+                        'condition_id': market.get('conditionId', ''),
+                        'answer1': 'Up',
+                        'answer2': 'Down',
+                        'max_spread': market.get('rewardsMaxSpread', 5),
+                        'rewards_daily_rate': reward_rate,
+                        'neg_risk': market.get('negRisk', False),
+                        'min_size': market.get('rewardsMinSize', 10),
+                        'market_slug': slug,
+                        'end_date_iso': market.get('endDate', ''),
+                    }
+                    
+                    matched_markets.append(market_data)
+                    print(f"  ✓ Found {asset.upper()} {window}: {slug}")
+                    
+                    if len(matched_markets) >= max_markets:
+                        break
+                        
+                except requests.Timeout:
+                    print(f"  ⚠️  Timeout fetching {slug}")
+                except Exception as e:
+                    print(f"  ⚠️  Error fetching {slug}: {e}")
             
             if len(matched_markets) >= max_markets:
                 break
@@ -102,7 +131,7 @@ def discover_markets(target_assets, window_durations, max_markets=10):
             return pd.DataFrame()
         
         df = pd.DataFrame(matched_markets)
-        print(f"✅ Discovered {len(df)} markets: {df['question'].tolist()[:3]}...")
+        print(f"✅ Discovered {len(df)} active markets")
         
         return df
         
@@ -132,7 +161,7 @@ def load_from_command_center():
             return pd.DataFrame(columns=['question', 'token1', 'token2', 'condition_id', 'max_size', 'trade_size', 'param_type']), {}
         
         # Extract global parameters from config
-        target_assets = _parse_list_field(config.get('targetAssets', 'BTC,ETH'))
+        target_assets = _parse_list_field(config.get('targetAssets', 'BTC,ETH,SOL'))
         window_durations = _parse_list_field(config.get('windowDurations', '5m,15m'))
         max_concurrent = config.get('maxConcurrentWindows', 5)
         
