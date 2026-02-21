@@ -168,29 +168,43 @@ def load_from_command_center():
         config = cc.get_config()
         if not config:
             print("⚠️  No active config found in Command Center. Bot will run with empty config.")
-            return pd.DataFrame(columns=['question', 'token1', 'token2', 'condition_id', 'max_size', 'trade_size', 'param_type']), {}
+            # Return empty params with default structure
+            return pd.DataFrame(columns=['question', 'token1', 'token2', 'condition_id', 'max_size', 'trade_size', 'param_type']), {'default': {}}
         
         # Extract global parameters from config
         target_assets = _parse_list_field(config.get('targetAssets', 'BTC,ETH,SOL'))
         window_durations = _parse_list_field(config.get('windowDurations', '5m,15m'))
         max_concurrent = config.get('maxConcurrentWindows', 5)
         
-        params = {
+        # Create trading parameters for each param_type
+        # trading.py expects: params[param_type]['stop_loss_threshold'], etc.
+        default_params = {
             'bankroll': config.get('kellyBankroll', 100),
             'targetSpread': config.get('mmSpreadMin', 0.02),
             'orderSize': config.get('mmOrderSize', 10),
             'maxLossPercent': config.get('maxLossPct', 0.05),
             'maxMarkets': max_concurrent,
-            'fillTimeout': 30,  # Not in config yet, use default
+            'fillTimeout': 30,
             'simulatedFillRate': config.get('simFillRate', 0.7),
             'targetAssets': target_assets,
             'windowDurations': window_durations,
             'maxConcurrentWindows': max_concurrent,
             'tradeAdvanceWindows': config.get('tradeAdvanceWindows', False),
+            # Trading logic parameters
+            'stop_loss_threshold': -5,  # PnL threshold for stop loss
+            'take_profit_threshold': 10,  # PnL threshold for take profit
+            'spread_threshold': 0.05,  # Max spread for exit
+            'volatility_threshold': 1.0,  # Max volatility (not used for crypto updown)
+            'sleep_period': 1,  # Hours to sleep after risk exit
+        }
+        
+        # Nest params by param_type (trading.py expects this structure)
+        params = {
+            'default': default_params
         }
         
         print(f"✅ Using auto-discovery mode for markets (targetAssets: {target_assets})")
-        print(f"✅ Loaded parameters from Command Center: bankroll=${params['bankroll']}, spread={params['targetSpread']}, orderSize=${params['orderSize']}")
+        print(f"✅ Loaded parameters from Command Center: bankroll=${default_params['bankroll']}, spread={default_params['targetSpread']}, orderSize=${default_params['orderSize']}")
         
         # Auto-discover markets based on config
         df = discover_markets(target_assets, window_durations, max_markets=max_concurrent * 2)
@@ -205,4 +219,5 @@ def load_from_command_center():
         print("Bot will run with empty config.")
         import traceback
         traceback.print_exc()
-        return pd.DataFrame(columns=['question', 'token1', 'token2', 'condition_id', 'max_size', 'trade_size', 'param_type']), {}
+        # Return empty params with default structure
+        return pd.DataFrame(columns=['question', 'token1', 'token2', 'condition_id', 'max_size', 'trade_size', 'param_type']), {'default': {}}
