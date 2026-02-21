@@ -146,7 +146,13 @@ def set_order(token, side, size, price):
 
 
 def update_markets():
-    received_df, received_params = get_sheet_df()
+    # Try Command Center first, fall back to Google Sheets
+    try:
+        from poly_data.command_center_loader import get_sheet_df_with_fallback
+        received_df, received_params = get_sheet_df_with_fallback()
+    except Exception as e:
+        print(f"⚠️  Error loading from Command Center, falling back to Google Sheets: {str(e)}")
+        received_df, received_params = get_sheet_df()
     # Ensure global_state.df is a DataFrame
     if not isinstance(global_state.df, pd.DataFrame):
         global_state.df = pd.DataFrame(columns=['question', 'token1', 'token2', 'condition_id'])
