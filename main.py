@@ -100,6 +100,18 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     mode = cc_config.get("mode", "dry_run")
     config.dry_run = (mode != "live")
 
+    # ── Only Market Making ──────────────────────────────────────────
+    # Disable all non-MM strategies: Sniper, Arb, Contrarian
+    config.sniper_enabled = False
+    config.arb_enabled = False
+    config.contrarian_enabled = False
+
+    # Disable auxiliary features that are not needed for pure MM
+    config.auto_merge_enabled = False
+    config.immediate_pair_completion = False
+    config.blind_redeem_enabled = False
+    config.hedge_max_loss_per_share = 0.0  # Disable hedging
+
     # Auto-scale mm_order_size based on bankroll and concurrent windows
     # Each window needs 2 orders (UP + DOWN), so budget per order:
     # deployable = bankroll * 0.80 (reserve 20%)
@@ -500,9 +512,10 @@ class PolyMakerBot(PolymarketBot):
                         if trading_halted:
                             continue
                         self.mm_strategy.execute(market)
-                        self.sniper.execute(market)
-                        self.arb.execute(market)
-                        self.contrarian.execute(market)
+                        # Sniper, Arb, Contrarian disabled - MM only
+                        # self.sniper.execute(market)
+                        # self.arb.execute(market)
+                        # self.contrarian.execute(market)
                     except Exception as e:
                         self.logger.error("  Strategy error on {}: {}".format(
                             market["slug"], e))
