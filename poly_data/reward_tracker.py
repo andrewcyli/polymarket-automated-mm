@@ -1,15 +1,12 @@
 """
-Reward Tracker - Estimates and logs maker rewards for each market
+Reward Tracker - Estimates maker rewards for each market (logging disabled in Command Center mode)
 """
 
 import time
 from datetime import datetime
 import poly_data.global_state as global_state
-from poly_data.gspread import get_spreadsheet
 import traceback
 
-_reward_worksheet = None
-_reward_spreadsheet = None
 _last_snapshot_time = {}
 
 
@@ -31,12 +28,19 @@ def estimate_order_reward(price, size, mid_price, max_spread, daily_rate):
 
 
 def log_market_snapshot(market_id, market_name):
-    """Log a snapshot of current orders and estimate rewards for a market."""
-    global _reward_worksheet, _reward_spreadsheet, _last_snapshot_time
+    """
+    Log a snapshot of current orders and estimate rewards for a market.
+    
+    NOTE: In Command Center mode, reward tracking is handled by the dashboard's
+    P&L analysis. This function is kept for compatibility but does not log to sheets.
+    """
+    global _last_snapshot_time
 
     try:
         current_time = time.time()
         last_snapshot = _last_snapshot_time.get(market_id, 0)
+        
+        # Rate limit: only log every 5 minutes
         if current_time - last_snapshot < 300:
             return
         _last_snapshot_time[market_id] = current_time
@@ -49,24 +53,7 @@ def log_market_snapshot(market_id, market_name):
             return
         market_row = market_row.iloc[0]
 
-        if _reward_spreadsheet is None:
-            _reward_spreadsheet = get_spreadsheet()
-
-        if _reward_worksheet is None:
-            try:
-                _reward_worksheet = _reward_spreadsheet.worksheet('Maker Rewards')
-            except:
-                _reward_worksheet = _reward_spreadsheet.add_worksheet(
-                    title='Maker Rewards', rows=10000, cols=15
-                )
-                headers = [
-                    'Timestamp', 'Market', 'Token', 'Side', 'Open Orders',
-                    'Order Price', 'Mid Price', 'Distance from Mid',
-                    'Position Size', 'Est. Hourly Reward ($)', 'Daily Rate',
-                    'Max Spread %', 'Status'
-                ]
-                _reward_worksheet.update('A1', [headers])
-
+        # Calculate mid price from order book
         if market_id in global_state.all_data:
             bids = global_state.all_data[market_id]['bids']
             asks = global_state.all_data[market_id]['asks']
@@ -79,55 +66,34 @@ def log_market_snapshot(market_id, market_name):
         else:
             mid_price = 0.5
 
+        # Estimate rewards for current orders (print to console only)
         for token_name in ['token1', 'token2']:
             token_id = str(market_row[token_name])
             answer = market_row['answer1'] if token_name == 'token1' else market_row['answer2']
             orders = global_state.orders.get(token_id, {'buy': {'price': 0, 'size': 0}, 'sell': {'price': 0, 'size': 0}})
-            position = global_state.positions.get(token_id, {'size': 0, 'avgPrice': 0})
 
             if orders['buy']['size'] > 0:
                 buy_reward = estimate_order_reward(
                     orders['buy']['price'], orders['buy']['size'], mid_price,
                     market_row['max_spread'], market_row['rewards_daily_rate']
                 )
-                # Convert all values to native Python types for JSON serialization
-                row = [
-                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    str(market_name)[:80], str(answer)[:30], 'BUY', float(orders['buy']['size']),
-                    float(orders['buy']['price']), float(mid_price),
-                    float(abs(orders['buy']['price'] - mid_price)), float(position['size']),
-                    float(round(buy_reward, 4)), float(market_row['rewards_daily_rate']),
-                    float(market_row['max_spread']), 'Active'
-                ]
-                _reward_worksheet.append_row(row, value_input_option='USER_ENTERED')
+                print(f"  Estimated BUY reward for {answer}: ${buy_reward:.4f}/hr")
 
             if orders['sell']['size'] > 0:
                 sell_reward = estimate_order_reward(
                     orders['sell']['price'], orders['sell']['size'], mid_price,
                     market_row['max_spread'], market_row['rewards_daily_rate']
                 )
-                # Convert all values to native Python types for JSON serialization
-                row = [
-                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    str(market_name)[:80], str(answer)[:30], 'SELL', float(orders['sell']['size']),
-                    float(orders['sell']['price']), float(mid_price),
-                    float(abs(orders['sell']['price'] - mid_price)), float(position['size']),
-                    float(round(sell_reward, 4)), float(market_row['rewards_daily_rate']),
-                    float(market_row['max_spread']), 'Active'
-                ]
-                _reward_worksheet.append_row(row, value_input_option='USER_ENTERED')
+                print(f"  Estimated SELL reward for {answer}: ${sell_reward:.4f}/hr")
 
-        print(f"Logged reward snapshot for {market_name[:50]}...")
         return True
 
     except Exception as e:
-        print(f"Failed to log reward snapshot: {e}")
+        print(f"Failed to calculate reward snapshot: {e}")
         traceback.print_exc()
         return False
 
 
 def reset_reward_cache():
-    """Reset the cached worksheet"""
-    global _reward_worksheet, _reward_spreadsheet
-    _reward_worksheet = None
-    _reward_spreadsheet = None
+    """Legacy function - no-op for Command Center mode"""
+    pass
