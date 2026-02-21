@@ -16,6 +16,9 @@ from poly_data.data_utils import get_position, get_order, set_position
 from poly_data.trade_logger import log_trade_to_sheets
 from poly_data.reward_tracker import log_market_snapshot
 
+# Command Center integration (non-blocking, fault-tolerant)
+from polymaker_client import cc
+
 # Create directory for storing position risk information
 if not os.path.exists('positions/'):
     os.makedirs('positions/')
@@ -108,6 +111,32 @@ def send_buy_order(order):
                 })
             except Exception as e:
                 print(f"⚠️  Trade logging failed: {e}")
+
+            # Log trade to Command Center
+            try:
+                question = order.get('question', '')
+                asset = 'UNKNOWN'
+                for crypto in ['BTC', 'ETH', 'SOL', 'DOGE', 'XRP', 'ADA', 'MATIC', 'AVAX', 'LINK', 'DOT']:
+                    if crypto in question.upper():
+                        asset = crypto
+                        break
+                window = '15m'
+                if '5 min' in question.lower() or '5m' in question.lower():
+                    window = '5m'
+                cc.log_trade(
+                    cycle=cc.cycle_count,
+                    asset=asset,
+                    window=window,
+                    side='buy',
+                    outcome=order.get('answer', 'Unknown'),
+                    price=order['price'],
+                    size=order['size'],
+                    token_id=str(order['token']),
+                    condition_id=order.get('condition_id'),
+                    strategy='MM',
+                )
+            except Exception as e:
+                print(f"⚠️  Command Center trade logging failed: {e}")
         else:
             print("Not creating buy order because its outside acceptable price range (0.1-0.9)")
     else:
@@ -193,6 +222,32 @@ def send_sell_order(order):
         })
     except Exception as e:
         print(f"⚠️  Trade logging failed: {e}")
+
+    # Log trade to Command Center
+    try:
+        question = order.get('question', '')
+        asset = 'UNKNOWN'
+        for crypto in ['BTC', 'ETH', 'SOL', 'DOGE', 'XRP', 'ADA', 'MATIC', 'AVAX', 'LINK', 'DOT']:
+            if crypto in question.upper():
+                asset = crypto
+                break
+        window = '15m'
+        if '5 min' in question.lower() or '5m' in question.lower():
+            window = '5m'
+        cc.log_trade(
+            cycle=cc.cycle_count,
+            asset=asset,
+            window=window,
+            side='sell',
+            outcome=order.get('answer', 'Unknown'),
+            price=order['price'],
+            size=order['size'],
+            token_id=str(order['token']),
+            condition_id=order.get('condition_id'),
+            strategy='MM',
+        )
+    except Exception as e:
+        print(f"⚠️  Command Center trade logging failed: {e}")
 
 # Dictionary to store locks for each market to prevent concurrent trading on the same market
 market_locks = {}
