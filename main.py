@@ -15,19 +15,38 @@ from dotenv import load_dotenv
 
 # Command Center integration (non-blocking, fault-tolerant)
 from polymaker_client import cc
+import os
+from pathlib import Path
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('main.log'),  # Log to file
-        logging.StreamHandler()  # Log to console
-    ]
-)
+# Logging will be configured after we get the run ID from Command Center
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+def setup_session_logging(run_id):
+    """
+    Set up logging for this bot run session.
+    Creates a logs/{run_id}/ folder and configures file + console logging.
+    """
+    # Create logs directory structure
+    log_dir = Path(f"logs/{run_id}")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    log_file = log_dir / "bot.log"
+    
+    # Configure logging with both file and console handlers
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),  # Log to session-specific file
+            logging.StreamHandler()  # Log to console
+        ],
+        force=True  # Override any existing configuration
+    )
+    
+    logger.info(f"📁 Session logs: {log_file.absolute()}")
+    return str(log_file)
 
 def update_once():
     """
@@ -156,6 +175,14 @@ async def main():
     """
     Main application entry point. Initializes client, data, and manages websocket connections.
     """
+    # Set up basic logging for startup (will be reconfigured with run ID later)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler()],
+        force=True
+    )
+    
     # Initialize client with error handling
     try:
         logger.info("=" * 80)
@@ -208,6 +235,21 @@ async def main():
     )
     if run_id:
         logger.info(f"✓ Command Center run #{run_id} started")
+        # Set up session-based logging now that we have the run ID
+        setup_session_logging(run_id)
+        logger.info(f"✓ Session logging configured for run #{run_id}")
+    else:
+        # Fallback to default logging if no run ID
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('main.log'),
+                logging.StreamHandler()
+            ],
+            force=True
+        )
+        logger.warning("⚠️  No run ID from Command Center, using default logging")
     
     # Report initial active markets
     _report_active_markets()

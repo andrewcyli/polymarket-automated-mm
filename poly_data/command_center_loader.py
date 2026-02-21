@@ -97,6 +97,9 @@ def discover_markets(target_assets, window_durations, max_markets=10):
                     rewards = market.get('rewards', {})
                     reward_rate = rewards.get('rewardsMaxSpread', 0) if isinstance(rewards, dict) else 0
                     
+                    # Get tick size (default 0.01 for crypto markets)
+                    tick_size = market.get('minimumTickSize', 0.01)
+                    
                     market_data = {
                         'question': event.get('title', f"{asset.upper()} Up or Down {window}"),
                         'token1': token_ids[0],
@@ -110,6 +113,13 @@ def discover_markets(target_assets, window_durations, max_markets=10):
                         'min_size': market.get('rewardsMinSize', 10),
                         'market_slug': slug,
                         'end_date_iso': market.get('endDate', ''),
+                        'tick_size': tick_size,
+                        'param_type': 'default',  # Will be set by data_utils.py
+                        'trade_size': 10,  # Default trade size, can be overridden by params
+                        'max_size': 100,  # Default max size, can be overridden by params
+                        'best_bid': 0.5,  # Will be updated by WebSocket
+                        'best_ask': 0.5,  # Will be updated by WebSocket
+                        '3_hour': 0.0,  # Volatility metric, not used for crypto updown
                     }
                     
                     matched_markets.append(market_data)
