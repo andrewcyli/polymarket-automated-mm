@@ -5,6 +5,18 @@ Fetches market data and trading parameters from the PolyMaker Command Center ins
 import pandas as pd
 from polymaker_client import cc
 
+def _parse_list_field(value):
+    """
+    Parse a field that can be either a string ("BTC,ETH") or an array (["BTC", "ETH"]).
+    Returns a list of stripped non-empty strings.
+    """
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    elif isinstance(value, str):
+        return [item.strip() for item in value.split(',') if item.strip()]
+    else:
+        return []
+
 def load_from_command_center():
     """
     Fetch market configuration from Command Center.
@@ -38,8 +50,8 @@ def load_from_command_center():
             'maxMarkets': config.get('maxMarkets', 5),
             'fillTimeout': config.get('fillTimeout', 30),
             'simulatedFillRate': config.get('simulatedFillRate', 0.7),
-            'targetAssets': [a.strip() for a in config.get('targetAssets', 'BTC,ETH').split(',') if a.strip()],
-            'windowDurations': [w.strip() for w in config.get('windowDurations', '5m,15m').split(',') if w.strip()],
+            'targetAssets': _parse_list_field(config.get('targetAssets', 'BTC,ETH')),
+            'windowDurations': _parse_list_field(config.get('windowDurations', '5m,15m')),
             'maxConcurrentWindows': config.get('maxConcurrentWindows', 4),
             'tradeAdvanceWindows': config.get('tradeAdvanceWindows', False),
         }
