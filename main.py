@@ -4,7 +4,7 @@ import asyncio  # Asynchronous I/O
 import traceback  # Exception handling
 import logging  # Logging for debugging
 import signal  # Signal handling for graceful shutdown
-import pandas as pd  # For reading Google Sheets
+import pandas as pd  # For data processing
 from poly_data.polymarket_client import PolymarketClient
 from poly_data.data_utils import update_markets, update_positions, update_orders
 from poly_data.websocket_handlers import connect_market_websocket, connect_user_websocket
@@ -12,7 +12,6 @@ import poly_data.global_state as global_state
 from poly_data.data_processing import remove_from_performing
 from poly_data.position_snapshot import log_position_snapshot
 from dotenv import load_dotenv
-from data_updater.google_utils import get_spreadsheet  # Import to access Google Sheet
 
 # Command Center integration (non-blocking, fault-tolerant)
 from polymaker_client import cc
@@ -34,10 +33,10 @@ def update_once():
     """
     Initialize the application state by fetching market data, positions, and orders.
     """
-    update_markets()  # Get market information from Google Sheets
+    update_markets()  # Get market information from Command Center
     update_positions()  # Get current positions from Polymarket
     update_orders()  # Get current orders from Polymarket
-    logger.info(f"Loaded {len(global_state.df)} markets from All Markets sheet")
+    logger.info(f"Loaded {len(global_state.df)} markets from Command Center")
 
 def remove_from_pending():
     """
@@ -184,7 +183,7 @@ async def main():
         logger.info(f"After initial updates: orders={global_state.orders}, positions={global_state.positions}")
     except Exception as e:
         logger.error(f"❌ Failed to load initial market data: {e}")
-        logger.error("Please check your Google Sheets configuration and network connection.")
+        logger.error("Please check your Command Center connection and network.")
         return
 
     # ========== Command Center: Start Run ==========
