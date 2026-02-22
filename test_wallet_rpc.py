@@ -25,7 +25,7 @@ except ImportError:
 
 # ── Config ───────────────────────────────────────────────────────
 POLYGON_RPC = os.getenv("POLYGON_RPC_URL",
-                os.getenv("POLYGON_RPC", "https://polygon-rpc.com"))
+                os.getenv("POLYGON_RPC", "https://polygon.drpc.org"))
 
 PROXY_WALLET = os.getenv("POLY_PROXY_WALLET",
                  os.getenv("POLYMARKET_PROXY_ADDRESS",
@@ -46,7 +46,7 @@ FALLBACK_RPCS = [
     "https://polygon-bor-rpc.publicnode.com",
     "https://polygon.llamarpc.com",
     "https://rpc.ankr.com/polygon",
-    "https://polygon.drpc.org",
+    "https://polygon-rpc.com",
 ]
 
 # ── Colours ──────────────────────────────────────────────────────
@@ -81,10 +81,9 @@ def test_env_vars():
     print(f"\n{BOLD}Test 2: Environment variables{RESET}")
     all_ok = True
 
-    if POLYGON_RPC == "https://polygon-rpc.com":
-        warn(f"POLYGON_RPC_URL not set — using default public RPC (unreliable)")
-        warn(f"  Add to .env:  POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY")
-        all_ok = False
+    if POLYGON_RPC == "https://polygon.drpc.org":
+        info(f"POLYGON_RPC_URL not set — using default: drpc.org (free, usually reliable)")
+        info(f"  For best reliability, add to .env:  POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY")
     else:
         ok(f"POLYGON_RPC_URL = {POLYGON_RPC[:60]}{'...' if len(POLYGON_RPC) > 60 else ''}")
 

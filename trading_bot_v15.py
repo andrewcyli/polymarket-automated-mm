@@ -80,7 +80,7 @@ class BotConfig:
     proxy_wallet: str = os.getenv("POLY_PROXY_WALLET", os.getenv("POLYMARKET_PROXY_ADDRESS", os.getenv("PROXY_WALLET", "")))
     chain_id: int = int(os.getenv("POLY_CHAIN_ID", os.getenv("CHAIN_ID", "137")))
     signature_type: int = int(os.getenv("POLY_SIG_TYPE", os.getenv("SIGNATURE_TYPE", "2")))
-    polygon_rpc: str = os.getenv("POLYGON_RPC_URL", os.getenv("POLYGON_RPC", "https://polygon-rpc.com"))
+    polygon_rpc: str = os.getenv("POLYGON_RPC_URL", os.getenv("POLYGON_RPC", "https://polygon.drpc.org"))
 
     timeframes: list = field(default_factory=lambda: ["15m", "5m"])
     assets_15m: list = field(default_factory=lambda: ["btc", "eth", "sol", "xrp"])
@@ -1164,7 +1164,7 @@ class WalletBalanceChecker:
         "https://polygon-bor-rpc.publicnode.com",
         "https://polygon.llamarpc.com",
         "https://rpc.ankr.com/polygon",
-        "https://polygon.drpc.org",
+        "https://polygon-rpc.com",
     ]
 
     def __init__(self, config, logger):
@@ -3386,14 +3386,22 @@ class PolymarketBot:
         signal.signal(signal.SIGTERM, self._shutdown)
 
     def _shutdown(self, signum, frame):
+        if not self.running:
+            # Second Ctrl+C: force exit immediately
+            self.logger.info("\nForce exit (second signal). Goodbye.")
+            os._exit(1)
         self.logger.info("\nShutdown signal received. Cancelling all orders...")
+        self.logger.info("  (Press Ctrl+C again to force-quit immediately)")
         self.running = False
-        self.engine.cancel_all()
+        try:
+            self.engine.cancel_all()
+        except Exception:
+            pass
         self._print_summary("FINAL")
         self._print_claim_summary()
         self._print_v15_1_summary()
         self.logger.info("All orders cancelled. Exiting.")
-        sys.exit(0)
+        os._exit(0)
 
     def _process_immediate_pair_completions(self):
         if not self.config.immediate_pair_completion:

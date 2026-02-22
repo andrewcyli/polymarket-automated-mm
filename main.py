@@ -336,18 +336,29 @@ class PolyMakerBot(PolymarketBot):
 
     def _shutdown(self, signum, frame):
         """Override shutdown to also stop CC run."""
+        if not self.running:
+            # Second Ctrl+C: force exit immediately
+            self.logger.info("\nForce exit (second signal). Goodbye.")
+            os._exit(1)
         self.logger.info("\nShutdown signal received. Cancelling all orders...")
+        self.logger.info("  (Press Ctrl+C again to force-quit immediately)")
         self.running = False
-        self.engine.cancel_all()
+        try:
+            self.engine.cancel_all()
+        except Exception:
+            pass
         self._print_summary("FINAL")
         self._print_claim_summary()
         self._print_v15_1_summary()
 
         # Stop CC run with final metrics
-        self._push_final_metrics("stopped")
+        try:
+            self._push_final_metrics("stopped")
+        except Exception:
+            pass
 
         self.logger.info("All orders cancelled. Exiting.")
-        sys.exit(0)
+        os._exit(0)
 
     def _push_metrics(self):
         """Push current metrics to Command Center periodically."""
@@ -580,7 +591,7 @@ class PolyMakerBot(PolymarketBot):
                 pnl_str = ""
                 self._current_wallet_balance = None
                 self._real_pnl = None
-                if self.balance_checker and not self.config.dry_run:
+                if self.balance_checker and not self.config.dry_run and self.running:
                     bal = self.balance_checker.get_balance()
                     if bal is not None:
                         self._current_wallet_balance = bal
@@ -837,7 +848,8 @@ class PolyMakerBot(PolymarketBot):
             except Exception as e:
                 self.logger.error("  Cycle error: {}".format(e))
 
-            time.sleep(self.config.cycle_interval)
+            if self.running:
+                time.sleep(self.config.cycle_interval)
 
 
 # -----------------------------------------------------------------
