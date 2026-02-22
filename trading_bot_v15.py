@@ -2315,6 +2315,45 @@ class TradingEngine:
                     "    [{:8s}] {:12s} {:4s} {:6.1f} @ ${:.2f} = ${:6.2f} | {}...".format(
                         strategy.upper(), label, side, size, price, price * size, oid[:16]))
                 self._track_order(oid, window_id, side, price, size, token_id, strategy)
+                # V15.1-8: Taker orders fill immediately on Polymarket (FOK).
+                # Record the fill right away so token_holdings is up-to-date
+                # for merge/claim logic within the same cycle.
+                if is_taker and side == "BUY":
+                    fee = self.fee_calc.fee_amount(price, size)
+                    self.record_fill(token_id, side, price, size, fee)
+                    # Also update fill tracking for merge/claim pipeline
+                    if window_id not in self.window_fill_tokens:
+                        self.window_fill_tokens[window_id] = []
+                    self.window_fill_tokens[window_id].append({
+                        "token_id": token_id, "size": size,
+                        "price": price,
+                        "is_up": self._is_up_token_cache.get(token_id),
+                        "time": time.time(),
+                    })
+                    self.window_fill_cost[window_id] = (
+                        self.window_fill_cost.get(window_id, 0) + price * size)
+                    is_up = self._is_up_token_cache.get(token_id)
+                    side_label = "UP" if is_up else "DOWN"
+                    if window_id not in self.window_fill_sides:
+                        self.window_fill_sides[window_id] = {}
+                    if side_label not in self.window_fill_sides[window_id]:
+                        self.window_fill_sides[window_id][side_label] = []
+                    self.window_fill_sides[window_id][side_label].append({
+                        "token_id": token_id, "price": price,
+                        "size": size, "time": time.time(),
+                    })
+                    sides = self.window_fill_sides.get(window_id, {})
+                    if "UP" in sides and "DOWN" in sides:
+                        self.paired_windows.add(window_id)
+                    # Remove from active_orders so check_fills doesn't double-count
+                    if oid in self.active_orders:
+                        del self.active_orders[oid]
+                    if window_id in self.orders_by_window:
+                        self.orders_by_window[window_id] = [
+                            o for o in self.orders_by_window[window_id] if o != oid]
+                    self._recalc_exposure()
+                    self.logger.info("    TAKER FILL (immediate) | {} {} {:.1f} @ ${:.2f} | {}".format(
+                        side, token_id[:12] + "...", size, price, window_id))
                 return oid
             else:
                 err_msg = (result.get("errorMsg", str(result))
@@ -3885,9 +3924,17 @@ class PolymarketBot:
                         self._loss_stop_until = now + self.config.hard_loss_cooloff
                         trading_halted = True
 
-                # V15-2 + V15.1-6: Dual-path tradeable filter with horizon
+                # V15-2 + V15.1-6 + V15.1-10: Dual-path tradeable filter
+                # with condition_id deduplication
                 tradeable_markets = []
                 active_window_ids = set(self.engine.window_exposure.keys())
+                # V15.1-10: Track condition_ids with active exposure
+                active_condition_ids = set()
+                for awid in active_window_ids:
+                    meta = self.engine._window_metadata.get(awid, {})
+                    cid = meta.get("condition_id", "")
+                    if cid:
+                        active_condition_ids.add(cid)
                 for market in markets:
                     edge = market.get("edge", 0)
                     maker_edge = market.get("maker_edge", edge)
@@ -3908,6 +3955,11 @@ class PolymarketBot:
                     if len(active_window_ids) >= self.config.max_concurrent_windows:
                         if market["window_id"] not in active_window_ids:
                             continue
+                    # V15.1-10: Condition_id dedup
+                    mkt_cid = market.get("condition_id", "")
+                    if mkt_cid and mkt_cid in active_condition_ids:
+                        if market["window_id"] not in active_window_ids:
+                            continue
                     tradeable_markets.append(market)
 
                 tradeable_markets = self._score_and_sort_markets(tradeable_markets)
@@ -3924,6 +3976,16 @@ class PolymarketBot:
                         wid = market["window_id"]
                         if (len(current_active) >= self.config.max_concurrent_windows
                                 and wid not in current_active):
+                            continue
+                        # V15.1-10: Dynamic condition_id dedup
+                        cur_cids = set()
+                        for awid in current_active:
+                            meta = self.engine._window_metadata.get(awid, {})
+                            c = meta.get("condition_id", "")
+                            if c:
+                                cur_cids.add(c)
+                        mkt_cid = market.get("condition_id", "")
+                        if mkt_cid and mkt_cid in cur_cids and wid not in current_active:
                             continue
                         self.mm_strategy.execute(market)
                         self.sniper.execute(market)

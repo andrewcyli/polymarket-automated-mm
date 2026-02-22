@@ -598,11 +598,17 @@ class PolyMakerBot(PolymarketBot):
                         self._wallet_read_failures = 0
                         wallet_str = " | W:${:.0f}".format(bal)
                         
-                        # Real P&L = current wallet - starting wallet
-                        # This is the ground truth: actual USDC change
+                        # V15.1-9: Real P&L = (wallet + position_value) - starting_wallet
+                        # Wallet-only P&L is misleading: buying tokens reduces wallet
+                        # but creates positions with value. Must include both.
                         if self._starting_wallet_balance is not None:
-                            self._real_pnl = bal - self._starting_wallet_balance
-                            pnl_str = " | realP&L:${:+.2f}".format(self._real_pnl)
+                            wallet_change = bal - self._starting_wallet_balance
+                            # capital_in_positions tracks cost basis of held tokens
+                            pos_value = getattr(self.engine, 'capital_in_positions', 0)
+                            self._real_pnl = wallet_change + pos_value
+                            self._wallet_only_pnl = wallet_change
+                            pnl_str = " | realP&L:${:+.2f} (wallet:${:+.2f} +pos:${:.2f})".format(
+                                self._real_pnl, wallet_change, pos_value)
                     else:
                         self._wallet_read_failures += 1
                         if self._wallet_read_failures >= self._max_wallet_failures:
@@ -769,9 +775,18 @@ class PolyMakerBot(PolymarketBot):
                             self._loss_stop_until = now + self.config.hard_loss_cooloff
                             trading_halted = True
 
-                # V15-2 + V15.1-6: Dual-path tradeable filter
+                # V15-2 + V15.1-6 + V15.1-10: Dual-path tradeable filter
+                # with condition_id deduplication
                 tradeable_markets = []
                 active_window_ids = set(self.engine.window_exposure.keys())
+                # V15.1-10: Track condition_ids that already have exposure
+                # to prevent entering the same underlying market via
+                # different timeframes (e.g. 15m and 5m for same BTC 8:45)
+                active_condition_ids = set()
+                for awid in active_window_ids:
+                    cid = self.window_conditions.get(awid, "")
+                    if cid:
+                        active_condition_ids.add(cid)
                 for market in markets:
                     edge = market.get("edge", 0)
                     maker_edge = market.get("maker_edge", edge)
@@ -786,6 +801,15 @@ class PolyMakerBot(PolymarketBot):
                             continue
                     if len(active_window_ids) >= self.config.max_concurrent_windows:
                         if market["window_id"] not in active_window_ids:
+                            continue
+                    # V15.1-10: Skip markets whose condition_id already has
+                    # exposure from a different window (same underlying)
+                    mkt_cid = market.get("condition_id", "")
+                    if mkt_cid and mkt_cid in active_condition_ids:
+                        if market["window_id"] not in active_window_ids:
+                            self.logger.debug(
+                                "  DEDUP SKIP | {} | condition {} already active via another window".format(
+                                    market["window_id"], mkt_cid[:16]))
                             continue
                     tradeable_markets.append(market)
 
@@ -811,6 +835,18 @@ class PolyMakerBot(PolymarketBot):
                                 "  CONCURRENT SKIP | {} | {}/{} windows active".format(
                                     wid, len(current_active),
                                     self.config.max_concurrent_windows))
+                            continue
+                        # V15.1-10: Dynamic condition_id dedup within strategy loop
+                        current_cids = set()
+                        for awid in current_active:
+                            c = self.window_conditions.get(awid, "")
+                            if c:
+                                current_cids.add(c)
+                        mkt_cid = market.get("condition_id", "")
+                        if mkt_cid and mkt_cid in current_cids and wid not in current_active:
+                            self.logger.debug(
+                                "  DEDUP SKIP (loop) | {} | condition {} already active".format(
+                                    wid, mkt_cid[:16]))
                             continue
                         if self.config.mm_enabled:
                             self.mm_strategy.execute(market)
