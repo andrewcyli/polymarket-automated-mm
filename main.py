@@ -677,6 +677,26 @@ class PolyMakerBot(PolymarketBot):
 
                 self._compute_market_edges(markets)
                 self._resolve_expired_windows(markets)
+
+                # V15.1-11: CRITICAL — check_fills() MUST run BEFORE cleanup/prune.
+                # cleanup_expired_windows() and prune_stale_orders() delete orders
+                # from active_orders. If a filled order is deleted first, check_fills()
+                # will never detect it, causing capital_in_positions to stay at 0
+                # and triggering false loss-stop warnings.
+                if not self.config.dry_run:
+                    live_fills = self.engine.check_fills()
+                    if live_fills:
+                        self.logger.info("  {} orders filled".format(live_fills))
+                        for wid in self.engine.window_fill_sides:
+                            self.churn_manager.force_allow(wid)
+                        imm_completed = self._process_immediate_pair_completions()
+                        if imm_completed:
+                            self.logger.info("  {} immediate pair completions".format(imm_completed))
+                    hedges = self.engine.process_hedge_completions(
+                        self.book_reader, self.vol_tracker)
+                    if hedges:
+                        self.logger.info("  {} hedges completed".format(hedges))
+
                 self.engine.cleanup_expired_windows(markets, self.churn_manager)
                 self.engine.prune_stale_orders()
 
@@ -692,18 +712,6 @@ class PolyMakerBot(PolymarketBot):
                         markets, self.price_feed, self.book_reader)
                     if exits > 0:
                         self.logger.info("  Pre-exit: {} sells placed".format(exits))
-                    live_fills = self.engine.check_fills()
-                    if live_fills:
-                        self.logger.info("  {} orders filled".format(live_fills))
-                        for wid in self.engine.window_fill_sides:
-                            self.churn_manager.force_allow(wid)
-                        imm_completed = self._process_immediate_pair_completions()
-                        if imm_completed:
-                            self.logger.info("  {} immediate pair completions".format(imm_completed))
-                    hedges = self.engine.process_hedge_completions(
-                        self.book_reader, self.vol_tracker)
-                    if hedges:
-                        self.logger.info("  {} hedges completed".format(hedges))
                     merged = self.auto_merger.check_and_merge_all(
                         self.engine._market_cache, self.engine.token_holdings)
                     if merged:
