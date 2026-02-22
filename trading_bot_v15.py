@@ -232,10 +232,12 @@ class BotConfig:
 
     hedge_completion_enabled: bool = True
     hedge_max_loss_per_share: float = 0.020
-    hedge_completion_delay: float = 2.0
+    hedge_completion_delay: float = 3.0       # V15.1-13: Reduced from 2.0 — hedge faster
     hedge_vol_multiplier: float = 2.0
     hedge_min_loss_threshold: float = 0.005
     hedge_max_loss_threshold: float = 0.025
+    hedge_max_combined_cost: float = 0.98     # V15.1-13: Max UP+DOWN+fees before rejecting hedge
+    hedge_min_profit_per_share: float = 0.005 # V15.1-13: Min profit/share after fees to accept hedge
 
     auto_claim_enabled: bool = True
     claim_delay_seconds: float = 30.0
@@ -250,6 +252,12 @@ class BotConfig:
     pre_exit_time_seconds: float = 30.0
     pre_exit_min_confidence: float = 0.75
     pre_exit_min_price: float = 0.80
+
+    # V15.1-14: Momentum exit — sell one-sided fill if price rises >X%
+    momentum_exit_enabled: bool = True
+    momentum_exit_threshold: float = 0.03    # 3% price increase triggers sell
+    momentum_exit_min_hold_secs: float = 10.0  # Min hold time before checking
+    momentum_exit_max_wait_secs: float = 120.0 # Max wait for hedge before checking momentum
 
     rpc_gas_cache_ttl: float = 30.0
     rpc_min_call_interval: float = 1.5
@@ -2486,18 +2494,27 @@ class TradingEngine:
             fee_other = self.fee_calc._interp_fee_per_share(other_ask)
             total_cost = filled_price + other_ask + fee_filled + fee_other
             profit_per_share = 1.0 - total_cost
-            base_threshold = self.config.hedge_max_loss_per_share
-            if vol_tracker:
-                dynamic_threshold = vol_tracker.get_dynamic_hedge_threshold(
-                    other_token, base_threshold)
-            else:
-                dynamic_threshold = base_threshold
-            if profit_per_share < -dynamic_threshold:
+
+            # V15.1-13: Two-tier hedge price check:
+            # 1) Hard cap: combined cost must not exceed hedge_max_combined_cost
+            # 2) Profit floor: must earn at least hedge_min_profit_per_share
+            # This replaces the old dynamic_threshold approach with a clearer model:
+            # "If I filled UP at 47c, max I'll pay for DOWN is (98c - 47c - fees) = ~49c"
+            max_other_price = self.config.hedge_max_combined_cost - filled_price - fee_filled - fee_other
+            if other_ask > max_other_price:
                 self.logger.info(
-                    "  HEDGE SKIP | {} | {} @ ${:.2f} | {} ask ${:.2f} | "
-                    "Pair ${:.3f} | Loss ${:.3f} > thresh ${:.3f}".format(
+                    "  HEDGE PRICE CAP | {} | {} @ ${:.2f} | {} ask ${:.2f} > max ${:.2f} | "
+                    "Combined ${:.3f} > cap ${:.3f}".format(
                         wid, filled_side, filled_price, other_side, other_ask,
-                        total_cost, -profit_per_share, dynamic_threshold))
+                        max_other_price, total_cost, self.config.hedge_max_combined_cost))
+                self.hedges_skipped += 1
+                continue
+            if profit_per_share < self.config.hedge_min_profit_per_share:
+                self.logger.info(
+                    "  HEDGE LOW PROFIT | {} | {} @ ${:.2f} | {} ask ${:.2f} | "
+                    "Pair ${:.3f} | Profit ${:.4f} < min ${:.3f}".format(
+                        wid, filled_side, filled_price, other_side, other_ask,
+                        total_cost, profit_per_share, self.config.hedge_min_profit_per_share))
                 self.hedges_skipped += 1
                 continue
             size = filled_size
@@ -2514,6 +2531,84 @@ class TradingEngine:
                 completed += 1
                 self.hedges_completed += 1
         return completed
+
+    def process_momentum_exits(self, book_reader):
+        """V15.1-14: Momentum exit — sell one-sided fills if price rises >X%.
+
+        When one side fills but the hedge hasn't completed after max_wait_secs,
+        check if the filled token's current bid has risen above the fill price
+        by momentum_exit_threshold. If so, sell the position for profit and
+        cancel any remaining orders on that window.
+
+        This captures directional moves when the market trends in our favor
+        instead of waiting indefinitely for the other side to fill.
+        """
+        if not self.config.momentum_exit_enabled:
+            return 0
+        now = time.time()
+        exits = 0
+        for wid, sides in list(self.window_fill_sides.items()):
+            # Only check windows with exactly one side filled (not paired)
+            if wid in self.paired_windows:
+                continue
+            if len(sides) != 1:
+                continue
+            filled_side = list(sides.keys())[0]
+            fills = sides[filled_side]
+            if not fills:
+                continue
+            # Use the earliest fill for timing
+            earliest_fill = min(fills, key=lambda f: f.get("time", now))
+            fill_time = earliest_fill.get("time", now)
+            fill_price = earliest_fill.get("price", 0)
+            fill_size = sum(f.get("size", 0) for f in fills)
+            fill_token = earliest_fill.get("token_id", "")
+            hold_secs = now - fill_time
+            # Must hold for minimum time
+            if hold_secs < self.config.momentum_exit_min_hold_secs:
+                continue
+            # Only check momentum after waiting long enough for hedge
+            if hold_secs < self.config.momentum_exit_max_wait_secs:
+                continue
+            # Check current bid price for the filled token
+            spread = book_reader.get_spread(fill_token)
+            if not spread:
+                continue
+            current_bid = spread["bid"]
+            price_change = (current_bid - fill_price) / fill_price if fill_price > 0 else 0
+            if price_change >= self.config.momentum_exit_threshold:
+                # Price has risen enough — sell for profit
+                sell_profit = (current_bid - fill_price) * fill_size
+                fee_est = self.fee_calc._interp_fee_per_share(current_bid) * fill_size
+                net_profit = sell_profit - fee_est
+                self.logger.info(
+                    "\n  MOMENTUM EXIT | {} | {} {:.0f} @ ${:.2f} -> bid ${:.2f} | "
+                    "Change: {:+.1%} | Gross ${:+.2f} | Net ${:+.2f} (after ~${:.2f} fees) | "
+                    "Held {:.0f}s".format(
+                        wid, filled_side, fill_size, fill_price, current_bid,
+                        price_change, sell_profit, net_profit, fee_est, hold_secs))
+                # Cancel any remaining orders on this window first
+                self.cancel_window_orders(wid, strategy_filter="mm")
+                # Place sell order as taker
+                result = self.place_order(
+                    fill_token, "SELL", current_bid, fill_size,
+                    wid, "MOM-EXIT", "mm", is_taker=True)
+                if result:
+                    exits += 1
+                    # Remove from fill tracking since we've exited
+                    self.window_fill_sides.pop(wid, None)
+                    self.window_fill_cost.pop(wid, None)
+                    self.window_fill_tokens.pop(wid, None)
+                    # Update capital tracking
+                    cost = fill_price * fill_size
+                    self.capital_in_positions = max(0, self.capital_in_positions - cost)
+                    self._update_total_capital()
+            else:
+                self.logger.debug(
+                    "  MOM CHECK | {} | {} @ ${:.2f} | bid ${:.2f} | {:+.1%} < {:.1%} | {:.0f}s".format(
+                        wid, filled_side, fill_price, current_bid,
+                        price_change, self.config.momentum_exit_threshold, hold_secs))
+        return exits
 
     def cancel_window_orders(self, window_id, strategy_filter=None):
         oids = self.orders_by_window.get(window_id, [])
@@ -2965,10 +3060,13 @@ class MarketMakingStrategy:
             return
         if not self.config.mm_enabled:
             return
-        is_strong_down = (
-            trend_label.startswith("STRONG DN") or trend_label.startswith("CL-DN"))
-        is_strong_up = (
-            trend_label.startswith("STRONG UP") or trend_label.startswith("CL-UP"))
+        # V15.1-12: Relaxed directional filter — CL-DN/CL-UP now only block
+        # at STRONG confidence (>80%). At 60-80% (CL- prefix), the skew already
+        # adjusts prices to favor the predicted side, which is sufficient protection.
+        # This dramatically improves fill rate on 15m crypto windows where CL-UP/CL-DN
+        # triggers frequently at 70% confidence, causing most markets to be skipped.
+        is_strong_down = trend_label.startswith("STRONG DN")
+        is_strong_up = trend_label.startswith("STRONG UP")
         if spread_down:
             result = self.reward_optimizer.optimal_distance_for_pair(
                 spread_up, spread_down or {}, midpoint)
@@ -3109,6 +3207,11 @@ class MarketMakingStrategy:
             # Both sides must be eligible; never place one-sided exposure
             can_place_up = (not is_strong_down and 0.02 <= up_price < midpoint and up_size > 0)
             can_place_down = (not is_strong_up and 0.02 <= down_price <= 0.98 and down_size > 0)
+            # V15.1-12: Log when directional skew is active but not blocking
+            if (trend_label.startswith("CL-DN") or trend_label.startswith("CL-UP")) and can_place_up and can_place_down:
+                self.logger.debug(
+                    "    SKEW ACTIVE | {} | {} | skew={:+.3f} (not blocking)".format(
+                        window_id, trend_label, skew))
             if not can_place_up or not can_place_down:
                 self.logger.info(
                     "    PAIR SKIP | {} | Can't fund both sides (up={} dn={})".format(

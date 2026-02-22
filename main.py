@@ -191,7 +191,26 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     config.auto_merge_enabled = True
     config.blind_redeem_enabled = True   # Try redeem even before resolution confirmed
     config.immediate_pair_completion = False  # Not needed with Option C skip
-    config.hedge_max_loss_per_share = 0.0  # Disable hedging (pure MM)
+    # V15.1-13: Hedge completion — auto-buy other side after one side fills.
+    # Read from CC config, with sensible defaults.
+    config.hedge_completion_enabled = bool(cc_config.get("hedgeEnabled", True))
+    config.hedge_completion_delay = float(cc_config.get("hedgeDelay", 3.0))
+    config.hedge_max_combined_cost = float(cc_config.get("hedgeMaxCost", 0.98))
+    config.hedge_min_profit_per_share = float(cc_config.get("hedgeMinProfit", 0.005))
+    config.hedge_max_loss_per_share = 0.02    # Legacy fallback threshold
+
+    # V15.1-14: Momentum exit — sell one-sided fill if price rises >X%
+    config.momentum_exit_enabled = bool(cc_config.get("momentumExitEnabled", True))
+    config.momentum_exit_threshold = float(cc_config.get("momentumExitThreshold", 0.03))
+    config.momentum_exit_max_wait_secs = float(cc_config.get("momentumExitMaxWait", 120.0))
+    config.momentum_exit_min_hold_secs = 10.0  # Fixed at 10s
+
+    print(f"  Hedge: {'ON' if config.hedge_completion_enabled else 'OFF'} "
+          f"(delay={config.hedge_completion_delay}s, maxCost=${config.hedge_max_combined_cost:.2f}, "
+          f"minProfit=${config.hedge_min_profit_per_share:.3f})")
+    print(f"  Momentum Exit: {'ON' if config.momentum_exit_enabled else 'OFF'} "
+          f"(threshold={config.momentum_exit_threshold:.1%}, "
+          f"maxWait={config.momentum_exit_max_wait_secs:.0f}s)")
 
     # ── Auto-claim/redeem: reclaim USDC after market resolution ──────
     # After a 15-min market resolves, winning shares are worth $1 each.
@@ -696,6 +715,12 @@ class PolyMakerBot(PolymarketBot):
                         self.book_reader, self.vol_tracker)
                     if hedges:
                         self.logger.info("  {} hedges completed".format(hedges))
+                    # V15.1-14: Momentum exit — sell one-sided fills if price rises >X%
+                    mom_exits = self.engine.process_momentum_exits(self.book_reader)
+                    if mom_exits:
+                        self.logger.info("  {} momentum exits".format(mom_exits))
+                        if self.balance_checker:
+                            self.balance_checker._cache_time = 0
 
                 self.engine.cleanup_expired_windows(markets, self.churn_manager)
                 self.engine.prune_stale_orders()
