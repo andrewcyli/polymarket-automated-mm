@@ -222,6 +222,9 @@ class PolyMakerClient:
             "starting_wallet": "startingWallet",
             "merges_completed": "mergesCompleted",
             "total_merged_usd": "totalMergedUsd",
+            "claims_completed": "claimsCompleted",
+            "total_claimed_usd": "totalClaimedUsd",
+            "claims_pending": "claimsPending",
         }
         data: Dict[str, Any] = {"runId": rid}
         for k, v in metrics.items():
@@ -270,6 +273,9 @@ class PolyMakerClient:
             "starting_wallet": "startingWallet",
             "merges_completed": "mergesCompleted",
             "total_merged_usd": "totalMergedUsd",
+            "claims_completed": "claimsCompleted",
+            "total_claimed_usd": "totalClaimedUsd",
+            "claims_pending": "claimsPending",
         }
         data: Dict[str, Any] = {"runId": rid, "status": status}
         if error_message:

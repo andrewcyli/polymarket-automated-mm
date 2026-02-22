@@ -145,9 +145,21 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     # returns ~$1/share as USDC, freeing capital for the next window.
     # This is essential for capital efficiency in MM.
     config.auto_merge_enabled = True
-    config.blind_redeem_enabled = True   # Try redeem even before resolution
+    config.blind_redeem_enabled = True   # Try redeem even before resolution confirmed
     config.immediate_pair_completion = False  # Not needed with Option C skip
     config.hedge_max_loss_per_share = 0.0  # Disable hedging (pure MM)
+
+    # ── Auto-claim/redeem: reclaim USDC after market resolution ──────
+    # After a 15-min market resolves, winning shares are worth $1 each.
+    # Auto-claim redeems them back to USDC so capital returns to bankroll.
+    # This is FREE (gasless) through Polymarket's relayer system.
+    config.auto_claim_enabled = True
+    config.claim_delay_seconds = 15.0     # Wait 15s after window ends before checking
+    config.claim_check_interval = 10.0    # Check every 10s (fast for 15-min markets)
+    config.claim_max_attempts = 120       # Try for up to 20 minutes
+    config.claim_timeout_seconds = 1800.0 # Give up after 30 minutes
+    config.claim_fallback_sell = True      # Sell winning shares on CLOB if redeem fails
+    config.claim_sell_min_price = 0.95    # Minimum price for fallback sell
 
     # ── Disable v15 bankroll auto-detect ───────────────────────────────
     # CC is the authority for bankroll. Don't let v15 override it from wallet.
@@ -330,6 +342,8 @@ class PolyMakerBot(PolymarketBot):
 
         # Include merge stats for CC dashboard
         merge_stats = self.auto_merger.get_stats()
+        # Include claim/redeem stats for CC dashboard
+        claim_stats = self.claim_manager.get_claim_stats()
         cc.update_run(
             total_cycles=cc.cycle_count,
             total_orders=stats.get("total_placed", 0),
@@ -343,6 +357,9 @@ class PolyMakerBot(PolymarketBot):
             starting_wallet=starting_bal,
             merges_completed=merge_stats.get("merges_completed", 0),
             total_merged_usd=merge_stats.get("total_merged_usd", 0),
+            claims_completed=claim_stats.get("claimed_total", 0),
+            total_claimed_usd=claim_stats.get("total_claimed_usd", 0),
+            claims_pending=claim_stats.get("pending_claims", 0),
         )
 
     def _push_final_metrics(self, status="completed"):
@@ -366,6 +383,7 @@ class PolyMakerBot(PolymarketBot):
         ending_bankroll = wallet_bal if wallet_bal is not None else (self.config.kelly_bankroll + total_pnl)
 
         merge_stats = self.auto_merger.get_stats()
+        claim_stats = self.claim_manager.get_claim_stats()
         cc.stop_run(
             status=status,
             total_cycles=cc.cycle_count,
@@ -380,6 +398,9 @@ class PolyMakerBot(PolymarketBot):
             starting_wallet=starting_bal,
             merges_completed=merge_stats.get("merges_completed", 0),
             total_merged_usd=merge_stats.get("total_merged_usd", 0),
+            claims_completed=claim_stats.get("claimed_total", 0),
+            total_claimed_usd=claim_stats.get("total_claimed_usd", 0),
+            claims_pending=claim_stats.get("pending_claims", 0),
         )
 
     def run(self):
