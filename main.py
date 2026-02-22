@@ -131,14 +131,58 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     mode = cc_config.get("mode", "dry_run")
     config.dry_run = (mode != "live")
 
-    # ── Disable v15's internal strategy budget system ───────────────
-    # Give 100% of strategy budget to MM since it's the only active strategy
-    config.strategy_budget_pct = {"mm": 1.0, "sniper": 0.0, "arb": 0.0, "contrarian": 0.0}
+    # ── Per-Strategy Toggles & Budgets from CC ──────────────────────
+    # CC is the authority for which strategies are active and their budgets.
+    # If not toggled on, budget = $0 and strategy is disabled.
     
-    # Disable all non-MM strategies: Sniper, Arb, Contrarian
-    config.sniper_enabled = False
-    config.arb_enabled = False
-    config.contrarian_enabled = False
+    mm_enabled = cc_config.get("mmEnabled", True)
+    arb_enabled = cc_config.get("arbEnabled", False)
+    sniper_enabled = cc_config.get("sniperEnabled", False)
+    contrarian_enabled = cc_config.get("contrarianEnabled", False)
+    pre_exit_enabled = cc_config.get("preExitEnabled", False)
+    
+    config.mm_enabled = bool(mm_enabled)
+    config.arb_enabled = bool(arb_enabled)
+    config.sniper_enabled = bool(sniper_enabled)
+    config.contrarian_enabled = bool(contrarian_enabled)
+    
+    # Per-strategy budgets (disabled = $0)
+    mm_budget = float(cc_config.get("mmBudget", 0)) if mm_enabled else 0
+    arb_budget = float(cc_config.get("arbBudget", 0)) if arb_enabled else 0
+    sniper_budget = float(cc_config.get("sniperBudget", 0)) if sniper_enabled else 0
+    contrarian_budget = float(cc_config.get("contrarianBudget", 0)) if contrarian_enabled else 0
+    
+    # Map CC budgets to v15's strategy_budget_pct system
+    total_budget = mm_budget + arb_budget + sniper_budget + contrarian_budget
+    if total_budget > 0:
+        config.strategy_budget_pct = {
+            "mm": mm_budget / total_budget,
+            "arb": arb_budget / total_budget,
+            "sniper": sniper_budget / total_budget,
+            "contrarian": contrarian_budget / total_budget,
+        }
+        config.strategy_budget_enabled = True
+    else:
+        config.strategy_budget_pct = {"mm": 1.0, "sniper": 0.0, "arb": 0.0, "contrarian": 0.0}
+    
+    # Arb-specific parameters
+    arb_min_profit = cc_config.get("arbMinProfit")
+    if arb_min_profit is not None:
+        config.arb_min_profit = float(arb_min_profit)
+    arb_max_size = cc_config.get("arbMaxSize")
+    if arb_max_size is not None:
+        config.arb_max_size = float(arb_max_size)
+    
+    # Pre-exit: disabled by default (erodes margins in live trading)
+    # When disabled, positions resolve naturally via auto-claim for full $1 payout
+    if not pre_exit_enabled:
+        config.pre_exit_enabled = False
+    
+    print(f"  Strategies: MM={'ON' if mm_enabled else 'OFF'} (${mm_budget:.0f}) | "
+          f"Arb={'ON' if arb_enabled else 'OFF'} (${arb_budget:.0f}) | "
+          f"Sniper={'ON' if sniper_enabled else 'OFF'} (${sniper_budget:.0f}) | "
+          f"Contrarian={'ON' if contrarian_enabled else 'OFF'} (${contrarian_budget:.0f}) | "
+          f"PreExit={'ON' if pre_exit_enabled else 'OFF'}")
 
     # ── Cash management: enable auto-merge for paired positions ──────
     # When both UP+DOWN sides of a pair are filled, merging them on-chain
@@ -743,11 +787,14 @@ class PolyMakerBot(PolymarketBot):
                     try:
                         if trading_halted:
                             continue
-                        self.mm_strategy.execute(market)
-                        # Sniper, Arb, Contrarian disabled - MM only
-                        # self.sniper.execute(market)
-                        # self.arb.execute(market)
-                        # self.contrarian.execute(market)
+                        if self.config.mm_enabled:
+                            self.mm_strategy.execute(market)
+                        if self.config.arb_enabled:
+                            self.arb.execute(market)
+                        if self.config.sniper_enabled:
+                            self.sniper.execute(market)
+                        if self.config.contrarian_enabled:
+                            self.contrarian.execute(market)
                     except Exception as e:
                         self.logger.error("  Strategy error on {}: {}".format(
                             market["slug"], e))
