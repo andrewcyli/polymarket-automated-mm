@@ -218,6 +218,8 @@ class PolyMakerClient:
             "avg_fill_rate": "avgFillRate",
             "ending_bankroll": "endingBankroll",
             "max_capital": "maxCapitalDeployed",
+            "wallet_balance": "walletBalance",
+            "starting_wallet": "startingWallet",
         }
 
         data: Dict[str, Any] = {"runId": rid}
@@ -264,6 +266,8 @@ class PolyMakerClient:
             "avg_fill_rate": "avgFillRate",
             "ending_bankroll": "endingBankroll",
             "max_capital": "maxCapitalDeployed",
+            "wallet_balance": "walletBalance",
+            "starting_wallet": "startingWallet",
         }
 
         data: Dict[str, Any] = {"runId": rid, "status": status}

@@ -302,9 +302,12 @@ class PolyMakerBot(PolymarketBot):
 
         stats = self.engine.get_stats()
 
-        # Calculate PnL from sim engine or live
+        # Calculate PnL: prefer real wallet P&L, fall back to sim/engine
         total_pnl = 0.0
-        if self.sim_engine:
+        real_pnl = getattr(self, '_real_pnl', None)
+        if real_pnl is not None:
+            total_pnl = real_pnl  # Ground truth from wallet
+        elif self.sim_engine:
             s = self.sim_engine.get_summary()
             total_pnl = s.get("realized_pnl", 0)
         else:
@@ -317,6 +320,11 @@ class PolyMakerBot(PolymarketBot):
         if drawdown > self._max_drawdown:
             self._max_drawdown = drawdown
 
+        # Include wallet balance in metrics for CC dashboard
+        wallet_bal = getattr(self, '_current_wallet_balance', None)
+        starting_bal = getattr(self, '_starting_wallet_balance', None)
+        ending_bankroll = wallet_bal if wallet_bal is not None else (self.config.kelly_bankroll + total_pnl)
+
         cc.update_run(
             total_cycles=cc.cycle_count,
             total_orders=stats.get("total_placed", 0),
@@ -324,8 +332,10 @@ class PolyMakerBot(PolymarketBot):
             total_pnl=total_pnl,
             peak_pnl=self._peak_pnl,
             max_drawdown=self._max_drawdown,
-            ending_bankroll=self.config.kelly_bankroll + total_pnl,
+            ending_bankroll=ending_bankroll,
             max_capital=stats.get("total_exposure", 0),
+            wallet_balance=wallet_bal,
+            starting_wallet=starting_bal,
         )
 
     def _push_final_metrics(self, status="completed"):
@@ -335,11 +345,18 @@ class PolyMakerBot(PolymarketBot):
 
         stats = self.engine.get_stats()
         total_pnl = 0.0
-        if self.sim_engine:
+        real_pnl = getattr(self, '_real_pnl', None)
+        if real_pnl is not None:
+            total_pnl = real_pnl
+        elif self.sim_engine:
             s = self.sim_engine.get_summary()
             total_pnl = s.get("realized_pnl", 0)
         else:
             total_pnl = stats.get("live_pnl", 0) or 0
+
+        wallet_bal = getattr(self, '_current_wallet_balance', None)
+        starting_bal = getattr(self, '_starting_wallet_balance', None)
+        ending_bankroll = wallet_bal if wallet_bal is not None else (self.config.kelly_bankroll + total_pnl)
 
         cc.stop_run(
             status=status,
@@ -349,8 +366,10 @@ class PolyMakerBot(PolymarketBot):
             total_pnl=total_pnl,
             peak_pnl=self._peak_pnl,
             max_drawdown=self._max_drawdown,
-            ending_bankroll=self.config.kelly_bankroll + total_pnl,
+            ending_bankroll=ending_bankroll,
             max_capital=stats.get("total_exposure", 0),
+            wallet_balance=wallet_bal,
+            starting_wallet=starting_bal,
         )
 
     def run(self):
@@ -402,25 +421,54 @@ class PolyMakerBot(PolymarketBot):
             self.logger.info(f"  Command Center: run #{self._cc_run_id}")
         self.logger.info("=" * 70)
 
-        # V15.1-5: Bankroll auto-detect
-        if self.config.auto_detect_bankroll and self.balance_checker and not self.config.dry_run:
+        # ── Live Wallet Check at Startup ─────────────────────────────────
+        # CC sets kellyBankroll as the session budget ceiling.
+        # We read the actual wallet to: (1) validate we have enough, 
+        # (2) record starting balance for real P&L tracking.
+        self._starting_wallet_balance = None
+        self._wallet_read_failures = 0
+        self._max_wallet_failures = 10  # alert after this many consecutive failures
+        
+        if self.balance_checker and not self.config.dry_run:
             wallet_bal = None
             for _attempt in range(5):
                 self.balance_checker._cache_time = 0
                 wallet_bal = self.balance_checker.get_balance()
                 if wallet_bal is not None:
                     break
-                self.logger.info("  Bankroll detect attempt {} failed, retrying...".format(_attempt + 1))
+                self.logger.info("  Wallet read attempt {} failed, retrying...".format(_attempt + 1))
                 time.sleep(3)
+            
             if wallet_bal is not None and wallet_bal > 0:
-                old_bankroll = self.config.kelly_bankroll
-                self.config.kelly_bankroll = wallet_bal
+                self._starting_wallet_balance = wallet_bal
                 self.engine.starting_wallet_balance = wallet_bal
-                self.logger.info("  Bankroll: ${:.2f} (was ${:.2f})".format(
-                    wallet_bal, old_bankroll))
+                self.logger.info("  Wallet balance: ${:.2f} (USDC.e on Polygon)".format(wallet_bal))
+                
+                # Validate: wallet must have enough for the session
+                session_budget = self.config.max_total_exposure  # CC sessionBudget
+                if wallet_bal < session_budget:
+                    self.logger.warning(
+                        "  ⚠️  INSUFFICIENT FUNDS: wallet ${:.2f} < sessionBudget ${:.0f}. "
+                        "Bot may not be able to deploy full budget.".format(
+                            wallet_bal, session_budget))
+                
+                cc_bankroll = self.config.kelly_bankroll
+                if wallet_bal < cc_bankroll:
+                    self.logger.warning(
+                        "  ⚠️  WALLET < BANKROLL: wallet ${:.2f} < kellyBankroll ${:.0f}. "
+                        "Max loss protection uses CC bankroll (${:.0f}), not wallet.".format(
+                            wallet_bal, cc_bankroll, cc_bankroll))
+                else:
+                    self.logger.info("  ✓ Wallet ${:.2f} >= bankroll ${:.0f} — funds sufficient".format(
+                        wallet_bal, cc_bankroll))
             else:
-                self.logger.warning("  Bankroll auto-detect FAILED. Using KELLY_BANKROLL=${:.0f}".format(
-                    self.config.kelly_bankroll))
+                self.logger.warning(
+                    "  ⚠️  WALLET READ FAILED at startup. Real P&L tracking disabled. "
+                    "Max loss will use simulated P&L only. Check PROXY_WALLET and POLYGON_RPC_URL.")
+        elif self.config.dry_run:
+            self.logger.info("  Wallet: DRY RUN mode — no live wallet monitoring")
+        else:
+            self.logger.warning("  ⚠️  No balance checker available. Live wallet monitoring disabled.")
 
         # V15.1-1: Exposure limits
         # If CC set sessionBudget, max_total_exposure is already set by apply_cc_config.
@@ -455,13 +503,32 @@ class PolyMakerBot(PolymarketBot):
 
                 wallet_str = ""
                 pnl_str = ""
+                self._current_wallet_balance = None
+                self._real_pnl = None
                 if self.balance_checker and not self.config.dry_run:
                     bal = self.balance_checker.get_balance()
                     if bal is not None:
+                        self._current_wallet_balance = bal
+                        self._wallet_read_failures = 0
                         wallet_str = " | W:${:.0f}".format(bal)
-                    live_pnl = stats.get("live_pnl")
-                    if live_pnl is not None:
-                        pnl_str = " | P&L:${:+.2f}".format(live_pnl)
+                        
+                        # Real P&L = current wallet - starting wallet
+                        # This is the ground truth: actual USDC change
+                        if self._starting_wallet_balance is not None:
+                            self._real_pnl = bal - self._starting_wallet_balance
+                            pnl_str = " | realP&L:${:+.2f}".format(self._real_pnl)
+                    else:
+                        self._wallet_read_failures += 1
+                        if self._wallet_read_failures >= self._max_wallet_failures:
+                            if self._wallet_read_failures == self._max_wallet_failures:
+                                self.logger.warning(
+                                    "  ⚠️  WALLET READ FAILED {} consecutive times. "
+                                    "Real P&L tracking unreliable. Check RPC connection.".format(
+                                        self._wallet_read_failures))
+                        # Fall back to engine's live P&L estimate
+                        live_pnl = stats.get("live_pnl")
+                        if live_pnl is not None:
+                            pnl_str = " | estP&L:${:+.2f}".format(live_pnl)
 
                 cs = self.claim_manager.get_claim_stats()
                 claim_str = ""
@@ -575,27 +642,46 @@ class PolyMakerBot(PolymarketBot):
                     self.merge_detector.check_merges(
                         self.engine.token_holdings, self.engine._market_cache)
 
+                # ── Loss Protection: Dual-Source (Real Wallet + Sim) ────────
                 trading_halted = False
                 now = time.time()
+                loss_limit = -self.config.hard_loss_stop_pct * self.config.kelly_bankroll
+                
                 if now < self._loss_stop_until:
                     if cycle % 10 == 1:
                         self.logger.info("  LOSS COOLOFF -- {}s remaining".format(
                             int(self._loss_stop_until - now)))
                     trading_halted = True
-                elif self.sim_engine:
-                    s = self.sim_engine.get_summary()
-                    # Loss limit based on CC maxLossPct * bankroll
-                    loss_limit = -self.config.hard_loss_stop_pct * self.config.kelly_bankroll
-                    if s["realized_pnl"] < loss_limit:
+                else:
+                    # Source 1: Real wallet P&L (ground truth, primary)
+                    if self._real_pnl is not None and self._real_pnl < loss_limit:
                         self.logger.warning(
-                            "  *** LOSS STOP TRIGGERED *** P&L: ${:.2f} < limit ${:.2f} "
-                            "(maxLoss={:.0%} x bankroll=${:.0f}). Halting for {:.0f}s.".format(
-                                s["realized_pnl"], loss_limit,
+                            "  *** LOSS STOP (WALLET) *** realP&L: ${:.2f} < limit ${:.2f} "
+                            "(maxLoss={:.0%} x bankroll=${:.0f}). Wallet: ${:.2f} -> ${:.2f}. "
+                            "Halting for {:.0f}s.".format(
+                                self._real_pnl, loss_limit,
                                 self.config.hard_loss_stop_pct,
                                 self.config.kelly_bankroll,
+                                self._starting_wallet_balance or 0,
+                                self._current_wallet_balance or 0,
                                 self.config.hard_loss_cooloff))
                         self._loss_stop_until = now + self.config.hard_loss_cooloff
                         trading_halted = True
+                    
+                    # Source 2: Simulated P&L (fallback when wallet read unavailable)
+                    elif self.sim_engine and self._real_pnl is None:
+                        s = self.sim_engine.get_summary()
+                        if s["realized_pnl"] < loss_limit:
+                            self.logger.warning(
+                                "  *** LOSS STOP (SIM) *** simP&L: ${:.2f} < limit ${:.2f} "
+                                "(maxLoss={:.0%} x bankroll=${:.0f}). "
+                                "Halting for {:.0f}s. (wallet read unavailable)".format(
+                                    s["realized_pnl"], loss_limit,
+                                    self.config.hard_loss_stop_pct,
+                                    self.config.kelly_bankroll,
+                                    self.config.hard_loss_cooloff))
+                            self._loss_stop_until = now + self.config.hard_loss_cooloff
+                            trading_halted = True
 
                 # V15-2 + V15.1-6: Dual-path tradeable filter
                 tradeable_markets = []
