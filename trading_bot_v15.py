@@ -1159,6 +1159,13 @@ class KellySizer:
 class WalletBalanceChecker:
     USDC_E = USDC_E_ADDRESS
     ERC20_ABI = json.loads('[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},{"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"}]')
+    # V15.1-7: Fallback RPCs for wallet balance reads
+    FALLBACK_RPCS = [
+        "https://polygon-bor-rpc.publicnode.com",
+        "https://polygon.llamarpc.com",
+        "https://rpc.ankr.com/polygon",
+        "https://polygon.drpc.org",
+    ]
 
     def __init__(self, config, logger):
         self.config = config
@@ -1168,6 +1175,7 @@ class WalletBalanceChecker:
         self.decimals = 6
         self._cache = None
         self._cache_time = 0
+        self._fallback_providers = []
         self._init_web3()
 
     def _init_web3(self):
@@ -1178,30 +1186,64 @@ class WalletBalanceChecker:
                 self.config.polygon_rpc, request_kwargs={"timeout": 10}))
             self.contract = self.w3.eth.contract(
                 address=Web3.to_checksum_address(self.USDC_E), abi=self.ERC20_ABI)
-            self.logger.info("  Wallet balance checker initialized")
+            self.logger.info("  Wallet balance checker initialized (primary: {})".format(
+                self.config.polygon_rpc[:40]))
         except Exception as e:
             self.logger.warning(f"  Wallet balance checker init failed: {e}")
             self.w3 = None
+        # Pre-init fallback providers
+        for rpc_url in self.FALLBACK_RPCS:
+            if rpc_url == self.config.polygon_rpc:
+                continue
+            try:
+                fb_w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 8}))
+                fb_contract = fb_w3.eth.contract(
+                    address=Web3.to_checksum_address(self.USDC_E), abi=self.ERC20_ABI)
+                self._fallback_providers.append((rpc_url, fb_w3, fb_contract))
+            except Exception:
+                pass
+        if self._fallback_providers:
+            self.logger.info("  Wallet balance: {} fallback RPCs ready".format(
+                len(self._fallback_providers)))
+
+    def _read_balance_from(self, contract, wallet):
+        raw = contract.functions.balanceOf(
+            Web3.to_checksum_address(wallet)).call()
+        return raw / (10 ** self.decimals)
 
     def get_balance(self):
-        if not self.w3 or not self.contract:
-            return None
         wallet = self.config.proxy_wallet
         if not wallet:
             return None
         now = time.time()
         if self._cache is not None and now - self._cache_time < self.config.wallet_balance_cache_ttl:
             return self._cache
-        try:
-            raw = self.contract.functions.balanceOf(
-                Web3.to_checksum_address(wallet)).call()
-            balance = raw / (10 ** self.decimals)
-            self._cache = balance
-            self._cache_time = now
-            return balance
-        except Exception as e:
-            self.logger.debug(f"  Balance check failed: {e}")
-            return self._cache
+        # Try primary RPC
+        if self.w3 and self.contract:
+            try:
+                balance = self._read_balance_from(self.contract, wallet)
+                self._cache = balance
+                self._cache_time = now
+                return balance
+            except Exception as e:
+                self.logger.info("  Wallet read failed (primary): {}".format(
+                    str(e)[:80]))
+        # Try fallback RPCs
+        for rpc_url, fb_w3, fb_contract in self._fallback_providers:
+            try:
+                balance = self._read_balance_from(fb_contract, wallet)
+                self._cache = balance
+                self._cache_time = now
+                self.logger.info("  Wallet read OK via fallback: {}".format(
+                    rpc_url[:40]))
+                return balance
+            except Exception as e:
+                self.logger.debug("  Wallet fallback {} failed: {}".format(
+                    rpc_url[:30], str(e)[:60]))
+                continue
+        self.logger.warning("  Wallet read failed on all RPCs (primary + {} fallbacks)".format(
+            len(self._fallback_providers)))
+        return self._cache
 
 
 # -----------------------------------------------------------------
@@ -3868,6 +3910,12 @@ class PolymarketBot:
                 for market in tradeable_markets:
                     try:
                         if trading_halted:
+                            continue
+                        # V15.1-7: Dynamic max_concurrent_windows enforcement
+                        current_active = set(self.engine.window_exposure.keys())
+                        wid = market["window_id"]
+                        if (len(current_active) >= self.config.max_concurrent_windows
+                                and wid not in current_active):
                             continue
                         self.mm_strategy.execute(market)
                         self.sniper.execute(market)

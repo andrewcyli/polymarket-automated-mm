@@ -787,6 +787,20 @@ class PolyMakerBot(PolymarketBot):
                     try:
                         if trading_halted:
                             continue
+                        # V15.1-7: Dynamic max_concurrent_windows enforcement
+                        # Re-check after each market because place_order() updates
+                        # window_exposure during the loop. Without this, cycle 1
+                        # lets all markets through the pre-filter (which checks
+                        # the STALE snapshot) and overshoots the limit.
+                        current_active = set(self.engine.window_exposure.keys())
+                        wid = market["window_id"]
+                        if (len(current_active) >= self.config.max_concurrent_windows
+                                and wid not in current_active):
+                            self.logger.debug(
+                                "  CONCURRENT SKIP | {} | {}/{} windows active".format(
+                                    wid, len(current_active),
+                                    self.config.max_concurrent_windows))
+                            continue
                         if self.config.mm_enabled:
                             self.mm_strategy.execute(market)
                         if self.config.arb_enabled:
