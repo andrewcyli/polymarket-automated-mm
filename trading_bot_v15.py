@@ -28,6 +28,17 @@ V15.1 Changes from V15:
            max_order_horizon (default 2700s = 45min). Prevents burning capital
            and API calls on windows 90+ minutes away.
 
+  V15.1-17. FIX MERGE + REDEEM CASHFLOW:
+            MERGE: _find_mergeable now builds combined lookup from _market_cache
+            + expired_windows_pending_claim + window_metadata + window_fill_tokens.
+            Previously, cleanup_expired_windows removed windows from _market_cache
+            BEFORE merge ran, so merge could never find paired UP+DOWN holdings.
+            Now merge runs BEFORE cleanup in the main loop.
+            REDEEM: process_claims now checks resolution FIRST before any redeem
+            attempt. Previously tried blind redeem every 3rd attempt regardless
+            of resolution status, wasting RPC calls. New priority:
+            1) CLOB-SELL (fastest, no gas) 2) CTF-DIRECT 3) CTF-PROXY 4) BLIND-REDEEM.
+
   V15.1-16. PER-MARKET BUDGET INCLUDES FILLS: place_order() per-market check
             now uses window_exposure (open orders) + window_fill_cost (filled orders)
             instead of just window_exposure. Previously, after a fill removed the
@@ -1410,11 +1421,48 @@ class AutoMerger:
 
     def _find_mergeable(self, market_cache, token_holdings):
         window_holdings = {}
+        # V15.1-17: Build combined lookup from market_cache + expired_windows_pending_claim
+        # so we can still match tokens after windows expire from market_cache.
+        combined_cache = dict(market_cache)  # start with active windows
+        if self.engine:
+            for wid, info in self.engine.expired_windows_pending_claim.items():
+                if wid not in combined_cache:
+                    combined_cache[wid] = {
+                        "token_up": info.get("token_up", ""),
+                        "token_down": info.get("token_down", ""),
+                        "condition_id": info.get("condition_id", ""),
+                        "slug": info.get("slug", ""),
+                    }
+            # Also check window_metadata for windows that have been registered
+            for wid, meta in self.engine.window_metadata.items():
+                if wid not in combined_cache:
+                    combined_cache[wid] = {
+                        "token_up": meta.get("token_up", ""),
+                        "token_down": meta.get("token_down", ""),
+                        "condition_id": meta.get("condition_id", ""),
+                        "slug": meta.get("slug", ""),
+                    }
+            # Also check window_fill_tokens for token mapping
+            for wid, tokens in self.engine.window_fill_tokens.items():
+                if wid not in combined_cache:
+                    # Reconstruct from fill data + _is_up_token_cache
+                    token_up = token_down = ""
+                    for t in tokens:
+                        tid = t.get("token_id", "")
+                        if t.get("is_up"):
+                            token_up = tid
+                        elif t.get("is_up") is False:
+                            token_down = tid
+                    if token_up or token_down:
+                        combined_cache[wid] = {
+                            "token_up": token_up, "token_down": token_down,
+                            "condition_id": "", "slug": "",
+                        }
         for token_id, holding in token_holdings.items():
             size = holding.get("size", 0)
             if size < self.config.merge_min_shares:
                 continue
-            for wid, market in market_cache.items():
+            for wid, market in combined_cache.items():
                 if token_id == market.get("token_up"):
                     if wid not in window_holdings:
                         window_holdings[wid] = {"up_size": 0, "down_size": 0, "market": market}
@@ -1423,6 +1471,13 @@ class AutoMerger:
                     if wid not in window_holdings:
                         window_holdings[wid] = {"up_size": 0, "down_size": 0, "market": market}
                     window_holdings[wid]["down_size"] = size
+        # V15.1-17: Log merge scan results for debugging
+        if window_holdings:
+            for wid, info in window_holdings.items():
+                self.logger.info(
+                    "  MERGE SCAN | {} | UP:{:.1f} DN:{:.1f} | mergeable:{:.1f}".format(
+                        wid, info["up_size"], info["down_size"],
+                        min(info["up_size"], info["down_size"])))
         return window_holdings
 
     def _execute_merge(self, condition_id, shares, window_id):
@@ -1697,21 +1752,23 @@ class AutoClaimManager:
                 del self._pending_claims[wid]
                 continue
             self._claim_attempts[wid] = attempts + 1
-            if self.config.blind_redeem_enabled and not self.rpc_limiter.is_backed_off:
-                if attempts % 3 == 0:
-                    success = self._try_blind_redeem(condition_id, wid)
-                    if success:
-                        self._mark_claimed(wid, condition_id, "BLIND-REDEEM")
-                        claimed += 1
-                        continue
+            # V15.1-17: Check resolution FIRST before any redeem attempt.
+            # Previous logic tried blind redeem before checking resolution,
+            # wasting RPC calls on unresolved markets.
             if not info.get("resolved", False):
                 resolved_info = self._check_if_resolved(wid, info)
                 if not resolved_info:
+                    # Not resolved yet — skip all redeem attempts
+                    if attempts % 10 == 0:
+                        self.logger.info("  CLAIM WAIT | {} | Not resolved yet ({} checks)".format(
+                            wid, attempts + 1))
                     continue
                 info["resolved"] = True
                 info["winning_token"] = resolved_info.get("winning_token", "")
                 info["outcome"] = resolved_info.get("outcome", "")
                 self.logger.info("  RESOLVED | {} | Winner: {}".format(wid, info["outcome"]))
+            # Market is resolved — now try to claim/redeem
+            # Priority: 1) CLOB-SELL (fastest, no gas) 2) CTF-DIRECT 3) CTF-PROXY 4) BLIND-REDEEM
             if self.config.claim_fallback_sell and info.get("winning_token"):
                 success = self._fallback_sell(wid, info)
                 if success:
@@ -1731,6 +1788,13 @@ class AutoClaimManager:
                         self._mark_claimed(wid, condition_id, "CTF-PROXY")
                         claimed += 1
                         continue
+            # V15.1-17: Blind redeem as last resort (market already confirmed resolved)
+            if self.config.blind_redeem_enabled and not self.rpc_limiter.is_backed_off:
+                success = self._try_blind_redeem(condition_id, wid)
+                if success:
+                    self._mark_claimed(wid, condition_id, "BLIND-REDEEM")
+                    claimed += 1
+                    continue
             next_interval = self.config.claim_check_interval * (1.2 ** min(attempts + 1, 10))
             if attempts % 10 == 0:
                 self.logger.info("  CLAIM RETRY | {} | {}/{} | Next {:.0f}s".format(

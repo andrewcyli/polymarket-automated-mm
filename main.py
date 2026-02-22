@@ -732,9 +732,18 @@ class PolyMakerBot(PolymarketBot):
                         if self.balance_checker:
                             self.balance_checker._cache_time = 0
 
+                # V15.1-17: Merge BEFORE cleanup so _market_cache still has
+                # expired window data (token_up/token_down needed for matching).
+                if not self.config.dry_run:
+                    merged = self.auto_merger.check_and_merge_all(
+                        self.engine._market_cache, self.engine.token_holdings)
+                    if merged:
+                        self.logger.info("  Auto-merged {} positions | ${:.2f} returned".format(
+                            merged, self.auto_merger.total_merged_usd))
+                        if self.balance_checker:
+                            self.balance_checker._cache_time = 0
                 self.engine.cleanup_expired_windows(markets, self.churn_manager)
                 self.engine.prune_stale_orders()
-
                 if not self.config.dry_run:
                     self.engine.reconcile_capital_from_wallet()
                     self._schedule_live_claims()
@@ -747,13 +756,6 @@ class PolyMakerBot(PolymarketBot):
                         markets, self.price_feed, self.book_reader)
                     if exits > 0:
                         self.logger.info("  Pre-exit: {} sells placed".format(exits))
-                    merged = self.auto_merger.check_and_merge_all(
-                        self.engine._market_cache, self.engine.token_holdings)
-                    if merged:
-                        self.logger.info("  Auto-merged {} positions | ${:.2f} returned".format(
-                            merged, self.auto_merger.total_merged_usd))
-                        if self.balance_checker:
-                            self.balance_checker._cache_time = 0
 
                 for market in markets:
                     self.engine._is_up_token_cache[market["token_up"]] = True
