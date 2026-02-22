@@ -2217,10 +2217,14 @@ class TradingEngine:
                         label, window_id, order_cost, available))
                 return None
             wexp = self.window_exposure.get(window_id, 0)
-            if wexp + order_cost > self.config.max_position_per_market:
+            # Allow 2% tolerance on per-market cap to handle rounding in equal-shares sizing
+            # This scales automatically when max_position_per_market changes
+            market_cap_with_tolerance = self.config.max_position_per_market * 1.02
+            if wexp + order_cost > market_cap_with_tolerance:
                 self.logger.info(
-                    "    REJECT {} | {} | window exp ${:.2f}+${:.2f} > max ${:.2f}".format(
-                        label, window_id, wexp, order_cost, self.config.max_position_per_market))
+                    "    REJECT {} | {} | window exp ${:.2f}+${:.2f} > max ${:.2f} (tol ${:.2f})".format(
+                        label, window_id, wexp, order_cost,
+                        self.config.max_position_per_market, market_cap_with_tolerance))
                 return None
             if self.total_exposure + order_cost > self.config.max_total_exposure:
                 self.logger.info(
@@ -2920,6 +2924,15 @@ class MarketMakingStrategy:
                         pair_cost = new_pair_cost
                         pair_profit = 1.0 - new_pair_cost
                         reward_score = self.reward_optimizer.reward_score(spread, optimal_d)
+        # Fix 3: Enforce optimal_d >= mm_base_spread (CC mmSpreadMin)
+        # This ensures the bot never places orders closer to midpoint than the
+        # configured minimum spread, regardless of what the reward optimizer suggests.
+        # Scales automatically when mmSpreadMin is changed in CC.
+        if optimal_d < self.config.mm_base_spread:
+            self.logger.debug(
+                "  SPREAD FLOOR | {} | d={:.3f} < min {:.3f}, using min".format(
+                    window_id, optimal_d, self.config.mm_base_spread))
+            optimal_d = self.config.mm_base_spread
         buy_up_price = round(midpoint - optimal_d + skew, 2)
         buy_down_price = round((1.0 - midpoint) - optimal_d - skew, 2)
         if buy_up_price <= 0.02 or buy_down_price <= 0.02:
@@ -3011,20 +3024,36 @@ class MarketMakingStrategy:
                 return
             self.engine.cancel_window_orders(window_id, strategy_filter="mm")
             self.last_refresh[window_id] = now
-            if not is_strong_down and 0.02 <= up_price < midpoint and up_size > 0:
-                result = self.engine.place_order(
-                    market["token_up"], "BUY", up_price, up_size,
-                    window_id, "MM-L{}".format(level), "mm", is_taker=False)
-                if result:
-                    self.churn_manager.record_update(
-                        window_id, market["token_up"], up_price, up_size)
-            if not is_strong_up and 0.02 <= down_price <= 0.98 and down_size > 0:
-                result = self.engine.place_order(
-                    market["token_down"], "BUY", down_price, down_size,
-                    window_id, "MM-L{}d".format(level), "mm", is_taker=False)
-                if result:
-                    self.churn_manager.record_update(
-                        window_id, market["token_down"], down_price, down_size)
+            # --- PAIR-OR-SKIP GUARD ---
+            # Both sides must be eligible; never place one-sided exposure
+            can_place_up = (not is_strong_down and 0.02 <= up_price < midpoint and up_size > 0)
+            can_place_down = (not is_strong_up and 0.02 <= down_price <= 0.98 and down_size > 0)
+            if not can_place_up or not can_place_down:
+                self.logger.info(
+                    "    PAIR SKIP | {} | Can't fund both sides (up={} dn={})".format(
+                        window_id, can_place_up, can_place_down))
+                continue
+            up_result = self.engine.place_order(
+                market["token_up"], "BUY", up_price, up_size,
+                window_id, "MM-L{}".format(level), "mm", is_taker=False)
+            if not up_result:
+                self.logger.info(
+                    "    PAIR ABORT | {} | UP side failed, skipping DN".format(window_id))
+                continue
+            self.churn_manager.record_update(
+                window_id, market["token_up"], up_price, up_size)
+            dn_result = self.engine.place_order(
+                market["token_down"], "BUY", down_price, down_size,
+                window_id, "MM-L{}d".format(level), "mm", is_taker=False)
+            if not dn_result:
+                # DN failed — cancel the orphaned UP to prevent one-sided exposure
+                self.logger.warning(
+                    "    ORPHAN CANCEL | {} | DN rejected, cancelling UP {}".format(
+                        window_id, up_result))
+                self.engine.cancel_window_orders(window_id, strategy_filter="mm")
+                continue
+            self.churn_manager.record_update(
+                window_id, market["token_down"], down_price, down_size)
             est_reward = self.reward_optimizer.estimate_reward_per_hour(
                 2, reward_score, (up_size + down_size) / 2)
             self._total_estimated_reward += est_reward * (self.config.cycle_interval / 3600)

@@ -108,7 +108,7 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     
     mm_spread_max = cc_config.get("mmSpreadMax")
     if mm_spread_max and mm_spread_max > 0:
-        config.mm_spread_max = float(mm_spread_max)
+        config.mm_max_spread = float(mm_spread_max)
 
     # Risk parameters
     max_concurrent = cc_config.get("maxConcurrentWindows")
