@@ -2820,6 +2820,15 @@ class MarketMakingStrategy:
         # V15.1-6: Skip windows too far out
         if time_remaining > self.config.max_order_horizon:
             return
+        # CC-OPT-C: Skip windows that already have fills to prevent double-ordering.
+        # Once a pair is filled, the position is established and the guaranteed
+        # profit is locked. Re-entering doubles exposure without doubling the hedge.
+        fill_cost = self.engine.window_fill_cost.get(window_id, 0)
+        if fill_cost > 0:
+            self.logger.debug(
+                "  FILL SKIP | {} | Already filled ${:.2f} — position established".format(
+                    window_id, fill_cost))
+            return
         last = self.last_refresh.get(window_id, 0)
         if now - last < self.config.mm_refresh_interval:
             return

@@ -218,15 +218,15 @@ class PolyMakerClient:
             "avg_fill_rate": "avgFillRate",
             "ending_bankroll": "endingBankroll",
             "max_capital": "maxCapitalDeployed",
-            "wallet_balance": "walletBalance",
+             "wallet_balance": "walletBalance",
             "starting_wallet": "startingWallet",
+            "merges_completed": "mergesCompleted",
+            "total_merged_usd": "totalMergedUsd",
         }
-
         data: Dict[str, Any] = {"runId": rid}
         for k, v in metrics.items():
             api_key = key_map.get(k, k)
             data[api_key] = v
-
         result = self._post("/run/update", data)
         return result is not None
 
@@ -268,8 +268,9 @@ class PolyMakerClient:
             "max_capital": "maxCapitalDeployed",
             "wallet_balance": "walletBalance",
             "starting_wallet": "startingWallet",
+            "merges_completed": "mergesCompleted",
+            "total_merged_usd": "totalMergedUsd",
         }
-
         data: Dict[str, Any] = {"runId": rid, "status": status}
         if error_message:
             data["errorMessage"] = error_message

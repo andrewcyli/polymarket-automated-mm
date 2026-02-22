@@ -140,11 +140,14 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     config.arb_enabled = False
     config.contrarian_enabled = False
 
-    # Disable auxiliary features that are not needed for pure MM
-    config.auto_merge_enabled = False
-    config.immediate_pair_completion = False
-    config.blind_redeem_enabled = False
-    config.hedge_max_loss_per_share = 0.0  # Disable hedging
+    # ── Cash management: enable auto-merge for paired positions ──────
+    # When both UP+DOWN sides of a pair are filled, merging them on-chain
+    # returns ~$1/share as USDC, freeing capital for the next window.
+    # This is essential for capital efficiency in MM.
+    config.auto_merge_enabled = True
+    config.blind_redeem_enabled = True   # Try redeem even before resolution
+    config.immediate_pair_completion = False  # Not needed with Option C skip
+    config.hedge_max_loss_per_share = 0.0  # Disable hedging (pure MM)
 
     # ── Disable v15 bankroll auto-detect ───────────────────────────────
     # CC is the authority for bankroll. Don't let v15 override it from wallet.
@@ -325,6 +328,8 @@ class PolyMakerBot(PolymarketBot):
         starting_bal = getattr(self, '_starting_wallet_balance', None)
         ending_bankroll = wallet_bal if wallet_bal is not None else (self.config.kelly_bankroll + total_pnl)
 
+        # Include merge stats for CC dashboard
+        merge_stats = self.auto_merger.get_stats()
         cc.update_run(
             total_cycles=cc.cycle_count,
             total_orders=stats.get("total_placed", 0),
@@ -336,6 +341,8 @@ class PolyMakerBot(PolymarketBot):
             max_capital=stats.get("total_exposure", 0),
             wallet_balance=wallet_bal,
             starting_wallet=starting_bal,
+            merges_completed=merge_stats.get("merges_completed", 0),
+            total_merged_usd=merge_stats.get("total_merged_usd", 0),
         )
 
     def _push_final_metrics(self, status="completed"):
@@ -358,6 +365,7 @@ class PolyMakerBot(PolymarketBot):
         starting_bal = getattr(self, '_starting_wallet_balance', None)
         ending_bankroll = wallet_bal if wallet_bal is not None else (self.config.kelly_bankroll + total_pnl)
 
+        merge_stats = self.auto_merger.get_stats()
         cc.stop_run(
             status=status,
             total_cycles=cc.cycle_count,
@@ -370,6 +378,8 @@ class PolyMakerBot(PolymarketBot):
             max_capital=stats.get("total_exposure", 0),
             wallet_balance=wallet_bal,
             starting_wallet=starting_bal,
+            merges_completed=merge_stats.get("merges_completed", 0),
+            total_merged_usd=merge_stats.get("total_merged_usd", 0),
         )
 
     def run(self):
