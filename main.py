@@ -418,6 +418,10 @@ class PolyMakerBot(PolymarketBot):
         merge_stats = self.auto_merger.get_stats()
         # Include claim/redeem stats for CC dashboard
         claim_stats = self.claim_manager.get_claim_stats()
+        # V15.1-16: Include position value for accurate portfolio P&L
+        pos_value = getattr(self, '_position_value', None)
+        if pos_value is None:
+            pos_value = self.engine.get_position_value()
         cc.update_run(
             total_cycles=cc.cycle_count,
             total_orders=stats.get("total_placed", 0),
@@ -429,6 +433,7 @@ class PolyMakerBot(PolymarketBot):
             max_capital=stats.get("total_exposure", 0),
             wallet_balance=wallet_bal,
             starting_wallet=starting_bal,
+            position_value=pos_value,
             merges_completed=merge_stats.get("merges_completed", 0),
             total_merged_usd=merge_stats.get("total_merged_usd", 0),
             claims_completed=claim_stats.get("claimed_total", 0),
@@ -617,17 +622,22 @@ class PolyMakerBot(PolymarketBot):
                         self._wallet_read_failures = 0
                         wallet_str = " | W:${:.0f}".format(bal)
                         
-                        # V15.1-9: Real P&L = (wallet + position_value) - starting_wallet
+                        # V15.1-16: Real P&L = (wallet + live_position_value) - starting_wallet
+                        # Uses actual market prices for positions, not cost basis.
                         # Wallet-only P&L is misleading: buying tokens reduces wallet
                         # but creates positions with value. Must include both.
                         if self._starting_wallet_balance is not None:
                             wallet_change = bal - self._starting_wallet_balance
-                            # capital_in_positions tracks cost basis of held tokens
-                            pos_value = getattr(self.engine, 'capital_in_positions', 0)
+                            # V15.1-16: Use live position value (market price * shares)
+                            # instead of capital_in_positions (cost basis) which gets
+                            # zeroed by reconcile and doesn't reflect actual value.
+                            pos_value = self.engine.get_position_value()
+                            pos_cost = getattr(self.engine, 'capital_in_positions', 0)
                             self._real_pnl = wallet_change + pos_value
                             self._wallet_only_pnl = wallet_change
-                            pnl_str = " | realP&L:${:+.2f} (wallet:${:+.2f} +pos:${:.2f})".format(
-                                self._real_pnl, wallet_change, pos_value)
+                            self._position_value = pos_value
+                            pnl_str = " | realP&L:${:+.2f} (wallet:${:+.2f} +pos:${:.2f}/cost:${:.2f})".format(
+                                self._real_pnl, wallet_change, pos_value, pos_cost)
                     else:
                         self._wallet_read_failures += 1
                         if self._wallet_read_failures >= self._max_wallet_failures:
@@ -768,6 +778,15 @@ class PolyMakerBot(PolymarketBot):
                         self.engine.token_holdings, self.engine._market_cache)
 
                 # ── Loss Protection: Dual-Source (Real Wallet + Sim) ────────
+                # V15.1-16: Recompute P&L AFTER check_fills so position value
+                # reflects fills detected in this cycle. Without this, the P&L
+                # computed at cycle start (before check_fills) doesn't include
+                # newly filled positions, causing false loss stops.
+                if self._starting_wallet_balance is not None and self._current_wallet_balance is not None:
+                    wallet_change = self._current_wallet_balance - self._starting_wallet_balance
+                    pos_value = self.engine.get_position_value()
+                    self._real_pnl = wallet_change + pos_value
+                    self._position_value = pos_value
                 trading_halted = False
                 now = time.time()
                 loss_limit = -self.config.hard_loss_stop_pct * self.config.kelly_bankroll

@@ -28,6 +28,17 @@ V15.1 Changes from V15:
            max_order_horizon (default 2700s = 45min). Prevents burning capital
            and API calls on windows 90+ minutes away.
 
+  V15.1-16. PER-MARKET BUDGET INCLUDES FILLS: place_order() per-market check
+            now uses window_exposure (open orders) + window_fill_cost (filled orders)
+            instead of just window_exposure. Previously, after a fill removed the
+            order from active_orders, window_exposure dropped, allowing hedge buys
+            to pass the cap. Total spend could reach 2-3x budget_per_market.
+            Also fixes reconcile_capital_from_wallet() to NOT zero
+            capital_in_positions when filled_windows exist — tokens are still held
+            and must be counted in P&L. The old code caused wallet-only P&L to
+            trigger false loss stops (wallet down $57 but tokens worth $57 = $0
+            actual loss), halting the bot for 6+ hours overnight.
+
   V15.1-15. PERSISTENT FILLED WINDOW GUARD: Adds filled_windows set that
             tracks windows with ANY fill. Survives reconcile_capital_from_wallet()
             which previously wiped window_fill_cost={}, allowing re-entry into
@@ -1728,12 +1739,30 @@ class AutoClaimManager:
 
     def _try_blind_redeem(self, condition_id, window_id):
         if not self.w3 or not self.ctf_contract or not self.account:
+            self.logger.debug("  BLIND REDEEM SKIP | {} | No web3/contract/account".format(window_id))
             return False
         self.blind_redeem_attempts += 1
         try:
             usdc_addr = Web3.to_checksum_address(USDC_E_ADDRESS)
             parent = bytes(32)
             cid_bytes = self._to_bytes32(condition_id)
+            # V15.1-16: Check payoutDenominator first to avoid wasting gas on
+            # unresolved markets. If denom==0, market hasn't resolved yet.
+            try:
+                self.rpc_limiter.wait()
+                denom = self.ctf_contract.functions.payoutDenominator(cid_bytes).call()
+                if denom == 0:
+                    self.logger.info("  BLIND REDEEM SKIP | {} | Not resolved (denom=0)".format(window_id))
+                    return False
+            except Exception as e_denom:
+                err_d = str(e_denom).lower()
+                if "rate limit" in err_d or "-32090" in err_d:
+                    self.rpc_limiter.report_rate_limit(self._parse_rate_limit_delay(e_denom))
+                    return False
+                self.logger.info("  BLIND REDEEM | {} | payoutDenominator check failed: {}".format(
+                    window_id, str(e_denom)[:80]))
+                # Continue anyway — blind redeem is meant to try even without confirmation
+            # Try proxy wallet first, then direct
             if self.proxy_contract and self.config.proxy_wallet:
                 redeem_data = self.ctf_contract.encodeABI(
                     fn_name="redeemPositions",
@@ -1759,26 +1788,38 @@ class AutoClaimManager:
                         receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
                         if receipt.status == 1:
                             self.blind_redeem_successes += 1
-                            self.logger.info("  BLIND REDEEM OK | {} | Tx: {}...".format(
-                                window_id, self.w3.to_hex(tx_hash)[:20]))
+                            self.logger.info("  BLIND REDEEM OK | {} | {} | Tx: {}...".format(
+                                window_id, fn_name, self.w3.to_hex(tx_hash)[:20]))
                             return True
                         else:
+                            self.logger.info("  BLIND REDEEM REVERTED | {} | {} | Tx: {}...".format(
+                                window_id, fn_name, self.w3.to_hex(tx_hash)[:20]))
                             return False
                     except Exception as e1:
                         err = str(e1).lower()
+                        self.logger.info("  BLIND REDEEM FAIL | {} | {} | {}".format(
+                            window_id, fn_name, str(e1)[:100]))
                         if "rate limit" in err or "-32090" in err:
                             self.rpc_limiter.report_rate_limit(self._parse_rate_limit_delay(e1))
                             return False
                         if "revert" in err or "execution reverted" in err:
-                            return False
+                            # Try next fn_name variant
+                            try:
+                                self.rpc_limiter.wait()
+                                nonce = self.w3.eth.get_transaction_count(self.account.address)
+                            except Exception:
+                                return False
+                            continue
                         try:
                             self.rpc_limiter.wait()
                             nonce = self.w3.eth.get_transaction_count(self.account.address)
                         except Exception:
                             return False
-            return False
+            # V15.1-16: Fall back to direct redeem if no proxy or proxy failed
+            return self._redeem_direct(condition_id, window_id)
         except Exception as e:
             err = str(e).lower()
+            self.logger.info("  BLIND REDEEM ERROR | {} | {}".format(window_id, str(e)[:100]))
             if "rate limit" in err or "-32090" in err:
                 self.rpc_limiter.report_rate_limit(self._parse_rate_limit_delay(e))
             return False
@@ -2225,12 +2266,27 @@ class TradingEngine:
     def reconcile_capital_from_wallet(self):
         if (len(self.window_exposure) == 0 and len(self.active_orders) == 0
                 and self.capital_in_positions > 1.0):
-            self.logger.info("  RECONCILE: No orders, releasing ${:.2f} | filled_windows={}".format(
-                self.capital_in_positions, len(self.filled_windows)))
-            self.capital_in_positions = 0
+            # V15.1-16: Do NOT zero capital_in_positions if we still hold tokens.
+            # The old code zeroed it, which made the P&L calculation think we had
+            # $0 in positions, triggering false loss stops (wallet down but tokens held).
+            # Only release capital for windows that have been fully claimed/sold.
+            filled_capital = sum(self.window_fill_cost.get(wid, 0)
+                                 for wid in self.filled_windows)
+            unfilled_capital = self.capital_in_positions - filled_capital
+            if unfilled_capital > 1.0:
+                self.logger.info("  RECONCILE: Releasing ${:.2f} unfilled capital "
+                    "(keeping ${:.2f} in {} filled windows)".format(
+                        unfilled_capital, filled_capital, len(self.filled_windows)))
+                self.capital_in_positions = max(0, filled_capital)
+            elif len(self.filled_windows) == 0:
+                # No filled windows, safe to release all
+                self.logger.info("  RECONCILE: No orders/fills, releasing ${:.2f}".format(
+                    self.capital_in_positions))
+                self.capital_in_positions = 0
+            else:
+                self.logger.debug("  RECONCILE: Keeping ${:.2f} in {} filled windows".format(
+                    self.capital_in_positions, len(self.filled_windows)))
             # V15.1-15: Only clear window_fill_cost for windows NOT in filled_windows.
-            # filled_windows is the persistent guard; window_fill_cost is the capital tracker.
-            # We can release capital but must NOT remove the re-entry guard.
             surviving_fill_cost = {}
             for wid in self.filled_windows:
                 if wid in self.window_fill_cost:
@@ -2250,16 +2306,44 @@ class TradingEngine:
                         self.capital_in_positions = max(0, self.capital_in_positions - release)
                         self._update_total_capital()
 
+    def get_position_value(self):
+        """V15.1-16: Compute live position value from token_holdings and market_cache.
+        Uses the best available price for each token:
+        1. Market's last known price from market_cache
+        2. Cost basis per share from token_holdings
+        3. Fallback: 0.50 (binary market midpoint)
+        """
+        total = 0.0
+        for token_id, holding in self.token_holdings.items():
+            size = holding.get("size", 0)
+            if size <= 0:
+                continue
+            # Try to find the token's current price from market_cache
+            price = None
+            for wid, market in self._market_cache.items():
+                if token_id == market.get("token_up"):
+                    # UP token: price is the UP probability
+                    price = market.get("up_price", market.get("prob_up"))
+                    break
+                elif token_id == market.get("token_down"):
+                    # DOWN token: price is the DOWN probability
+                    price = market.get("down_price", market.get("prob_down"))
+                    break
+            if price is None or price <= 0:
+                # Fallback: use cost basis per share, or 0.50
+                cost = holding.get("cost", 0)
+                price = (cost / size) if size > 0 and cost > 0 else 0.50
+            total += size * price
+        return total
+
     def get_live_pnl(self):
         if self.starting_wallet_balance is None or not self.balance_checker:
             return None
         current = self.balance_checker.get_balance()
         if current is None:
             return None
-        held_value = sum(
-            h.get("size", 0) * 0.50
-            for h in self.token_holdings.values()
-        )
+        # V15.1-16: Use actual position value instead of hardcoded 0.50
+        held_value = self.get_position_value()
         return (current + self.capital_deployed + held_value) - self.starting_wallet_balance
 
     # V15.1-4: Verbose order rejection logging
@@ -2292,14 +2376,20 @@ class TradingEngine:
                         label, window_id, order_cost, available))
                 return None
             wexp = self.window_exposure.get(window_id, 0)
+            # V15.1-16: Include fill costs in per-market budget check.
+            # window_exposure only tracks OPEN orders; after a fill the order is
+            # removed, so hedge/re-entry buys bypass the cap. Adding
+            # window_fill_cost gives the TRUE total spend on this window.
+            wfill = self.window_fill_cost.get(window_id, 0)
+            total_window_spend = wexp + wfill
             # Allow 2% tolerance on per-market cap to handle rounding in equal-shares sizing
             # This scales automatically when max_position_per_market changes
             market_cap_with_tolerance = self.config.max_position_per_market * 1.02
-            if wexp + order_cost > market_cap_with_tolerance:
+            if total_window_spend + order_cost > market_cap_with_tolerance:
                 self.logger.info(
-                    "    REJECT {} | {} | window exp ${:.2f}+${:.2f} > max ${:.2f} (tol ${:.2f})".format(
-                        label, window_id, wexp, order_cost,
-                        self.config.max_position_per_market, market_cap_with_tolerance))
+                    "    REJECT {} | {} | window spend ${:.2f}(open)+${:.2f}(filled)+${:.2f}(new) > max ${:.2f}".format(
+                        label, window_id, wexp, wfill, order_cost,
+                        market_cap_with_tolerance))
                 return None
             if self.total_exposure + order_cost > self.config.max_total_exposure:
                 self.logger.info(

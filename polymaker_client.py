@@ -225,6 +225,7 @@ class PolyMakerClient:
             "claims_completed": "claimsCompleted",
             "total_claimed_usd": "totalClaimedUsd",
             "claims_pending": "claimsPending",
+            "position_value": "positionValue",
         }
         data: Dict[str, Any] = {"runId": rid}
         for k, v in metrics.items():
