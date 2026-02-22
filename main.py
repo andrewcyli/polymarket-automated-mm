@@ -146,7 +146,66 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     config.blind_redeem_enabled = False
     config.hedge_max_loss_per_share = 0.0  # Disable hedging
 
+    # ── Disable v15 bankroll auto-detect ───────────────────────────────
+    # CC is the authority for bankroll. Don't let v15 override it from wallet.
+    config.auto_detect_bankroll = False
+
+    # ── Pre-flight validation ──────────────────────────────────────────
+    _preflight_validate(config, cc_config)
+
     return config
+
+
+def _preflight_validate(config: BotConfig, cc_config: dict):
+    """
+    Validate that CC config makes sense before the bot starts trading.
+    Prints warnings for any issues that could cause problems.
+    """
+    issues = []
+    
+    session_budget = cc_config.get("sessionBudget", 0)
+    budget_per_market = cc_config.get("budgetPerMarket", 0)
+    bankroll = cc_config.get("kellyBankroll", 0)
+    max_concurrent = cc_config.get("maxConcurrentWindows", 4)
+    max_loss_pct = cc_config.get("maxLossPct", 0.2)
+    
+    # Check: sessionBudget should not exceed bankroll
+    if session_budget > bankroll:
+        issues.append(
+            f"  ⚠️  sessionBudget (${session_budget}) > kellyBankroll (${bankroll}). "
+            f"Session budget should not exceed total bankroll."
+        )
+    
+    # Check: budgetPerMarket * maxConcurrentWindows should not exceed sessionBudget
+    max_deploy = budget_per_market * max_concurrent
+    if max_deploy > session_budget and session_budget > 0:
+        issues.append(
+            f"  ⚠️  budgetPerMarket (${budget_per_market}) x {max_concurrent} markets = ${max_deploy:.0f} "
+            f"exceeds sessionBudget (${session_budget}). Bot may run out of capital."
+        )
+    
+    # Check: budgetPerMarket should be at least $10 for viable pair orders
+    if budget_per_market < 10:
+        issues.append(
+            f"  ⚠️  budgetPerMarket (${budget_per_market}) is below $10 minimum. "
+            f"Each market needs at least $5/side for viable pair orders."
+        )
+    
+    # Check: max loss makes sense
+    max_loss_dollar = max_loss_pct * bankroll
+    if max_loss_dollar > session_budget and session_budget > 0:
+        issues.append(
+            f"  ⚠️  maxLoss (${max_loss_dollar:.0f} = {max_loss_pct:.0%} of ${bankroll}) "
+            f"exceeds sessionBudget (${session_budget}). Loss stop may not trigger before budget exhausted."
+        )
+    
+    if issues:
+        print("\n  ╔══ PRE-FLIGHT VALIDATION ══════════════════════════════════╗")
+        for issue in issues:
+            print(issue)
+        print("  ╚══════════════════════════════════════════════════════════╝\n")
+    else:
+        print("  ✓ Pre-flight validation passed")
 
 
 class PolyMakerBot(PolymarketBot):
@@ -196,6 +255,8 @@ class PolyMakerBot(PolymarketBot):
                            f"session_budget=${self.config.max_total_exposure:.0f}, "
                            f"budget_per_market=${self.config.max_position_per_market:.0f}, "
                            f"order_size=${self.config.mm_order_size:.0f}/side, "
+                           f"max_loss={self.config.hard_loss_stop_pct:.0%} (${self.config.hard_loss_stop_pct * self.config.kelly_bankroll:.0f}), "
+                           f"cooldown={self.config.hard_loss_cooloff:.0f}s, "
                            f"dry_run={self.config.dry_run}")
 
         # Validate credentials for live mode
@@ -374,6 +435,11 @@ class PolyMakerBot(PolymarketBot):
         self.logger.info("  Exposure limits: max_total=${:.0f} | max_per_market=${:.0f} | order_size=${:.0f}/side | bankroll=${:.0f}".format(
             self.config.max_total_exposure, self.config.max_position_per_market,
             self.config.mm_order_size, self.config.kelly_bankroll))
+        self.logger.info("  Risk controls: max_loss={:.0%} (${:.0f}) | cooldown={:.0f}s | reserve={:.0%}".format(
+            self.config.hard_loss_stop_pct,
+            self.config.hard_loss_stop_pct * self.config.kelly_bankroll,
+            self.config.hard_loss_cooloff,
+            self.config.deploy_reserve_pct))
 
         self.running = True
         cycle = 0
@@ -518,8 +584,16 @@ class PolyMakerBot(PolymarketBot):
                     trading_halted = True
                 elif self.sim_engine:
                     s = self.sim_engine.get_summary()
+                    # Loss limit based on CC maxLossPct * bankroll
                     loss_limit = -self.config.hard_loss_stop_pct * self.config.kelly_bankroll
                     if s["realized_pnl"] < loss_limit:
+                        self.logger.warning(
+                            "  *** LOSS STOP TRIGGERED *** P&L: ${:.2f} < limit ${:.2f} "
+                            "(maxLoss={:.0%} x bankroll=${:.0f}). Halting for {:.0f}s.".format(
+                                s["realized_pnl"], loss_limit,
+                                self.config.hard_loss_stop_pct,
+                                self.config.kelly_bankroll,
+                                self.config.hard_loss_cooloff))
                         self._loss_stop_until = now + self.config.hard_loss_cooloff
                         trading_halted = True
 
