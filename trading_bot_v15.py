@@ -28,6 +28,15 @@ V15.1 Changes from V15:
            max_order_horizon (default 2700s = 45min). Prevents burning capital
            and API calls on windows 90+ minutes away.
 
+  V15.1-15. PERSISTENT FILLED WINDOW GUARD: Adds filled_windows set that
+            tracks windows with ANY fill. Survives reconcile_capital_from_wallet()
+            which previously wiped window_fill_cost={}, allowing re-entry into
+            windows that already had fills. Root cause of 5x $30 DOWN orders on
+            same BTC 15m window ($150 on $100 bankroll). Guard is checked in:
+            (1) MM execute, (2) Sniper/Arb/Contrarian execute, (3) tradeable
+            filter, (4) strategy execution loop. Only released on window expiry
+            or momentum exit. Also preserves window_fill_cost for filled windows
+            during reconciliation instead of blanket reset.
   Carried from V15:
   V15-1 through V15-6, V14.1-1 through V14.1-8, V14-1 through V14-10,
   V13.1-1 through V13.1-2, V13-1 through V13-12, V8-1 through V8-13,
@@ -2053,6 +2062,12 @@ class TradingEngine:
         self.window_edge = {}
         self.unredeemed_position_value = 0.0
         self.paired_windows = set()
+        # V15.1-15: Persistent filled window tracking.
+        # Once a window has ANY fill, it's added here and never re-entered.
+        # Only cleared on window expiry/claim or momentum exit.
+        # This survives reconcile_capital_from_wallet() which resets window_fill_cost.
+        self.filled_windows = set()  # {window_id, ...}
+        self.window_entry_count = {}  # {window_id: int} — safety counter
 
         if not config.dry_run and HAS_CLOB:
             try:
@@ -2155,6 +2170,9 @@ class TradingEngine:
                     wid, "+".join(sorted(sides.keys())) if sides else "?", fill_cost))
             self.window_fill_sides.pop(wid, None)
             self._market_cache.pop(wid, None)
+            # V15.1-15: Release filled window tracking on expiry
+            self.filled_windows.discard(wid)
+            self.window_entry_count.pop(wid, None)
         self.known_windows = active_ids
         self._recalc_exposure()
 
@@ -2207,10 +2225,17 @@ class TradingEngine:
     def reconcile_capital_from_wallet(self):
         if (len(self.window_exposure) == 0 and len(self.active_orders) == 0
                 and self.capital_in_positions > 1.0):
-            self.logger.info("  RECONCILE: No orders, releasing ${:.2f}".format(
-                self.capital_in_positions))
+            self.logger.info("  RECONCILE: No orders, releasing ${:.2f} | filled_windows={}".format(
+                self.capital_in_positions, len(self.filled_windows)))
             self.capital_in_positions = 0
-            self.window_fill_cost = {}
+            # V15.1-15: Only clear window_fill_cost for windows NOT in filled_windows.
+            # filled_windows is the persistent guard; window_fill_cost is the capital tracker.
+            # We can release capital but must NOT remove the re-entry guard.
+            surviving_fill_cost = {}
+            for wid in self.filled_windows:
+                if wid in self.window_fill_cost:
+                    surviving_fill_cost[wid] = self.window_fill_cost[wid]
+            self.window_fill_cost = surviving_fill_cost
             self._update_total_capital()
             return
         if self.balance_checker and self.config.check_wallet_balance:
@@ -2340,6 +2365,9 @@ class TradingEngine:
                     })
                     self.window_fill_cost[window_id] = (
                         self.window_fill_cost.get(window_id, 0) + price * size)
+                    # V15.1-15: Mark window as filled — prevents re-entry
+                    self.filled_windows.add(window_id)
+                    self.window_entry_count[window_id] = self.window_entry_count.get(window_id, 0) + 1
                     is_up = self._is_up_token_cache.get(token_id)
                     side_label = "UP" if is_up else "DOWN"
                     if window_id not in self.window_fill_sides:
@@ -2425,6 +2453,9 @@ class TradingEngine:
                             cost = fill_price * fill_size
                             self.window_fill_cost[wid] = (
                                 self.window_fill_cost.get(wid, 0) + cost)
+                            # V15.1-15: Mark window as filled — prevents re-entry
+                            self.filled_windows.add(wid)
+                            self.window_entry_count[wid] = self.window_entry_count.get(wid, 0) + 1
                             if wid not in self.window_fill_tokens:
                                 self.window_fill_tokens[wid] = []
                             self.window_fill_tokens[wid].append({
@@ -2599,6 +2630,9 @@ class TradingEngine:
                     self.window_fill_sides.pop(wid, None)
                     self.window_fill_cost.pop(wid, None)
                     self.window_fill_tokens.pop(wid, None)
+                    # V15.1-15: Release filled window guard after momentum exit
+                    self.filled_windows.discard(wid)
+                    self.window_entry_count.pop(wid, None)
                     # Update capital tracking
                     cost = fill_price * fill_size
                     self.capital_in_positions = max(0, self.capital_in_positions - cost)
@@ -2722,6 +2756,7 @@ class TradingEngine:
             "estimated_rewards": self.estimated_rewards_total,
             "unredeemed_value": self.unredeemed_position_value,
             "paired_windows": len(self.paired_windows),
+            "filled_windows": len(self.filled_windows),
         }
 
 
@@ -3000,11 +3035,21 @@ class MarketMakingStrategy:
         # V15.1-6: Skip windows too far out
         if time_remaining > self.config.max_order_horizon:
             return
-        # CC-OPT-C: Skip windows that already have fills to prevent double-ordering.
-        # Once a pair is filled, the position is established and the guaranteed
-        # profit is locked. Re-entering doubles exposure without doubling the hedge.
+        # V15.1-15: PERSISTENT filled window guard (replaces CC-OPT-C).
+        # filled_windows survives reconcile_capital_from_wallet() which resets
+        # window_fill_cost. This is the PRIMARY re-entry prevention mechanism.
+        if window_id in self.engine.filled_windows:
+            fill_cost = self.engine.window_fill_cost.get(window_id, 0)
+            entries = self.engine.window_entry_count.get(window_id, 0)
+            self.logger.debug(
+                "  FILL GUARD | {} | Already filled ${:.2f} (entries={}) — no re-entry".format(
+                    window_id, fill_cost, entries))
+            return
+        # CC-OPT-C (backup): Also check window_fill_cost in case filled_windows
+        # was somehow missed (belt-and-suspenders).
         fill_cost = self.engine.window_fill_cost.get(window_id, 0)
         if fill_cost > 0:
+            self.engine.filled_windows.add(window_id)  # Repair missing entry
             self.logger.debug(
                 "  FILL SKIP | {} | Already filled ${:.2f} — position established".format(
                     window_id, fill_cost))
@@ -3265,6 +3310,9 @@ class LateSniper:
         if not self.config.sniper_enabled:
             return
         window_id = market["window_id"]
+        # V15.1-15: Skip windows with existing fills
+        if window_id in self.engine.filled_windows:
+            return
         asset = market["asset"]
         now = time.time()
         time_remaining = market["end_time"] - now
@@ -3350,6 +3398,9 @@ class CombinedProbArb:
         if not self.config.arb_enabled:
             return
         window_id = market["window_id"]
+        # V15.1-15: Skip windows with existing fills
+        if window_id in self.engine.filled_windows:
+            return
         now = time.time()
         last = self.last_scan.get(window_id, 0)
         if now - last < self.config.arb_scan_interval:
@@ -3424,6 +3475,9 @@ class ContrarianFade:
         if not self.config.contrarian_enabled:
             return
         window_id = market["window_id"]
+        # V15.1-15: Skip windows with existing fills
+        if window_id in self.engine.filled_windows:
+            return
         asset = market["asset"]
         now = time.time()
         time_remaining = market["end_time"] - now

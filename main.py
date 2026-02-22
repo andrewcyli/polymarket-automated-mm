@@ -812,6 +812,9 @@ class PolyMakerBot(PolymarketBot):
                 # with condition_id deduplication
                 tradeable_markets = []
                 active_window_ids = set(self.engine.window_exposure.keys())
+                # V15.1-15: Include filled windows in "active" set for filtering
+                # This prevents filled windows from passing concurrent/edge filters
+                filled_wids = self.engine.filled_windows
                 # V15.1-10: Track condition_ids that already have exposure
                 # to prevent entering the same underlying market via
                 # different timeframes (e.g. 15m and 5m for same BTC 8:45)
@@ -821,11 +824,15 @@ class PolyMakerBot(PolymarketBot):
                     if cid:
                         active_condition_ids.add(cid)
                 for market in markets:
+                    wid = market["window_id"]
+                    # V15.1-15: Skip windows that already have fills (persistent guard)
+                    if wid in filled_wids:
+                        continue
                     edge = market.get("edge", 0)
                     maker_edge = market.get("maker_edge", edge)
                     if (edge < self.config.min_pair_edge
                             and maker_edge < self.config.pair_min_profit):
-                        if market["window_id"] not in active_window_ids:
+                        if wid not in active_window_ids:
                             continue
                     if market.get("is_advance", False) and not self.config.trade_advance_windows:
                         continue
@@ -855,13 +862,16 @@ class PolyMakerBot(PolymarketBot):
                     try:
                         if trading_halted:
                             continue
+                        wid = market["window_id"]
+                        # V15.1-15: Dynamic filled window guard within strategy loop
+                        if wid in self.engine.filled_windows:
+                            continue
                         # V15.1-7: Dynamic max_concurrent_windows enforcement
                         # Re-check after each market because place_order() updates
                         # window_exposure during the loop. Without this, cycle 1
                         # lets all markets through the pre-filter (which checks
                         # the STALE snapshot) and overshoots the limit.
                         current_active = set(self.engine.window_exposure.keys())
-                        wid = market["window_id"]
                         if (len(current_active) >= self.config.max_concurrent_windows
                                 and wid not in current_active):
                             self.logger.debug(
