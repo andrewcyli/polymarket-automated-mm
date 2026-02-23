@@ -38,6 +38,9 @@ V15.1 Changes from V15:
             attempt. Previously tried blind redeem every 3rd attempt regardless
             of resolution status, wasting RPC calls. New priority:
             1) CLOB-SELL (fastest, no gas) 2) CTF-DIRECT 3) CTF-PROXY 4) BLIND-REDEEM.
+            V15.1-17b: After successful merge, reduce window_fill_cost by merged
+            amount to keep reconcile accounting accurate. filled_windows guard
+            remains (window stays blocked from re-entry even after merge).
 
   V15.1-16. PER-MARKET BUDGET INCLUDES FILLS: place_order() per-market check
             now uses window_exposure (open orders) + window_fill_cost (filled orders)
@@ -1377,6 +1380,19 @@ class AutoMerger:
                     self.engine.session_total_spent = max(
                         0, self.engine.session_total_spent - mergeable)
                     self.engine._update_total_capital()
+                    # V15.1-17b: After merge returns USDC, clean up accounting.
+                    # window_fill_cost must be reduced so reconcile doesn't
+                    # inflate capital_in_positions back up. filled_windows
+                    # guard remains until cleanup_expired_windows releases it
+                    # (the window is still blocked from re-entry, which is correct
+                    # since the position is gone and we don't want to re-enter).
+                    old_fill = self.engine.window_fill_cost.get(wid, 0)
+                    if old_fill > 0:
+                        new_fill = max(0, old_fill - mergeable)
+                        if new_fill > 0:
+                            self.engine.window_fill_cost[wid] = new_fill
+                        else:
+                            self.engine.window_fill_cost.pop(wid, None)
                 self.logger.info(
                     "  MERGED OK | {} | {:.1f} shares -> ~${:.2f} USDC returned".format(
                         wid, mergeable, mergeable))
@@ -1413,6 +1429,14 @@ class AutoMerger:
                 self.engine.session_total_spent = max(
                     0, self.engine.session_total_spent - mergeable)
                 self.engine._update_total_capital()
+                # V15.1-17b: Clean up window_fill_cost after simulated merge
+                old_fill = self.engine.window_fill_cost.get(wid, 0)
+                if old_fill > 0:
+                    new_fill = max(0, old_fill - mergeable)
+                    if new_fill > 0:
+                        self.engine.window_fill_cost[wid] = new_fill
+                    else:
+                        self.engine.window_fill_cost.pop(wid, None)
             self.logger.info(
                 "  MERGED (sim) | {} | {:.1f} shares -> ~${:.2f} returned".format(
                     wid, mergeable, mergeable))
