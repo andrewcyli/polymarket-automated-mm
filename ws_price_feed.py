@@ -1,15 +1,20 @@
 """
-WebSocket-Enhanced Price Feed
-==============================
-Wraps the existing PriceFeed with real-time RTDS data from WebSocket.
+WebSocket-Enhanced Price Feed & Order Book Reader
+===================================================
+Wraps the existing PriceFeed and OrderBookReader with real-time WebSocket data.
 
-Priority chain:
+Price feed priority:
 1. RTDS WebSocket (Binance real-time) — sub-second latency
 2. Chainlink on-chain (Polygon RPC) — ~2-3 second latency
 3. CoinGecko REST API — ~10-30 second latency
 
-The bot uses this as a drop-in replacement for PriceFeed.
-If WebSocket is down, it automatically falls back to the existing REST-based feeds.
+Orderbook priority:
+1. WebSocket book snapshot + incremental deltas — sub-second
+2. WebSocket best_bid_ask events — sub-second (spread only)
+3. REST API polling — ~1-5 second latency
+
+The bot uses these as drop-in replacements.
+If WebSocket is down, they automatically fall back to the existing REST-based feeds.
 """
 
 import logging
@@ -127,6 +132,11 @@ class WSOrderBookReader:
     Enhanced order book reader that checks WebSocket StateStore first,
     then falls back to the existing REST-based OrderBookReader.
     
+    Three data sources (in priority order):
+    1. Full orderbook from StateStore (snapshot + incremental deltas)
+    2. best_bid_ask from StateStore (fast spread-only path)
+    3. REST API (legacy fallback)
+    
     Drop-in replacement: same interface as OrderBookReader.
     """
 
@@ -137,35 +147,80 @@ class WSOrderBookReader:
 
         self.legacy = legacy_book_reader
         self.state_store = state_store
-        self._ws_hit_count = 0
+        self._ws_book_hits = 0
+        self._ws_bba_hits = 0  # best_bid_ask fast path hits
         self._fallback_count = 0
+        self._last_source: Dict[str, str] = {}  # token_id -> last source used
+
+    @property
+    def _ws_hit_count(self):
+        """Backward-compatible total WS hit count."""
+        return self._ws_book_hits + self._ws_bba_hits
 
     def get_book(self, token_id: str) -> Optional[dict]:
-        """Get orderbook. WebSocket first, then REST."""
+        """
+        Get orderbook. WebSocket first, then REST.
+        
+        The WS book includes the initial snapshot plus any incremental
+        price_change deltas applied since the last snapshot.
+        """
         if self.state_store:
             ws_book = self.state_store.get_orderbook(token_id)
             if ws_book:
-                self._ws_hit_count += 1
+                self._ws_book_hits += 1
+                self._last_source[token_id] = "ws_book"
                 return ws_book
 
         self._fallback_count += 1
+        self._last_source[token_id] = "rest"
         return self.legacy.get_book(token_id)
 
     def get_spread(self, token_id: str) -> Optional[dict]:
-        """Get spread data. Uses WebSocket book if available."""
+        """
+        Get spread data. Uses three-tier priority:
+        1. Full WS book → compute spread (most accurate, includes depth)
+        2. WS best_bid_ask → instant spread (no depth info)
+        3. REST fallback
+        """
         if self.state_store:
+            # Tier 1: Full WS book (includes depth for imbalance calculation)
             ws_book = self.state_store.get_orderbook(token_id)
             if ws_book:
-                # Compute spread from WebSocket book data
                 bids = ws_book.get("bids", [])
                 asks = ws_book.get("asks", [])
                 if bids and asks:
                     spread_data = self._compute_spread(bids, asks)
                     if spread_data:
-                        self._ws_hit_count += 1
+                        self._ws_book_hits += 1
+                        self._last_source[token_id] = "ws_book"
                         return spread_data
 
+            # Tier 2: best_bid_ask fast path (no depth, but instant)
+            bba = self.state_store.get_best_bid_ask(token_id)
+            if bba:
+                try:
+                    best_bid = float(bba["best_bid"])
+                    best_ask = float(bba["best_ask"])
+                    if best_bid > 0 and best_ask > 0 and best_ask > best_bid:
+                        spread = best_ask - best_bid
+                        midpoint = (best_bid + best_ask) / 2
+                        self._ws_bba_hits += 1
+                        self._last_source[token_id] = "ws_bba"
+                        return {
+                            "bid": best_bid,
+                            "ask": best_ask,
+                            "spread": spread,
+                            "midpoint": midpoint,
+                            "total_bid_size": 0,  # Not available from bba
+                            "total_ask_size": 0,
+                            "imbalance": 0,
+                        }
+                except (ValueError, TypeError, KeyError):
+                    pass
+
+        # Tier 3: REST fallback
         self._fallback_count += 1
+        self._last_source[token_id] = "rest"
         return self.legacy.get_spread(token_id)
 
     def _compute_spread(self, bids: list, asks: list) -> Optional[dict]:
@@ -212,14 +267,67 @@ class WSOrderBookReader:
         self.legacy.invalidate_cache(token_id)
 
     def get_available_liquidity(self, token_id, side, price, size_needed):
-        """Get available liquidity. Falls back to legacy for now."""
+        """
+        Get available liquidity. Uses WS book if available, else REST.
+        
+        This is the same algorithm as OrderBookReader.get_available_liquidity
+        but uses the WS-maintained book instead of making a REST call.
+        """
+        # Try WS book first
+        if self.state_store:
+            ws_book = self.state_store.get_orderbook(token_id)
+            if ws_book:
+                return self._compute_liquidity(ws_book, side, price, size_needed)
+
+        # Fall back to legacy REST
         return self.legacy.get_available_liquidity(token_id, side, price, size_needed)
 
-    def get_stats(self) -> dict:
+    def _compute_liquidity(self, book: dict, side: str, price: float, size_needed: float) -> dict:
+        """
+        Compute available liquidity from book data.
+        Same algorithm as OrderBookReader.get_available_liquidity.
+        """
+        if side == "BUY":
+            orders = sorted(book.get("asks", []), key=lambda x: float(x.get("price", 0)))
+        else:
+            orders = sorted(book.get("bids", []), key=lambda x: float(x.get("price", 0)), reverse=True)
+
+        filled = 0.0
+        total_cost = 0.0
+        for order in orders:
+            op = float(order.get("price", 0))
+            os_val = float(order.get("size", 0))
+            can_fill = min(os_val, size_needed - filled)
+            filled += can_fill
+            total_cost += can_fill * op
+            if filled >= size_needed:
+                break
+
+        avg_price = total_cost / filled if filled > 0 else price
+        slippage = abs(avg_price - price) / price if price > 0 else 0
         return {
-            "ws_hits": self._ws_hit_count,
+            "available": filled >= size_needed * 0.5,
+            "fillable_size": filled,
+            "avg_price": avg_price,
+            "slippage": slippage,
+        }
+
+    def get_book_freshness(self, token_id: str) -> Optional[dict]:
+        """Get book freshness info for diagnostics."""
+        if self.state_store:
+            return self.state_store.get_book_freshness(token_id)
+        return None
+
+    def get_stats(self) -> dict:
+        """Get detailed orderbook reader statistics."""
+        total = self._ws_book_hits + self._ws_bba_hits + self._fallback_count
+        return {
+            "ws_book_hits": self._ws_book_hits,
+            "ws_bba_hits": self._ws_bba_hits,
+            "ws_hits": self._ws_hit_count,  # backward compat
             "fallbacks": self._fallback_count,
             "hit_rate": (
-                self._ws_hit_count / max(1, self._ws_hit_count + self._fallback_count)
+                self._ws_hit_count / max(1, total)
             ),
+            "sources": dict(self._last_source),
         }

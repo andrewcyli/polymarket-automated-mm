@@ -797,6 +797,13 @@ class PolyMakerBot(PolymarketBot):
                         ws_str += " | Fills:{}(ws:{},rest:{})".format(
                             fill_mode, fd_stats["ws_fills_session"],
                             fd_stats["rest_fallback_count"])
+                    # Orderbook stats
+                    if hasattr(self.book_reader, 'get_stats'):
+                        bk_stats = self.book_reader.get_stats()
+                        ws_str += " | Book:ws{}/bba{}/rest{}".format(
+                            bk_stats.get("ws_book_hits", bk_stats.get("ws_hits", 0)),
+                            bk_stats.get("ws_bba_hits", 0),
+                            bk_stats.get("fallbacks", 0))
 
                 self.logger.info(
                     "\n{}\n  C{} | {} | Ord:{} | Exp:${:.0f} | Avail:${:.0f} | MaxExp:${:.0f}"

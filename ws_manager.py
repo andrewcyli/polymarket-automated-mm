@@ -174,18 +174,75 @@ class StateStore:
     # ── Market Channel Accessors ──
 
     def update_orderbook(self, token_id: str, book_data: dict):
+        """Store a full orderbook snapshot."""
         with self._lock:
             self._orderbooks[token_id] = {
                 **book_data,
                 "timestamp": time.time(),
+                "snapshot_ts": time.time(),  # When the full snapshot was received
+                "update_count": 0,  # Number of incremental updates since snapshot
             }
 
-    def get_orderbook(self, token_id: str) -> Optional[dict]:
+    def apply_book_delta(self, token_id: str, side: str, price: str, size: str):
+        """
+        Apply an incremental orderbook update from a price_change event.
+        
+        When an order is placed or cancelled, the market channel sends a
+        price_change event with the new size at that price level.
+        - If size > 0: update or add the price level
+        - If size == 0: remove the price level
+        """
         with self._lock:
             entry = self._orderbooks.get(token_id)
-            if entry and time.time() - entry.get("timestamp", 0) < 30:
+            if not entry:
+                return  # No snapshot yet — can't apply delta
+            
+            book_side = "bids" if side.upper() == "BUY" else "asks"
+            levels = entry.get(book_side, [])
+            
+            price_str = str(price)
+            size_float = float(size)
+            
+            # Find existing level at this price
+            found = False
+            new_levels = []
+            for level in levels:
+                if str(level.get("price", "")) == price_str:
+                    found = True
+                    if size_float > 0:
+                        # Update size at this price level
+                        new_levels.append({"price": price_str, "size": str(size_float)})
+                else:
+                    new_levels.append(level)
+            
+            if not found and size_float > 0:
+                # New price level
+                new_levels.append({"price": price_str, "size": str(size_float)})
+            
+            entry[book_side] = new_levels
+            entry["timestamp"] = time.time()
+            entry["update_count"] = entry.get("update_count", 0) + 1
+
+    def get_orderbook(self, token_id: str, max_age: float = 30.0) -> Optional[dict]:
+        """Get cached orderbook if fresh enough."""
+        with self._lock:
+            entry = self._orderbooks.get(token_id)
+            if entry and time.time() - entry.get("timestamp", 0) < max_age:
                 return entry
             return None
+
+    def get_book_freshness(self, token_id: str) -> Optional[dict]:
+        """Get book freshness info for diagnostics."""
+        with self._lock:
+            entry = self._orderbooks.get(token_id)
+            if not entry:
+                return None
+            now = time.time()
+            return {
+                "age_seconds": now - entry.get("timestamp", 0),
+                "snapshot_age": now - entry.get("snapshot_ts", 0),
+                "incremental_updates": entry.get("update_count", 0),
+            }
 
     def update_market_price(self, condition_id: str, price_up: float, price_down: float):
         with self._lock:
@@ -742,19 +799,38 @@ class WSConnection:
 
         elif event_type == "price_change":
             # Order placed or cancelled — contains price_changes array
+            # Apply each delta to the stored orderbook for incremental updates
             market_id = data.get("market", "")
             price_changes = data.get("price_changes", [])
             for change in price_changes:
                 asset_id = change.get("asset_id", "")
                 if asset_id:
+                    # Apply delta to stored book
+                    price = change.get("price", "")
+                    size = change.get("size", "")
+                    side = change.get("side", "")
+                    if price and size and side:
+                        self.state_store.apply_book_delta(asset_id, side, price, size)
+                    
+                    # Update best_bid_ask from the change event (if provided)
+                    best_bid = change.get("best_bid", "")
+                    best_ask = change.get("best_ask", "")
+                    if best_bid and best_ask:
+                        spread = ""
+                        try:
+                            spread = str(round(float(best_ask) - float(best_bid), 4))
+                        except (ValueError, TypeError):
+                            pass
+                        self.state_store.update_best_bid_ask(asset_id, best_bid, best_ask, spread)
+                    
                     self.event_bus.emit(EventType.PRICE_CHANGE, {
                         "market_id": market_id,
                         "asset_id": asset_id,
-                        "price": change.get("price", ""),
-                        "size": change.get("size", ""),
-                        "side": change.get("side", ""),
-                        "best_bid": change.get("best_bid", ""),
-                        "best_ask": change.get("best_ask", ""),
+                        "price": price,
+                        "size": size,
+                        "side": side,
+                        "best_bid": best_bid,
+                        "best_ask": best_ask,
                     })
 
         elif event_type == "last_trade_price":
