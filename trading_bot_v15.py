@@ -1499,6 +1499,15 @@ class AutoMerger:
                             self.engine.window_fill_cost[wid] = new_fill
                         else:
                             self.engine.window_fill_cost.pop(wid, None)
+                # V15.1-P5: Track realized PnL from merge.
+                # Merge returns $1 per pair of shares. The cost was what we paid
+                # for those shares (up_price + down_price per pair).
+                if self.engine:
+                    # Estimate cost: use window_fill_cost if available, else use
+                    # the merged amount as a rough cost estimate (conservative)
+                    merge_cost = min(old_fill, mergeable) if old_fill > 0 else mergeable
+                    self.engine.session_realized_returns += mergeable
+                    self.engine.session_realized_cost += merge_cost
                 self.logger.info(
                     "  MERGED OK | {} | {:.1f} shares -> ~${:.2f} USDC returned".format(
                         wid, mergeable, mergeable))
@@ -1631,7 +1640,7 @@ class AutoMerger:
             err = str(e).lower()
             if "rate limit" in err or "-32090" in err:
                 self.rpc_limiter.report_rate_limit(15)
-            self.logger.debug("  Merge error for {}: {}".format(window_id, e))
+            self.logger.warning("  MERGE ERROR | {} | {}".format(window_id, e))
             return False
 
     def _merge_via_proxy(self, ctf_addr, merge_data, window_id):
@@ -2184,6 +2193,12 @@ class AutoClaimManager:
         })
         if self.engine:
             self.engine.record_claim(total_size)
+            # V15.1-P5: Track realized PnL from claim.
+            # Claim returns the winning side's shares as USDC.
+            # Cost was what we paid for those shares.
+            fill_cost = info.get("fill_cost", 0)
+            self.engine.session_realized_returns += total_size
+            self.engine.session_realized_cost += fill_cost
         self.logger.info("  CLAIMED | {} | {} | Est: ${:.2f}".format(wid, method, total_size))
 
     def _log_manual_claim_instructions(self, wid, info):
@@ -2298,6 +2313,12 @@ class TradingEngine:
         self.window_edge = {}
         self.unredeemed_position_value = 0.0
         self.paired_windows = set()
+        # V15.1-P5: Realized PnL tracking.
+        # Only counts returns from resolved positions (merges + claims).
+        # session_realized_returns = total $ returned from merges/claims
+        # session_realized_pnl = returns - cost of those positions
+        self.session_realized_returns = 0.0  # $ returned from merges + claims
+        self.session_realized_cost = 0.0     # $ cost of positions that were merged/claimed
         # V15.1-15: Persistent filled window tracking.
         # Once a window has ANY fill, it's added here and never re-entered.
         # Only cleared on window expiry/claim or momentum exit.
@@ -3099,6 +3120,9 @@ class TradingEngine:
             "unredeemed_value": self.unredeemed_position_value,
             "paired_windows": len(self.paired_windows),
             "filled_windows": len(self.filled_windows),
+            "session_realized_returns": self.session_realized_returns,
+            "session_realized_cost": self.session_realized_cost,
+            "session_realized_pnl": self.session_realized_returns - self.session_realized_cost,
         }
 
 
@@ -3364,6 +3388,7 @@ class MarketMakingStrategy:
         self.vol_tracker = vol_tracker
         self.churn_manager = churn_manager
         self.last_refresh = {}
+        self._window_first_placed = {}  # {window_id: timestamp} — when orders were first placed
         self._cycle_reward_estimates = []
         self._total_estimated_reward = 0.0
 
@@ -3395,6 +3420,16 @@ class MarketMakingStrategy:
             self.logger.debug(
                 "  FILL SKIP | {} | Already filled ${:.2f} — position established".format(
                     window_id, fill_cost))
+            return
+        # V15.1-P5: NO-CHURN-REFRESH GUARD — once orders are placed for a
+        # window, never cancel+replace them. Cancelling is async on Polymarket;
+        # if the old order fills before the cancel takes effect, BOTH old and
+        # new orders fill, doubling the position size. Let original orders
+        # stand until they fill or the window expires.
+        if window_id in self._window_first_placed:
+            self.logger.debug(
+                "  NO-REFRESH | {} | Orders placed at {:.0f}s ago — standing".format(
+                    window_id, now - self._window_first_placed[window_id]))
             return
         last = self.last_refresh.get(window_id, 0)
         if now - last < self.config.mm_refresh_interval:
@@ -3625,9 +3660,16 @@ class MarketMakingStrategy:
                 continue
             self.churn_manager.record_update(
                 window_id, market["token_down"], down_price, down_size)
+            # V15.1-P5: Record first placement time — blocks churn refresh
+            if window_id not in self._window_first_placed:
+                self._window_first_placed[window_id] = time.time()
             est_reward = self.reward_optimizer.estimate_reward_per_hour(
                 2, reward_score, (up_size + down_size) / 2)
             self._total_estimated_reward += est_reward * (self.config.cycle_interval / 3600)
+
+    def cleanup_window(self, window_id):
+        """V15.1-P5: Clean up tracking when a window expires."""
+        self._window_first_placed.pop(window_id, None)
 
     def get_reward_stats(self):
         return {"total_estimated_reward": self._total_estimated_reward}

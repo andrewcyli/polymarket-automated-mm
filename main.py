@@ -742,16 +742,20 @@ class PolyMakerBot(PolymarketBot):
                         # but creates positions with value. Must include both.
                         if self._starting_wallet_balance is not None:
                             wallet_change = bal - self._starting_wallet_balance
-                            # V15.1-16: Use live position value (market price * shares)
-                            # instead of capital_in_positions (cost basis) which gets
-                            # zeroed by reconcile and doesn't reflect actual value.
                             pos_value = self.engine.get_position_value()
                             pos_cost = getattr(self.engine, 'capital_in_positions', 0)
-                            self._real_pnl = wallet_change + pos_value
+                            # V15.1-P5: Portfolio PnL = wallet change + position value
+                            # (informational only, NOT used for loss stop)
+                            self._portfolio_pnl = wallet_change + pos_value
                             self._wallet_only_pnl = wallet_change
                             self._position_value = pos_value
-                            pnl_str = " | realP&L:${:+.2f} (wallet:${:+.2f} +pos:${:.2f}/cost:${:.2f})".format(
-                                self._real_pnl, wallet_change, pos_value, pos_cost)
+                            # V15.1-P5: Realized PnL = returns from merges/claims - cost
+                            # This is the ONLY PnL used for loss stop decisions.
+                            realized = stats.get("session_realized_pnl", 0)
+                            self._real_pnl = realized
+                            pnl_str = " | P&L:${:+.2f}r/${:+.2f}p (spent:${:.0f} pos:${:.2f})".format(
+                                realized, self._portfolio_pnl,
+                                self.engine.session_total_spent, pos_value)
                     else:
                         self._wallet_read_failures += 1
                         if self._wallet_read_failures >= self._max_wallet_failures:
@@ -917,6 +921,10 @@ class PolyMakerBot(PolymarketBot):
                         if self.balance_checker:
                             self.balance_checker._cache_time = 0
                 self.engine.cleanup_expired_windows(markets, self.churn_manager)
+                # V15.1-P5: Clean up MM strategy tracking for expired windows
+                for wid in list(self.mm_strategy._window_first_placed.keys()):
+                    if wid not in self.engine.known_windows:
+                        self.mm_strategy.cleanup_window(wid)
                 self.engine.prune_stale_orders()
                 self.engine.purge_recently_cancelled()
                 # Phase 4: Purge stale WS order lifecycle tracking data
@@ -956,21 +964,20 @@ class PolyMakerBot(PolymarketBot):
                     # This ensures PnL calc uses real position data, not just
                     # fill-recorded data which can miss fills (race conditions).
                     # query_live_positions also feeds the merge scan with accurate data.
-                    if not self.config.dry_run and self.merge_detector.w3:
-                        self.merge_detector.query_live_positions(self.engine._market_cache)
+                    if not self.config.dry_run and self.auto_merger.w3:
+                        self.auto_merger.query_live_positions(self.engine._market_cache)
                     self.merge_detector.check_merges(
                         self.engine.token_holdings, self.engine._market_cache)
 
-                # ── Loss Protection: Dual-Source (Real Wallet + Sim) ────────
-                # V15.1-16: Recompute P&L AFTER check_fills so position value
-                # reflects fills detected in this cycle. Without this, the P&L
-                # computed at cycle start (before check_fills) doesn't include
-                # newly filled positions, causing false loss stops.
-                if self._starting_wallet_balance is not None and self._current_wallet_balance is not None:
-                    wallet_change = self._current_wallet_balance - self._starting_wallet_balance
-                    pos_value = self.engine.get_position_value()
-                    self._real_pnl = wallet_change + pos_value
-                    self._position_value = pos_value
+                # ── Loss Protection: Realized PnL Only ────────────────────
+                # V15.1-P5: Loss stop uses REALIZED PnL only (merges + claims).
+                # Unrealized position value fluctuates as market moves, causing
+                # false loss stops when one side fills before the other.
+                # The session exposure limit controls max capital at risk.
+                # Realized PnL only turns negative when positions are resolved
+                # at a loss (e.g., one-sided fill after resolution).
+                realized_pnl = self.engine.session_realized_returns - self.engine.session_realized_cost
+                self._real_pnl = realized_pnl
                 trading_halted = False
                 now = time.time()
                 loss_limit = -self.config.hard_loss_stop_pct * self.config.kelly_bankroll
@@ -981,29 +988,30 @@ class PolyMakerBot(PolymarketBot):
                             int(self._loss_stop_until - now)))
                     trading_halted = True
                 else:
-                    # Source 1: Real wallet P&L (ground truth, primary)
-                    if self._real_pnl is not None and self._real_pnl < loss_limit:
+                    # Source 1: Realized PnL from merges/claims (primary)
+                    if realized_pnl < loss_limit:
                         self.logger.warning(
-                            "  *** LOSS STOP (WALLET) *** realP&L: ${:.2f} < limit ${:.2f} "
-                            "(maxLoss={:.0%} x bankroll=${:.0f}). Wallet: ${:.2f} -> ${:.2f}. "
+                            "  *** LOSS STOP (REALIZED) *** realizedP&L: ${:.2f} < limit ${:.2f} "
+                            "(maxLoss={:.0%} x bankroll=${:.0f}). "
+                            "Returns: ${:.2f}, Cost: ${:.2f}. "
                             "Halting for {:.0f}s.".format(
-                                self._real_pnl, loss_limit,
+                                realized_pnl, loss_limit,
                                 self.config.hard_loss_stop_pct,
                                 self.config.kelly_bankroll,
-                                self._starting_wallet_balance or 0,
-                                self._current_wallet_balance or 0,
+                                self.engine.session_realized_returns,
+                                self.engine.session_realized_cost,
                                 self.config.hard_loss_cooloff))
                         self._loss_stop_until = now + self.config.hard_loss_cooloff
                         trading_halted = True
                     
-                    # Source 2: Simulated P&L (fallback when wallet read unavailable)
-                    elif self.sim_engine and self._real_pnl is None:
+                    # Source 2: Simulated P&L (fallback for dry_run mode)
+                    elif self.sim_engine and self.config.dry_run:
                         s = self.sim_engine.get_summary()
                         if s["realized_pnl"] < loss_limit:
                             self.logger.warning(
                                 "  *** LOSS STOP (SIM) *** simP&L: ${:.2f} < limit ${:.2f} "
                                 "(maxLoss={:.0%} x bankroll=${:.0f}). "
-                                "Halting for {:.0f}s. (wallet read unavailable)".format(
+                                "Halting for {:.0f}s. (dry_run mode)".format(
                                     s["realized_pnl"], loss_limit,
                                     self.config.hard_loss_stop_pct,
                                     self.config.kelly_bankroll,
