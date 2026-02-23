@@ -582,6 +582,67 @@ class TestWSConnectionParsing:
         assert len(events) == 1
         assert events[0]["new_tick_size"] == "0.001"
 
+    # ── List Message Handling ──
+
+    @pytest.mark.asyncio
+    async def test_market_list_message(self):
+        """Server sometimes sends JSON arrays instead of single dicts."""
+        conn = self._make_conn(Channel.MARKET)
+        events = []
+        self.bus.subscribe(EventType.LAST_TRADE_PRICE, lambda et, d: events.append(d))
+        # Server sends a list of two events
+        data = [
+            {
+                "event_type": "last_trade_price",
+                "asset_id": "token_1",
+                "market": "cond_1",
+                "price": "0.55",
+                "size": "100",
+                "side": "BUY",
+                "fee_rate_bps": "0",
+            },
+            {
+                "event_type": "last_trade_price",
+                "asset_id": "token_2",
+                "market": "cond_2",
+                "price": "0.45",
+                "size": "50",
+                "side": "SELL",
+                "fee_rate_bps": "0",
+            },
+        ]
+        await conn._handle_market_message(data)
+        assert len(events) == 2
+        assert events[0]["token_id"] == "token_1"
+        assert events[1]["token_id"] == "token_2"
+
+    @pytest.mark.asyncio
+    async def test_market_non_dict_non_list_ignored(self):
+        """Non-dict, non-list messages are silently ignored."""
+        conn = self._make_conn(Channel.MARKET)
+        await conn._handle_market_message("some string")
+        await conn._handle_market_message(42)
+        # No crash, no state change
+
+    @pytest.mark.asyncio
+    async def test_user_list_message(self):
+        """User channel can also receive list messages."""
+        conn = self._make_conn(Channel.USER)
+        events = []
+        self.bus.subscribe(EventType.ORDER_UPDATE, lambda et, d: events.append(d))
+        data = [
+            {
+                "event_type": "order",
+                "type": "PLACEMENT",
+                "id": "order_1",
+                "asset_id": "token_abc",
+                "market": "cond_1",
+                "size_matched": "0",
+            },
+        ]
+        await conn._handle_user_message(data)
+        assert len(events) == 1
+
     # ── User Channel ──
 
     @pytest.mark.asyncio

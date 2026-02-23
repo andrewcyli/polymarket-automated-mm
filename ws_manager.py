@@ -475,6 +475,23 @@ class WSConnection:
                     # Start text-based PING heartbeat
                     self._ping_task = asyncio.ensure_future(self._heartbeat_loop())
 
+                    # For user channel: send auth subscription immediately
+                    # The Polymarket user WS server disconnects (1006) if no auth
+                    # message is sent within a few seconds of connecting.
+                    if self.channel == Channel.USER and self.auth_creds:
+                        auth_msg = {
+                            "auth": self.auth_creds,
+                            "markets": [],  # Empty initially; markets added later
+                            "type": "user",
+                        }
+                        try:
+                            await self._ws.send(json.dumps(auth_msg))
+                            sub_key = json.dumps(auth_msg, sort_keys=True)
+                            self._subscriptions.add(sub_key)
+                            logger.info(f"WS [user] Auth subscription sent (key: {self.auth_creds.get('apiKey', '')[:8]}...)")
+                        except Exception as e:
+                            logger.error(f"WS [user] Failed to send auth: {e}")
+
                     # Re-subscribe to any active subscriptions after reconnect
                     await self._resubscribe_all()
 
@@ -607,10 +624,18 @@ class WSConnection:
                 logger.error(f"WS [{self.channel.value}] Unsubscribe error: {e}")
 
     async def _resubscribe_all(self):
-        """Re-subscribe to all active subscriptions after reconnect."""
+        """Re-subscribe to all active subscriptions after reconnect.
+        
+        For the user channel, the initial auth message is already sent in connect(),
+        so we skip any subscription that contains 'auth' to avoid duplicating it.
+        We do re-send market-addition subscriptions (those with 'operation': 'subscribe').
+        """
         for sub_key in list(self._subscriptions):
             try:
                 msg = json.loads(sub_key)
+                # Skip user auth messages — already sent in connect()
+                if self.channel == Channel.USER and "auth" in msg:
+                    continue
                 await self._ws.send(json.dumps(msg))
                 logger.debug(f"WS [{self.channel.value}] Re-subscribed: {msg}")
             except Exception as e:
@@ -648,7 +673,7 @@ class WSConnection:
         elif self.channel == Channel.RTDS:
             await self._handle_rtds_message(data)
 
-    async def _handle_market_message(self, data: dict):
+    async def _handle_market_message(self, data):
         """
         Handle Market channel messages.
         
@@ -660,7 +685,21 @@ class WSConnection:
         - tick_size_change: Tick size changed
         - new_market: New market created (requires custom_feature_enabled)
         - market_resolved: Market resolved (requires custom_feature_enabled)
+        
+        Note: Server sometimes sends JSON arrays (list of events) instead of
+        a single dict. We handle both cases.
         """
+        # Handle array messages: iterate over each item
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    await self._handle_market_message(item)
+            return
+
+        if not isinstance(data, dict):
+            logger.debug(f"WS [market] Unexpected message type: {type(data).__name__}")
+            return
+
         event_type = data.get("event_type", "")
 
         if event_type == "book":
@@ -764,7 +803,7 @@ class WSConnection:
                 "outcomes": data.get("outcomes", []),
             })
 
-    async def _handle_user_message(self, data: dict):
+    async def _handle_user_message(self, data):
         """
         Handle User channel messages.
         
@@ -772,6 +811,17 @@ class WSConnection:
         - trade: Order matched (MATCHED → MINED → CONFIRMED, or RETRYING → FAILED)
         - order: Order placed (PLACEMENT), updated (UPDATE), or cancelled (CANCELLATION)
         """
+        # Handle array messages
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    await self._handle_user_message(item)
+            return
+
+        if not isinstance(data, dict):
+            logger.debug(f"WS [user] Unexpected message type: {type(data).__name__}")
+            return
+
         event_type = data.get("event_type", "")
 
         if event_type == "trade":
@@ -862,7 +912,7 @@ class WSConnection:
                     "raw": data,
                 })
 
-    async def _handle_rtds_message(self, data: dict):
+    async def _handle_rtds_message(self, data):
         """
         Handle RTDS channel messages.
         
@@ -878,6 +928,17 @@ class WSConnection:
             }
         }
         """
+        # Handle array messages
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    await self._handle_rtds_message(item)
+            return
+
+        if not isinstance(data, dict):
+            logger.debug(f"WS [rtds] Unexpected message type: {type(data).__name__}")
+            return
+
         topic = data.get("topic", "")
         payload = data.get("payload", {})
 
