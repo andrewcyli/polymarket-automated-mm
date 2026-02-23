@@ -351,7 +351,7 @@ class PolyMakerBot(PolymarketBot):
         if HAS_WS_MANAGER and self._ws_enabled:
             try:
                 self.ws_manager = WebSocketManager(
-                    api_key=self.config.api_key,
+                    api_key=self.config.api_key,  # L1 keys initially; L2 set later via set_derived_creds()
                     api_secret=self.config.api_secret,
                     api_passphrase=self.config.api_passphrase,
                     enable_market=True,
@@ -378,6 +378,12 @@ class PolyMakerBot(PolymarketBot):
                 self.arb.book_reader = self.book_reader
                 self.contrarian.book_reader = self.book_reader
                 self.contrarian.price_feed = self.price_feed
+                # Pass L2 derived creds to WS manager for user channel auth
+                if hasattr(self, 'engine') and self.engine.client and self.engine.client.creds:
+                    derived = self.engine.client.creds
+                    self.ws_manager.set_derived_creds(
+                        derived.api_key, derived.api_secret, derived.api_passphrase
+                    )
                 self.logger.info("  WebSocket manager initialized (market+user+rtds)")
             except Exception as e:
                 self.logger.warning(f"  WebSocket manager init failed: {e}. Using REST-only mode.")
@@ -596,10 +602,12 @@ class PolyMakerBot(PolymarketBot):
                 self.logger.info("  WebSocket manager started (background thread)")
                 # Subscribe to RTDS for all configured assets
                 all_assets = list(set(self.config.assets_15m + self.config.assets_5m))
-                self.ws_manager.subscribe_rtds_all([a.upper() for a in all_assets])
+                self.ws_manager.subscribe_rtds_all([a.lower() for a in all_assets])
                 # Subscribe to user order updates if authenticated
+                # Note: subscribe_user_orders needs condition_ids, called after market discovery
+                # For now, just log that user channel will be subscribed later
                 if self.config.api_key:
-                    self.ws_manager.subscribe_user_orders()
+                    self.logger.info("  User channel: will subscribe after market discovery")
                 # Give WebSocket connections a moment to establish
                 time.sleep(2)
                 ws_status = self.ws_manager.get_connection_summary()
@@ -777,6 +785,8 @@ class PolyMakerBot(PolymarketBot):
 
                 self.book_reader.invalidate_cache()
                 markets = self.market_discovery.discover()
+                ws_token_ids = []
+                ws_condition_ids = []
 
                 for market in markets:
                     cid = market.get("condition_id", "")
@@ -786,10 +796,17 @@ class PolyMakerBot(PolymarketBot):
                     self.vol_tracker.register_token(market["token_up"], market["asset"])
                     self.vol_tracker.register_token(market["token_down"], market["asset"])
                     self.engine.register_window_metadata(market)
-                    # Subscribe to WebSocket market data for active tokens
+                    # Collect token IDs for batch WS subscription
                     if self.ws_manager:
-                        self.ws_manager.subscribe_market(market["token_up"])
-                        self.ws_manager.subscribe_market(market["token_down"])
+                        ws_token_ids.append(market["token_up"])
+                        ws_token_ids.append(market["token_down"])
+                        ws_condition_ids.append(market["condition_id"])
+
+                # Batch subscribe to WS market + user channels for discovered markets
+                if self.ws_manager and ws_token_ids:
+                    self.ws_manager.subscribe_market(ws_token_ids)
+                    if self.config.api_key and ws_condition_ids:
+                        self.ws_manager.subscribe_user_orders(ws_condition_ids)
 
                 self._compute_market_edges(markets)
                 self._resolve_expired_windows(markets)

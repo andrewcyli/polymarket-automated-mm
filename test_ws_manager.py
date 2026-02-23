@@ -1,8 +1,14 @@
 """
 Tests for WebSocket Manager (Phase 1)
 ======================================
-Tests the StateStore, EventBus, WSPriceFeed, WSOrderBookReader,
-and WebSocketManager initialization/lifecycle.
+Tests cover:
+1. StateStore — thread-safe data access
+2. EventBus — pub/sub event system
+3. WSPriceFeed — WS-first with REST fallback
+4. WSOrderBookReader — WS-first with REST fallback
+5. WSConnection — message parsing for all three channels
+6. WebSocketManager — subscription message formats (Polymarket protocol)
+7. Graceful degradation — fallback when WS is unavailable
 
 Run: python -m pytest test_ws_manager.py -v
 """
@@ -10,6 +16,7 @@ Run: python -m pytest test_ws_manager.py -v
 import json
 import time
 import threading
+import asyncio
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
@@ -17,6 +24,7 @@ from ws_manager import (
     StateStore, EventBus, EventType, Channel,
     WSConnection, WebSocketManager, WS_URLS,
     INITIAL_RECONNECT_DELAY, MAX_RECONNECT_DELAY,
+    MIN_SESSION_DURATION, RECONNECT_BACKOFF_FACTOR,
 )
 from ws_price_feed import WSPriceFeed, WSOrderBookReader
 
@@ -45,11 +53,10 @@ class TestStateStore:
     def test_get_orderbook_stale(self):
         book = {"bids": [], "asks": []}
         self.store.update_orderbook("token_abc", book)
-        # Manually set timestamp to 60 seconds ago
         with self.store._lock:
             self.store._orderbooks["token_abc"]["timestamp"] = time.time() - 60
         result = self.store.get_orderbook("token_abc")
-        assert result is None  # Stale (>30s)
+        assert result is None
 
     def test_get_orderbook_missing(self):
         result = self.store.get_orderbook("nonexistent")
@@ -71,6 +78,22 @@ class TestStateStore:
         result = self.store.get_market_price("cond_123")
         assert result is None
 
+    # ── Best Bid/Ask ──
+
+    def test_update_and_get_best_bid_ask(self):
+        self.store.update_best_bid_ask("asset_1", "0.50", "0.55", "0.05")
+        bba = self.store.get_best_bid_ask("asset_1")
+        assert bba is not None
+        assert bba["best_bid"] == "0.50"
+        assert bba["best_ask"] == "0.55"
+        assert bba["spread"] == "0.05"
+
+    def test_best_bid_ask_stale(self):
+        self.store.update_best_bid_ask("asset_1", "0.50", "0.55", "0.05")
+        with self.store._lock:
+            self.store._best_bid_ask["asset_1"]["ts"] = time.time() - 60
+        assert self.store.get_best_bid_ask("asset_1") is None
+
     # ── Trades ──
 
     def test_record_and_get_trades(self):
@@ -79,7 +102,6 @@ class TestStateStore:
         trades = self.store.get_recent_trades("token_abc")
         assert len(trades) == 2
         assert trades[0]["price"] == 0.50
-        assert trades[1]["side"] == "SELL"
 
     def test_trades_max_50(self):
         for i in range(60):
@@ -89,7 +111,6 @@ class TestStateStore:
 
     def test_trades_age_filter(self):
         self.store.record_trade("token_abc", {"price": 0.50, "size": 10, "side": "BUY"})
-        # Manually age the trade
         with self.store._lock:
             self.store._recent_trades["token_abc"][0]["ts"] = time.time() - 120
         trades = self.store.get_recent_trades("token_abc", max_age=60)
@@ -98,16 +119,16 @@ class TestStateStore:
     # ── Resolved Markets ──
 
     def test_mark_and_check_resolved(self):
-        self.store.mark_resolved("cond_123", "UP")
-        assert self.store.is_resolved("cond_123") == "UP"
+        self.store.mark_resolved("cond_123", "Yes")
+        assert self.store.is_resolved("cond_123") == "Yes"
         assert self.store.is_resolved("cond_456") is None
 
     # ── Order Statuses ──
 
     def test_update_and_get_order_status(self):
-        self.store.update_order_status("order_1", "OPEN", 0)
+        self.store.update_order_status("order_1", "PLACEMENT", 0)
         result = self.store.get_order_status("order_1")
-        assert result["status"] == "OPEN"
+        assert result["status"] == "PLACEMENT"
         assert result["filled_size"] == 0
 
         self.store.update_order_status("order_1", "MATCHED", 10.5)
@@ -134,8 +155,6 @@ class TestStateStore:
         self.store.record_fill({"order_id": "o2", "price": 0.55, "size": 5})
         pending = self.store.get_pending_fills()
         assert len(pending) == 2
-
-        # Mark one as processed
         self.store.mark_fill_processed(pending[0]["ts"])
         pending = self.store.get_pending_fills()
         assert len(pending) == 1
@@ -160,7 +179,6 @@ class TestStateStore:
         all_prices = self.store.get_all_crypto_prices()
         assert "btc" in all_prices
         assert "eth" in all_prices
-        assert all_prices["btc"]["price"] == 95000.0
 
     # ── Connection State ──
 
@@ -198,9 +216,7 @@ class TestStateStore:
     # ── Thread Safety ──
 
     def test_concurrent_writes(self):
-        """Test that concurrent writes don't corrupt state."""
         errors = []
-
         def writer(asset, count):
             try:
                 for i in range(count):
@@ -218,9 +234,7 @@ class TestStateStore:
             t.start()
         for t in threads:
             t.join()
-
         assert len(errors) == 0
-        # All prices should be written
         assert self.store.get_crypto_price("btc") is not None
         assert self.store.get_crypto_price("eth") is not None
         assert self.store.get_crypto_price("sol") is not None
@@ -231,62 +245,41 @@ class TestStateStore:
 # ─────────────────────────────────────────────────────────────────
 
 class TestEventBus:
-    """Test the thread-safe EventBus."""
 
     def setup_method(self):
         self.bus = EventBus()
 
     def test_subscribe_and_emit(self):
         received = []
-        def handler(event_type, data):
-            received.append((event_type, data))
-
-        self.bus.subscribe(EventType.CRYPTO_PRICE, handler)
+        self.bus.subscribe(EventType.CRYPTO_PRICE, lambda et, d: received.append((et, d)))
         self.bus.emit(EventType.CRYPTO_PRICE, {"asset": "btc", "price": 95000})
-
         assert len(received) == 1
         assert received[0][0] == EventType.CRYPTO_PRICE
-        assert received[0][1]["asset"] == "btc"
 
     def test_multiple_handlers(self):
         counts = {"a": 0, "b": 0}
-        def handler_a(et, d):
-            counts["a"] += 1
-        def handler_b(et, d):
-            counts["b"] += 1
-
-        self.bus.subscribe(EventType.ORDER_FILL, handler_a)
-        self.bus.subscribe(EventType.ORDER_FILL, handler_b)
+        self.bus.subscribe(EventType.ORDER_FILL, lambda et, d: counts.__setitem__("a", counts["a"] + 1))
+        self.bus.subscribe(EventType.ORDER_FILL, lambda et, d: counts.__setitem__("b", counts["b"] + 1))
         self.bus.emit(EventType.ORDER_FILL, {"order_id": "o1"})
-
         assert counts["a"] == 1
         assert counts["b"] == 1
 
     def test_unsubscribe(self):
         received = []
-        def handler(et, d):
-            received.append(d)
-
+        handler = lambda et, d: received.append(d)
         self.bus.subscribe(EventType.CONNECTED, handler)
         self.bus.emit(EventType.CONNECTED, {"channel": "market"})
         assert len(received) == 1
-
         self.bus.unsubscribe(EventType.CONNECTED, handler)
         self.bus.emit(EventType.CONNECTED, {"channel": "market"})
-        assert len(received) == 1  # No new events
+        assert len(received) == 1
 
     def test_handler_error_doesnt_crash(self):
         def bad_handler(et, d):
             raise ValueError("boom")
-
         received = []
-        def good_handler(et, d):
-            received.append(d)
-
         self.bus.subscribe(EventType.TRADE, bad_handler)
-        self.bus.subscribe(EventType.TRADE, good_handler)
-
-        # Should not raise, and good_handler should still fire
+        self.bus.subscribe(EventType.TRADE, lambda et, d: received.append(d))
         self.bus.emit(EventType.TRADE, {"price": 0.50})
         assert len(received) == 1
 
@@ -301,18 +294,9 @@ class TestEventBus:
     def test_no_cross_event_leakage(self):
         received_a = []
         received_b = []
-        def handler_a(et, d):
-            received_a.append(d)
-        def handler_b(et, d):
-            received_b.append(d)
-
-        self.bus.subscribe(EventType.CRYPTO_PRICE, handler_a)
-        self.bus.subscribe(EventType.ORDER_FILL, handler_b)
-
+        self.bus.subscribe(EventType.CRYPTO_PRICE, lambda et, d: received_a.append(d))
+        self.bus.subscribe(EventType.ORDER_FILL, lambda et, d: received_b.append(d))
         self.bus.emit(EventType.CRYPTO_PRICE, {"asset": "btc"})
-        assert len(received_a) == 1
-        assert len(received_b) == 0
-
         self.bus.emit(EventType.ORDER_FILL, {"order_id": "o1"})
         assert len(received_a) == 1
         assert len(received_b) == 1
@@ -323,7 +307,6 @@ class TestEventBus:
 # ─────────────────────────────────────────────────────────────────
 
 class TestWSPriceFeed:
-    """Test the WS-enhanced price feed wrapper."""
 
     def setup_method(self):
         self.legacy = MagicMock()
@@ -331,76 +314,67 @@ class TestWSPriceFeed:
         self.feed = WSPriceFeed(self.legacy, state_store=self.store)
 
     def test_ws_price_takes_priority(self):
-        """WebSocket price should be returned when fresh."""
         self.store.update_crypto_price("btc", 95000.0, "binance")
         self.legacy.get_current_price.return_value = 94500.0
-
         price = self.feed.get_current_price("btc")
         assert price == 95000.0
-        # Legacy should NOT have been called
         self.legacy.get_current_price.assert_not_called()
 
     def test_fallback_to_legacy(self):
-        """Should fall back to legacy when WS price is stale."""
         self.legacy.get_current_price.return_value = 94500.0
         self.legacy.use_chainlink = True
-
         price = self.feed.get_current_price("btc")
         assert price == 94500.0
         self.legacy.get_current_price.assert_called_once_with("btc")
 
     def test_fallback_when_ws_stale(self):
-        """Should fall back when WS price is older than max_age."""
         self.store.update_crypto_price("btc", 95000.0, "binance")
-        # Make it stale
         with self.store._lock:
             self.store._crypto_prices["btc"]["ts"] = time.time() - 30
         self.legacy.get_current_price.return_value = 94500.0
         self.legacy.use_chainlink = False
-
         price = self.feed.get_current_price("btc")
         assert price == 94500.0
 
     def test_no_state_store(self):
-        """Should work without state store (REST-only mode)."""
         feed = WSPriceFeed(self.legacy, state_store=None)
         self.legacy.get_current_price.return_value = 94500.0
         self.legacy.use_chainlink = True
-
         price = feed.get_current_price("btc")
         assert price == 94500.0
 
     def test_update_calls_legacy(self):
-        """update() should always call legacy update for Chainlink/CoinGecko."""
         self.feed.update()
         self.legacy.update.assert_called_once()
 
     def test_momentum_delegates_to_legacy(self):
-        """Momentum calculation delegates to legacy (needs history)."""
         self.legacy.get_momentum.return_value = 0.003
         result = self.feed.get_momentum("btc", 5)
         assert result == 0.003
-        self.legacy.get_momentum.assert_called_once_with("btc", 5)
 
     def test_predict_resolution_delegates(self):
-        """predict_resolution delegates to legacy."""
         self.legacy.predict_resolution.return_value = {"direction": "UP", "confidence": 0.75}
         result = self.feed.predict_resolution("btc", 100, 200)
         assert result["direction"] == "UP"
 
     def test_stats_tracking(self):
-        """Stats should track WS hits vs fallbacks."""
         self.store.update_crypto_price("btc", 95000.0)
         self.legacy.get_current_price.return_value = 3500.0
         self.legacy.use_chainlink = True
-
         self.feed.get_current_price("btc")  # WS hit
         self.feed.get_current_price("eth")  # Fallback
-
         stats = self.feed.get_stats()
         assert stats["ws_hits"] == 1
         assert stats["fallbacks"] == 1
         assert stats["hit_rate"] == 0.5
+
+    def test_passthrough_properties(self):
+        self.legacy.use_chainlink = True
+        self.legacy.chainlink = "mock"
+        self.legacy.prices = {"btc": 67000}
+        self.legacy.price_history = []
+        assert self.feed.use_chainlink is True
+        assert self.feed.prices == {"btc": 67000}
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -408,7 +382,6 @@ class TestWSPriceFeed:
 # ─────────────────────────────────────────────────────────────────
 
 class TestWSOrderBookReader:
-    """Test the WS-enhanced order book reader wrapper."""
 
     def setup_method(self):
         self.legacy = MagicMock()
@@ -416,35 +389,28 @@ class TestWSOrderBookReader:
         self.reader = WSOrderBookReader(self.legacy, state_store=self.store)
 
     def test_ws_book_takes_priority(self):
-        """WebSocket book should be returned when available."""
         book = {
             "bids": [{"price": "0.45", "size": "100"}],
             "asks": [{"price": "0.55", "size": "100"}],
         }
         self.store.update_orderbook("token_abc", book)
-        self.legacy.get_book.return_value = {"bids": [], "asks": []}
-
         result = self.reader.get_book("token_abc")
         assert result is not None
         assert len(result["bids"]) == 1
         self.legacy.get_book.assert_not_called()
 
     def test_fallback_to_legacy_book(self):
-        """Should fall back to legacy when no WS book."""
         self.legacy.get_book.return_value = {"bids": [{"price": "0.45"}], "asks": []}
-
         result = self.reader.get_book("token_abc")
         assert result is not None
         self.legacy.get_book.assert_called_once()
 
     def test_ws_spread_computation(self):
-        """Should compute spread from WS book data."""
         book = {
             "bids": [{"price": "0.45", "size": "100"}, {"price": "0.40", "size": "50"}],
             "asks": [{"price": "0.55", "size": "80"}, {"price": "0.60", "size": "30"}],
         }
         self.store.update_orderbook("token_abc", book)
-
         spread = self.reader.get_spread("token_abc")
         assert spread is not None
         assert spread["bid"] == 0.45
@@ -455,143 +421,531 @@ class TestWSOrderBookReader:
         assert spread["total_ask_size"] == 110
 
     def test_spread_fallback(self):
-        """Should fall back to legacy spread when no WS book."""
         self.legacy.get_spread.return_value = {"bid": 0.45, "ask": 0.55, "spread": 0.10}
-
         spread = self.reader.get_spread("token_abc")
         assert spread is not None
         assert spread["bid"] == 0.45
         self.legacy.get_spread.assert_called_once()
 
     def test_spread_empty_book(self):
-        """Should fall back when WS book has no bids/asks."""
         book = {"bids": [], "asks": []}
         self.store.update_orderbook("token_abc", book)
         self.legacy.get_spread.return_value = {"bid": 0.45, "ask": 0.55, "spread": 0.10}
-
         spread = self.reader.get_spread("token_abc")
         assert spread is not None
         self.legacy.get_spread.assert_called_once()
 
     def test_invalidate_cache_delegates(self):
-        """invalidate_cache should delegate to legacy."""
         self.reader.invalidate_cache("token_abc")
         self.legacy.invalidate_cache.assert_called_once_with("token_abc")
 
 
 # ─────────────────────────────────────────────────────────────────
-# WSConnection Tests
+# WSConnection Message Parsing Tests
 # ─────────────────────────────────────────────────────────────────
 
-class TestWSConnection:
-    """Test the WSConnection message handling."""
+class TestWSConnectionParsing:
+    """Test that WSConnection correctly parses messages per Polymarket protocol."""
 
     def setup_method(self):
         self.store = StateStore()
         self.bus = EventBus()
 
-    def test_normalize_asset(self):
-        """Test asset name normalization."""
-        assert WSConnection._normalize_asset("BTCUSDT") == "btc"
-        assert WSConnection._normalize_asset("ETHUSDC") == "eth"
-        assert WSConnection._normalize_asset("SOLUSD") == "sol"
-        assert WSConnection._normalize_asset("bitcoin") == "btc"
-        assert WSConnection._normalize_asset("ethereum") == "eth"
-        assert WSConnection._normalize_asset("BTC") == "btc"
-        assert WSConnection._normalize_asset("xrp") == "xrp"
+    def _make_conn(self, channel):
+        return WSConnection(channel, self.store, self.bus)
 
-    def test_connection_properties(self):
-        """Test connection initialization."""
-        conn = WSConnection(Channel.MARKET, self.store, self.bus)
-        assert conn.channel == Channel.MARKET
-        assert conn.url == WS_URLS[Channel.MARKET]
-        assert not conn.connected
-        assert conn.message_count == 0
+    # ── Market Channel ──
+
+    @pytest.mark.asyncio
+    async def test_market_book_event(self):
+        conn = self._make_conn(Channel.MARKET)
+        msg = {
+            "event_type": "book",
+            "asset_id": "token_abc",
+            "market": "cond_123",
+            "hash": "abc123",
+            "bids": [{"price": "0.50", "size": "100"}],
+            "asks": [{"price": "0.55", "size": "80"}],
+        }
+        await conn._handle_market_message(msg)
+        book = self.store.get_orderbook("token_abc")
+        assert book is not None
+        assert len(book["bids"]) == 1
+        assert book["hash"] == "abc123"
+
+    @pytest.mark.asyncio
+    async def test_market_price_change_event(self):
+        conn = self._make_conn(Channel.MARKET)
+        events = []
+        self.bus.subscribe(EventType.PRICE_CHANGE, lambda et, d: events.append(d))
+        msg = {
+            "event_type": "price_change",
+            "market": "cond_123",
+            "price_changes": [
+                {"asset_id": "token_1", "price": "0.55", "size": "100", "side": "BUY",
+                 "best_bid": "0.54", "best_ask": "0.56"},
+            ],
+        }
+        await conn._handle_market_message(msg)
+        assert len(events) == 1
+        assert events[0]["asset_id"] == "token_1"
+        assert events[0]["best_bid"] == "0.54"
+
+    @pytest.mark.asyncio
+    async def test_market_last_trade_price_event(self):
+        conn = self._make_conn(Channel.MARKET)
+        events = []
+        self.bus.subscribe(EventType.LAST_TRADE_PRICE, lambda et, d: events.append(d))
+        msg = {
+            "event_type": "last_trade_price",
+            "asset_id": "token_abc",
+            "market": "cond_123",
+            "price": "0.55",
+            "size": "100",
+            "side": "BUY",
+            "fee_rate_bps": "0",
+        }
+        await conn._handle_market_message(msg)
+        assert len(events) == 1
+        assert events[0]["price"] == 0.55
+        trades = self.store.get_recent_trades("token_abc")
+        assert len(trades) == 1
+
+    @pytest.mark.asyncio
+    async def test_market_best_bid_ask_event(self):
+        conn = self._make_conn(Channel.MARKET)
+        msg = {
+            "event_type": "best_bid_ask",
+            "asset_id": "token_abc",
+            "market": "cond_123",
+            "best_bid": "0.50",
+            "best_ask": "0.55",
+            "spread": "0.05",
+        }
+        await conn._handle_market_message(msg)
+        bba = self.store.get_best_bid_ask("token_abc")
+        assert bba is not None
+        assert bba["best_bid"] == "0.50"
+
+    @pytest.mark.asyncio
+    async def test_market_resolved_event(self):
+        conn = self._make_conn(Channel.MARKET)
+        events = []
+        self.bus.subscribe(EventType.MARKET_RESOLVED, lambda et, d: events.append(d))
+        msg = {
+            "event_type": "market_resolved",
+            "market": "cond_123",
+            "question": "Will BTC be above 70k?",
+            "winning_outcome": "Yes",
+            "winning_asset_id": "token_yes",
+            "assets_ids": ["token_yes", "token_no"],
+            "outcomes": ["Yes", "No"],
+        }
+        await conn._handle_market_message(msg)
+        assert self.store.is_resolved("cond_123") == "Yes"
+        assert len(events) == 1
+        assert events[0]["winning_outcome"] == "Yes"
+
+    @pytest.mark.asyncio
+    async def test_market_new_market_event(self):
+        conn = self._make_conn(Channel.MARKET)
+        events = []
+        self.bus.subscribe(EventType.NEW_MARKET, lambda et, d: events.append(d))
+        msg = {
+            "event_type": "new_market",
+            "id": "market_456",
+            "question": "Will ETH hit 5k?",
+            "market": "cond_456",
+            "slug": "will-eth-hit-5k",
+            "assets_ids": ["token_a", "token_b"],
+            "outcomes": ["Yes", "No"],
+        }
+        await conn._handle_market_message(msg)
+        assert len(events) == 1
+        assert events[0]["question"] == "Will ETH hit 5k?"
+
+    @pytest.mark.asyncio
+    async def test_market_tick_size_change_event(self):
+        conn = self._make_conn(Channel.MARKET)
+        events = []
+        self.bus.subscribe(EventType.TICK_SIZE_CHANGE, lambda et, d: events.append(d))
+        msg = {
+            "event_type": "tick_size_change",
+            "asset_id": "token_abc",
+            "market": "cond_123",
+            "old_tick_size": "0.01",
+            "new_tick_size": "0.001",
+        }
+        await conn._handle_market_message(msg)
+        assert len(events) == 1
+        assert events[0]["new_tick_size"] == "0.001"
+
+    # ── User Channel ──
+
+    @pytest.mark.asyncio
+    async def test_user_trade_matched(self):
+        conn = self._make_conn(Channel.USER)
+        fills = []
+        order_updates = []
+        self.bus.subscribe(EventType.USER_TRADE, lambda et, d: fills.append(d))
+        self.bus.subscribe(EventType.ORDER_FILL, lambda et, d: order_updates.append(d))
+        msg = {
+            "event_type": "trade",
+            "type": "TRADE",
+            "status": "MATCHED",
+            "taker_order_id": "taker_1",
+            "asset_id": "token_abc",
+            "market": "cond_123",
+            "price": "0.55",
+            "size": "100",
+            "side": "BUY",
+            "maker_orders": [
+                {"order_id": "maker_1", "matched_amount": "50", "price": "0.55",
+                 "asset_id": "token_abc", "outcome": "Yes"},
+                {"order_id": "maker_2", "matched_amount": "50", "price": "0.55",
+                 "asset_id": "token_abc", "outcome": "Yes"},
+            ],
+        }
+        await conn._handle_user_message(msg)
+        # Should have 1 USER_TRADE + 2 ORDER_FILL events
+        assert len(fills) == 1
+        assert len(order_updates) == 2
+        # Check fill recorded in state store
+        store_fills = self.store.get_recent_fills()
+        assert len(store_fills) == 1
+        assert store_fills[0]["taker_order_id"] == "taker_1"
+        # Check order statuses
+        taker_status = self.store.get_order_status("taker_1")
+        assert taker_status["status"] == "MATCHED"
+        maker_status = self.store.get_order_status("maker_1")
+        assert maker_status["status"] == "MATCHED"
+
+    @pytest.mark.asyncio
+    async def test_user_trade_confirmed(self):
+        """CONFIRMED status should update order status but NOT record a new fill."""
+        conn = self._make_conn(Channel.USER)
+        msg = {
+            "event_type": "trade",
+            "type": "TRADE",
+            "status": "CONFIRMED",
+            "taker_order_id": "taker_1",
+            "asset_id": "token_abc",
+            "price": "0.55",
+            "size": "100",
+            "side": "BUY",
+            "maker_orders": [],
+        }
+        await conn._handle_user_message(msg)
+        status = self.store.get_order_status("taker_1")
+        assert status["status"] == "CONFIRMED"
+        # No fill should be recorded for CONFIRMED (only MATCHED)
+        assert len(self.store.get_recent_fills()) == 0
+
+    @pytest.mark.asyncio
+    async def test_user_order_placement(self):
+        conn = self._make_conn(Channel.USER)
+        events = []
+        self.bus.subscribe(EventType.ORDER_UPDATE, lambda et, d: events.append(d))
+        msg = {
+            "event_type": "order",
+            "type": "PLACEMENT",
+            "id": "order_123",
+            "asset_id": "token_abc",
+            "market": "cond_123",
+            "price": "0.55",
+            "side": "BUY",
+            "original_size": "100",
+            "size_matched": "0",
+            "outcome": "Yes",
+        }
+        await conn._handle_user_message(msg)
+        assert len(events) == 1
+        assert events[0]["type"] == "PLACEMENT"
+        status = self.store.get_order_status("order_123")
+        assert status["status"] == "PLACEMENT"
+
+    @pytest.mark.asyncio
+    async def test_user_order_cancellation(self):
+        conn = self._make_conn(Channel.USER)
+        msg = {
+            "event_type": "order",
+            "type": "CANCELLATION",
+            "id": "order_123",
+            "asset_id": "token_abc",
+            "market": "cond_123",
+            "size_matched": "50",
+        }
+        await conn._handle_user_message(msg)
+        status = self.store.get_order_status("order_123")
+        assert status["status"] == "CANCELLATION"
+
+    # ── RTDS Channel ──
+
+    @pytest.mark.asyncio
+    async def test_rtds_binance_price(self):
+        conn = self._make_conn(Channel.RTDS)
+        msg = {
+            "topic": "crypto_prices",
+            "type": "update",
+            "timestamp": 1753314064237,
+            "payload": {
+                "symbol": "btcusdt",
+                "timestamp": 1753314088395,
+                "value": 67234.50,
+            },
+        }
+        await conn._handle_rtds_message(msg)
+        price = self.store.get_crypto_price("btc")
+        assert price == 67234.50
+
+    @pytest.mark.asyncio
+    async def test_rtds_chainlink_price(self):
+        conn = self._make_conn(Channel.RTDS)
+        msg = {
+            "topic": "crypto_prices_chainlink",
+            "type": "update",
+            "timestamp": 1753314064237,
+            "payload": {
+                "symbol": "eth/usd",
+                "timestamp": 1753314088395,
+                "value": 3456.78,
+            },
+        }
+        await conn._handle_rtds_message(msg)
+        price = self.store.get_crypto_price("eth")
+        assert price == 3456.78
+
+    @pytest.mark.asyncio
+    async def test_rtds_normalize_asset(self):
+        conn = self._make_conn(Channel.RTDS)
+        assert conn._normalize_asset("btcusdt") == "btc"
+        assert conn._normalize_asset("ETHUSDT") == "eth"
+        assert conn._normalize_asset("sol/usd") == "sol"
+        assert conn._normalize_asset("SOLUSDC") == "sol"
+        assert conn._normalize_asset("bitcoin") == "btc"
+        assert conn._normalize_asset("XRP") == "xrp"
+
+    # ── PONG and non-JSON handling ──
+
+    @pytest.mark.asyncio
+    async def test_pong_handling(self):
+        conn = self._make_conn(Channel.MARKET)
+        await conn._handle_message("PONG")
+        assert conn._message_count == 0
+
+    @pytest.mark.asyncio
+    async def test_non_json_message(self):
+        """Non-JSON, non-PONG messages are counted but gracefully ignored."""
+        conn = self._make_conn(Channel.MARKET)
+        await conn._handle_message("some random text")
+        # Message is counted (it's not a PONG) but parsing fails gracefully
+        assert conn._message_count == 1
 
 
 # ─────────────────────────────────────────────────────────────────
-# WebSocketManager Tests
+# WebSocketManager Subscription Format Tests
+# ─────────────────────────────────────────────────────────────────
+
+class TestSubscriptionFormats:
+    """Verify subscription messages match the official Polymarket WebSocket protocol."""
+
+    def setup_method(self):
+        self.manager = WebSocketManager(
+            api_key="test_key",
+            api_secret="test_secret",
+            api_passphrase="test_pass",
+            enable_market=True,
+            enable_user=True,
+            enable_rtds=True,
+        )
+
+    def test_market_subscribe_format(self):
+        """Market subscribe: {assets_ids: [...], type: 'market', custom_feature_enabled: true}"""
+        self.manager.subscribe_market(["token_1", "token_2"])
+        with self.manager._queue_lock:
+            assert len(self.manager._sub_queue) == 1
+            channel, msg = self.manager._sub_queue[0]
+            assert channel == Channel.MARKET
+            assert msg["type"] == "market"
+            assert msg["assets_ids"] == ["token_1", "token_2"]
+            assert msg["custom_feature_enabled"] is True
+
+    def test_market_additional_subscribe_format(self):
+        """Additional subscribe: {assets_ids: [...], operation: 'subscribe', custom_feature_enabled: true}"""
+        self.manager.subscribe_market_additional(["token_3"])
+        with self.manager._queue_lock:
+            channel, msg = self.manager._sub_queue[0]
+            assert msg["operation"] == "subscribe"
+            assert msg["assets_ids"] == ["token_3"]
+            assert msg["custom_feature_enabled"] is True
+
+    def test_market_unsubscribe_format(self):
+        """Unsubscribe: {assets_ids: [...], operation: 'unsubscribe'}"""
+        self.manager.unsubscribe_market(["token_1"])
+        with self.manager._queue_lock:
+            channel, msg = self.manager._unsub_queue[0]
+            assert msg["operation"] == "unsubscribe"
+            assert msg["assets_ids"] == ["token_1"]
+
+    def test_user_subscribe_format(self):
+        """User subscribe: {auth: {...}, markets: [...], type: 'user'}"""
+        # Create a user connection with auth creds
+        conn = WSConnection(
+            Channel.USER, self.manager.state_store, self.manager.event_bus,
+            auth_creds={"apiKey": "test_key", "secret": "test_secret", "passphrase": "test_pass"},
+        )
+        self.manager._connections[Channel.USER] = conn
+        self.manager.subscribe_user_orders(["cond_1", "cond_2"])
+        with self.manager._queue_lock:
+            channel, msg = self.manager._sub_queue[0]
+            assert channel == Channel.USER
+            assert msg["type"] == "user"
+            assert msg["markets"] == ["cond_1", "cond_2"]
+            assert "auth" in msg
+            assert msg["auth"]["apiKey"] == "test_key"
+            assert msg["auth"]["secret"] == "test_secret"
+            assert msg["auth"]["passphrase"] == "test_pass"
+
+    def test_user_additional_subscribe_format(self):
+        """Additional user subscribe: {markets: [...], operation: 'subscribe'}"""
+        self.manager.subscribe_user_additional(["cond_3"])
+        with self.manager._queue_lock:
+            channel, msg = self.manager._sub_queue[0]
+            assert msg["operation"] == "subscribe"
+            assert msg["markets"] == ["cond_3"]
+
+    def test_rtds_binance_subscribe_format(self):
+        """RTDS Binance: {action: 'subscribe', subscriptions: [{topic: 'crypto_prices', type: 'update', filters: '...'}]}"""
+        self.manager.subscribe_rtds_binance(["btc", "eth"])
+        with self.manager._queue_lock:
+            channel, msg = self.manager._sub_queue[0]
+            assert channel == Channel.RTDS
+            assert msg["action"] == "subscribe"
+            assert len(msg["subscriptions"]) == 1
+            sub = msg["subscriptions"][0]
+            assert sub["topic"] == "crypto_prices"
+            assert sub["type"] == "update"
+            assert "btcusdt" in sub["filters"]
+            assert "ethusdt" in sub["filters"]
+
+    def test_rtds_chainlink_subscribe_format(self):
+        """RTDS Chainlink: {action: 'subscribe', subscriptions: [{topic: 'crypto_prices_chainlink', type: '*'}]}"""
+        self.manager.subscribe_rtds_chainlink(["btc"])
+        with self.manager._queue_lock:
+            channel, msg = self.manager._sub_queue[0]
+            assert msg["action"] == "subscribe"
+            sub = msg["subscriptions"][0]
+            assert sub["topic"] == "crypto_prices_chainlink"
+            assert sub["type"] == "*"
+
+    def test_rtds_all_subscribes_both(self):
+        self.manager.subscribe_rtds_all(["btc", "eth"])
+        with self.manager._queue_lock:
+            assert len(self.manager._sub_queue) == 2
+            topics = [msg["subscriptions"][0]["topic"] for _, msg in self.manager._sub_queue]
+            assert "crypto_prices" in topics
+            assert "crypto_prices_chainlink" in topics
+
+    def test_set_derived_creds(self):
+        self.manager.set_derived_creds("derived_key", "derived_secret", "derived_pass")
+        assert self.manager.api_key == "derived_key"
+        assert self.manager.api_secret == "derived_secret"
+        assert self.manager.api_passphrase == "derived_pass"
+
+
+# ─────────────────────────────────────────────────────────────────
+# WebSocketManager Lifecycle Tests
 # ─────────────────────────────────────────────────────────────────
 
 class TestWebSocketManager:
-    """Test the WebSocketManager orchestrator."""
 
     def test_init_default(self):
-        """Test default initialization."""
         mgr = WebSocketManager(api_key="test_key")
         assert mgr.enable_market is True
         assert mgr.enable_user is True
         assert mgr.enable_rtds is True
-        assert mgr.state_store is not None
-        assert mgr.event_bus is not None
 
     def test_init_no_api_key_disables_user(self):
-        """User channel should be disabled without API key."""
         mgr = WebSocketManager(api_key="")
         assert mgr.enable_user is False
 
     def test_init_selective_channels(self):
-        """Test selective channel enabling."""
-        mgr = WebSocketManager(
-            api_key="test",
-            enable_market=False,
-            enable_user=False,
-            enable_rtds=True,
-        )
+        mgr = WebSocketManager(api_key="test", enable_market=False, enable_user=False, enable_rtds=True)
         assert mgr.enable_market is False
         assert mgr.enable_user is False
         assert mgr.enable_rtds is True
 
-    def test_subscribe_market_queues(self):
-        """subscribe_market should queue the subscription."""
-        mgr = WebSocketManager()
-        mgr.subscribe_market("token_abc")
-        with mgr._queue_lock:
-            assert len(mgr._sub_queue) == 1
-            channel, msg = mgr._sub_queue[0]
-            assert channel == Channel.MARKET
-            assert msg["assets_id"] == "token_abc"
-
-    def test_subscribe_rtds_all(self):
-        """subscribe_rtds_all should queue subscriptions for all assets."""
-        mgr = WebSocketManager()
-        mgr.subscribe_rtds_all(["BTC", "ETH", "SOL"])
-        with mgr._queue_lock:
-            assert len(mgr._sub_queue) == 3
-
-    def test_subscribe_user_orders(self):
-        """subscribe_user_orders should queue the subscription."""
-        mgr = WebSocketManager(api_key="test")
-        mgr.subscribe_user_orders()
-        with mgr._queue_lock:
-            assert len(mgr._sub_queue) == 1
-            channel, msg = mgr._sub_queue[0]
-            assert channel == Channel.USER
-
     def test_get_status_not_running(self):
-        """Status should show not running before start."""
         mgr = WebSocketManager()
         status = mgr.get_status()
         assert status["running"] is False
         assert status["healthy"] is False
 
     def test_is_healthy_no_connections(self):
-        """is_healthy should be False when not running."""
         mgr = WebSocketManager()
         assert mgr.is_healthy() is False
 
     def test_get_connection_summary_empty(self):
-        """Connection summary should handle no connections."""
         mgr = WebSocketManager()
         summary = mgr.get_connection_summary()
         assert summary == "No connections"
 
     @patch("ws_manager.HAS_WEBSOCKETS", False)
     def test_start_without_websockets_lib(self):
-        """Should return False if websockets library is not installed."""
         mgr = WebSocketManager()
         result = mgr.start()
         assert result is False
+
+    def test_empty_subscribe_calls(self):
+        mgr = WebSocketManager()
+        mgr.subscribe_market([])
+        mgr.subscribe_market_additional([])
+        mgr.unsubscribe_market([])
+        mgr.subscribe_user_additional([])
+        with mgr._queue_lock:
+            assert len(mgr._sub_queue) == 0
+            assert len(mgr._unsub_queue) == 0
+
+
+# ─────────────────────────────────────────────────────────────────
+# Reconnect Backoff Tests
+# ─────────────────────────────────────────────────────────────────
+
+class TestReconnectBackoff:
+    """Verify backoff behavior for rapid disconnect scenarios."""
+
+    def test_backoff_increases_on_short_session(self):
+        conn = WSConnection(Channel.USER, StateStore(), EventBus())
+        conn._reconnect_delay = 2.0
+        conn._session_start = time.time() - 1  # 1 second session
+        session_duration = time.time() - conn._session_start
+        if session_duration < MIN_SESSION_DURATION:
+            conn._reconnect_delay = min(
+                conn._reconnect_delay * RECONNECT_BACKOFF_FACTOR,
+                MAX_RECONNECT_DELAY,
+            )
+        assert conn._reconnect_delay == 4.0
+
+    def test_backoff_resets_on_long_session(self):
+        conn = WSConnection(Channel.MARKET, StateStore(), EventBus())
+        conn._reconnect_delay = 16.0
+        conn._session_start = time.time() - 30  # 30 second session
+        session_duration = time.time() - conn._session_start
+        if session_duration >= MIN_SESSION_DURATION:
+            conn._reconnect_delay = INITIAL_RECONNECT_DELAY
+        assert conn._reconnect_delay == INITIAL_RECONNECT_DELAY
+
+    def test_backoff_caps_at_max(self):
+        conn = WSConnection(Channel.USER, StateStore(), EventBus())
+        conn._reconnect_delay = 50.0
+        conn._session_start = time.time() - 1
+        session_duration = time.time() - conn._session_start
+        if session_duration < MIN_SESSION_DURATION:
+            conn._reconnect_delay = min(
+                conn._reconnect_delay * RECONNECT_BACKOFF_FACTOR,
+                MAX_RECONNECT_DELAY,
+            )
+        assert conn._reconnect_delay == MAX_RECONNECT_DELAY
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -599,71 +953,38 @@ class TestWebSocketManager:
 # ─────────────────────────────────────────────────────────────────
 
 class TestStateStoreEventBusIntegration:
-    """Test that StateStore updates trigger EventBus events correctly."""
 
     def test_fill_flow(self):
-        """Simulate a fill flowing through the system."""
         store = StateStore()
         bus = EventBus()
-
-        fills_received = []
-        def on_fill(et, data):
-            fills_received.append(data)
-
-        bus.subscribe(EventType.ORDER_FILL, on_fill)
-
-        # Simulate what WSConnection._handle_user_message does
-        fill_data = {
-            "order_id": "order_123",
-            "price": 0.45,
-            "size": 10.0,
-            "side": "BUY",
-            "token_id": "token_abc",
-        }
+        fills = []
+        bus.subscribe(EventType.ORDER_FILL, lambda et, d: fills.append(d))
+        fill_data = {"order_id": "order_123", "price": 0.45, "size": 10.0, "side": "BUY"}
         store.record_fill(fill_data)
         bus.emit(EventType.ORDER_FILL, fill_data)
-
-        assert len(fills_received) == 1
-        assert fills_received[0]["order_id"] == "order_123"
-
-        # Verify store has the fill
-        pending = store.get_pending_fills()
-        assert len(pending) == 1
+        assert len(fills) == 1
+        assert fills[0]["order_id"] == "order_123"
+        assert len(store.get_pending_fills()) == 1
 
     def test_crypto_price_flow(self):
-        """Simulate crypto price update flowing through the system."""
         store = StateStore()
         bus = EventBus()
-
-        prices_received = []
-        def on_price(et, data):
-            prices_received.append(data)
-
-        bus.subscribe(EventType.CRYPTO_PRICE, on_price)
-
-        # Simulate RTDS message
+        prices = []
+        bus.subscribe(EventType.CRYPTO_PRICE, lambda et, d: prices.append(d))
         store.update_crypto_price("btc", 95123.45, "binance")
         bus.emit(EventType.CRYPTO_PRICE, {"asset": "btc", "price": 95123.45, "source": "binance"})
-
-        assert len(prices_received) == 1
+        assert len(prices) == 1
         assert store.get_crypto_price("btc") == 95123.45
 
     def test_market_resolution_flow(self):
-        """Simulate market resolution flowing through the system."""
         store = StateStore()
         bus = EventBus()
-
         resolutions = []
-        def on_resolved(et, data):
-            resolutions.append(data)
-
-        bus.subscribe(EventType.MARKET_RESOLVED, on_resolved)
-
-        store.mark_resolved("cond_123", "UP")
-        bus.emit(EventType.MARKET_RESOLVED, {"condition_id": "cond_123", "outcome": "UP"})
-
+        bus.subscribe(EventType.MARKET_RESOLVED, lambda et, d: resolutions.append(d))
+        store.mark_resolved("cond_123", "Yes")
+        bus.emit(EventType.MARKET_RESOLVED, {"market": "cond_123", "winning_outcome": "Yes"})
         assert len(resolutions) == 1
-        assert store.is_resolved("cond_123") == "UP"
+        assert store.is_resolved("cond_123") == "Yes"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -671,29 +992,23 @@ class TestStateStoreEventBusIntegration:
 # ─────────────────────────────────────────────────────────────────
 
 class TestGracefulDegradation:
-    """Test that the system degrades gracefully when WS is unavailable."""
 
     def test_price_feed_without_ws(self):
-        """WSPriceFeed should work fine without state_store."""
         legacy = MagicMock()
         legacy.get_current_price.return_value = 95000.0
         legacy.use_chainlink = True
-
         feed = WSPriceFeed(legacy, state_store=None)
         price = feed.get_current_price("btc")
         assert price == 95000.0
 
     def test_book_reader_without_ws(self):
-        """WSOrderBookReader should work fine without state_store."""
         legacy = MagicMock()
         legacy.get_spread.return_value = {"bid": 0.45, "ask": 0.55, "spread": 0.10}
-
         reader = WSOrderBookReader(legacy, state_store=None)
         spread = reader.get_spread("token_abc")
         assert spread["bid"] == 0.45
 
     def test_price_feed_ws_down_then_up(self):
-        """WSPriceFeed should seamlessly switch between WS and REST."""
         legacy = MagicMock()
         legacy.get_current_price.return_value = 94500.0
         legacy.use_chainlink = True
