@@ -148,8 +148,9 @@ class StateStore:
         # ── User Channel State ──
         # Order statuses: {order_id: {"status": str, "filled_size": float, "ts": float}}
         self._order_statuses: Dict[str, dict] = {}
-        # Recent fills: [{"order_id": str, "price": float, "size": float, "ts": float}]
+        # Recent fills: [{"order_id": str, "price": float, "size": float, "ts": float, "fill_id": int}]
         self._recent_fills: list = []
+        self._fill_counter: int = 0
 
         # ── RTDS Channel State ──
         # Crypto prices: {asset: {"price": float, "source": str, "ts": float}}
@@ -257,9 +258,11 @@ class StateStore:
 
     def record_fill(self, fill_data: dict):
         with self._lock:
+            self._fill_counter += 1
             self._recent_fills.append({
                 **fill_data,
                 "ts": time.time(),
+                "fill_id": self._fill_counter,
             })
             # Keep only last 200 fills
             if len(self._recent_fills) > 200:
@@ -274,11 +277,16 @@ class StateStore:
         with self._lock:
             return [f for f in self._recent_fills if not f.get("processed")]
 
-    def mark_fill_processed(self, fill_ts: float):
+    def mark_fill_processed(self, fill_ts: float = None, fill_id: int = None):
+        """Mark a fill as processed by fill_id (preferred) or timestamp."""
         with self._lock:
             for f in self._recent_fills:
-                if f.get("ts") == fill_ts:
+                if fill_id is not None and f.get("fill_id") == fill_id:
                     f["processed"] = True
+                    return
+                elif fill_ts is not None and f.get("ts") == fill_ts and not f.get("processed"):
+                    f["processed"] = True
+                    return
 
     # ── RTDS Channel Accessors ──
 

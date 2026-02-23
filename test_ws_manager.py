@@ -155,9 +155,11 @@ class TestStateStore:
         self.store.record_fill({"order_id": "o2", "price": 0.55, "size": 5})
         pending = self.store.get_pending_fills()
         assert len(pending) == 2
-        self.store.mark_fill_processed(pending[0]["ts"])
+        # Use fill_id for precise matching (timestamps can collide on fast machines)
+        self.store.mark_fill_processed(fill_id=pending[0]["fill_id"])
         pending = self.store.get_pending_fills()
         assert len(pending) == 1
+        assert pending[0]["order_id"] == "o2"
 
     # ── Crypto Prices ──
 
