@@ -80,7 +80,10 @@ RECONNECT_BACKOFF_FACTOR = 2.0
 CONNECTION_TIMEOUT = 15.0          # seconds to establish connection
 
 # Heartbeat intervals (text PING per Polymarket protocol)
-MARKET_USER_PING_INTERVAL = 10.0   # seconds for market/user channels
+# Official Polymarket example uses 50s for market/user PING interval.
+# The docs say 10s but the actual server tolerates up to ~60s.
+# Using 30s as a safe middle ground.
+MARKET_USER_PING_INTERVAL = 30.0   # seconds for market/user channels
 RTDS_PING_INTERVAL = 5.0           # seconds for RTDS channel
 
 # Minimum session duration before resetting backoff (prevents rapid reconnect loops)
@@ -442,6 +445,10 @@ class WSConnection:
         self._message_count = 0
         self._session_start = 0.0
         self._ping_task = None
+        # User channel: initial markets for auth subscription (set before connect)
+        self._initial_markets: list = []
+        # Stored auth message for reconnect resubscription
+        self._user_auth_msg: Optional[dict] = None
 
     async def connect(self):
         """Main connection loop with auto-reconnection."""
@@ -475,20 +482,28 @@ class WSConnection:
                     # Start text-based PING heartbeat
                     self._ping_task = asyncio.ensure_future(self._heartbeat_loop())
 
-                    # For user channel: send auth subscription immediately
-                    # The Polymarket user WS server disconnects (1006) if no auth
-                    # message is sent within a few seconds of connecting.
-                    if self.channel == Channel.USER and self.auth_creds:
+                    # For user channel: send auth subscription immediately after connect.
+                    # The Polymarket user WS server disconnects (1006) if no valid
+                    # subscription message is sent within a few seconds.
+                    # IMPORTANT: The auth message MUST include at least one condition ID
+                    # in 'markets'. Sending markets=[] causes immediate 1006 disconnect.
+                    if self.channel == Channel.USER and self.auth_creds and self._initial_markets:
                         auth_msg = {
                             "auth": self.auth_creds,
-                            "markets": [],  # Empty initially; markets added later
+                            "markets": self._initial_markets,
+                            "assets_ids": [],
                             "type": "user",
+                            "initial_dump": True,
                         }
                         try:
                             await self._ws.send(json.dumps(auth_msg))
-                            sub_key = json.dumps(auth_msg, sort_keys=True)
-                            self._subscriptions.add(sub_key)
-                            logger.info(f"WS [user] Auth subscription sent (key: {self.auth_creds.get('apiKey', '')[:8]}...)")
+                            # Store a simplified key for resubscribe tracking
+                            self._user_auth_msg = auth_msg
+                            logger.info(
+                                f"WS [user] Auth subscription sent "
+                                f"(key: {self.auth_creds.get('apiKey', '')[:8]}..., "
+                                f"markets: {len(self._initial_markets)})"
+                            )
                         except Exception as e:
                             logger.error(f"WS [user] Failed to send auth: {e}")
 
@@ -1167,7 +1182,11 @@ class WebSocketManager:
             tasks.append(asyncio.create_task(conn.connect()))
 
         if self.enable_user:
-            # User channel auth goes in the subscription message, not HTTP headers
+            # User channel is created but NOT connected yet.
+            # It will be started lazily when subscribe_user_orders() is called
+            # with actual condition IDs from market discovery.
+            # Reason: Polymarket's user WS server rejects connections that
+            # send markets=[] in the auth subscription (1006 disconnect).
             auth_creds = None
             if self.api_key:
                 auth_creds = {
@@ -1180,7 +1199,8 @@ class WebSocketManager:
                 auth_creds=auth_creds,
             )
             self._connections[Channel.USER] = conn
-            tasks.append(asyncio.create_task(conn.connect()))
+            # Don't connect yet — will be started by subscribe_user_orders()
+            logger.info("WS [user] Created (lazy start — waiting for condition IDs)")
 
         if self.enable_rtds:
             conn = WSConnection(
@@ -1233,8 +1253,10 @@ class WebSocketManager:
             return
         msg = {
             "assets_ids": token_ids if isinstance(token_ids, list) else [token_ids],
+            "markets": [],
             "type": "market",
             "custom_feature_enabled": True,
+            "initial_dump": True,
         }
         with self._queue_lock:
             self._sub_queue.append((Channel.MARKET, msg))
@@ -1274,26 +1296,45 @@ class WebSocketManager:
         """
         Subscribe to user order updates. Thread-safe.
         
-        Per docs: {
+        On first call: starts the user channel connection with the provided
+        condition IDs as the initial markets for auth. The Polymarket user WS
+        server requires at least one condition ID in the auth message.
+        
+        On subsequent calls: sends additional market subscriptions.
+        
+        Per official example: {
             "auth": {"apiKey": "...", "secret": "...", "passphrase": "..."},
             "markets": ["condition_id"],
-            "type": "user"
+            "assets_ids": [],
+            "type": "user",
+            "initial_dump": true
         }
-        
-        If condition_ids is empty, subscribes with empty markets list.
         """
+        if not condition_ids:
+            logger.warning("WS: subscribe_user_orders called with no condition IDs — skipping")
+            return
+
         conn = self._connections.get(Channel.USER)
         if not conn or not conn.auth_creds:
             logger.warning("WS: Cannot subscribe to user channel — no auth credentials")
             return
 
-        msg = {
-            "auth": conn.auth_creds,
-            "markets": condition_ids or [],
-            "type": "user",
-        }
-        with self._queue_lock:
-            self._sub_queue.append((Channel.USER, msg))
+        # If user channel hasn't been started yet, start it now with condition IDs
+        if not conn._running:
+            conn._initial_markets = condition_ids
+            if self._loop and not self._loop.is_closed():
+                logger.info(f"WS [user] Starting lazy connection with {len(condition_ids)} condition IDs")
+                asyncio.run_coroutine_threadsafe(conn.connect(), self._loop)
+            else:
+                logger.warning("WS [user] Event loop not available — initial_markets stored for later")
+        else:
+            # Already connected — send additional market subscription
+            msg = {
+                "markets": condition_ids,
+                "operation": "subscribe",
+            }
+            with self._queue_lock:
+                self._sub_queue.append((Channel.USER, msg))
 
     def subscribe_user_additional(self, condition_ids: list):
         """
@@ -1385,6 +1426,9 @@ class WebSocketManager:
         if not self._running:
             return False
         for channel, conn in self._connections.items():
+            # User channel may not be started yet (lazy start)
+            if channel == Channel.USER and not conn._running:
+                continue  # Not started yet = not unhealthy
             if not conn.connected:
                 return False
         return True
@@ -1409,6 +1453,11 @@ class WebSocketManager:
         """Human-readable connection summary for logging."""
         parts = []
         for ch, conn in self._connections.items():
-            status = "OK" if conn.connected else "DOWN"
+            if ch == Channel.USER and not conn._running:
+                status = "WAIT"  # Lazy start — waiting for condition IDs
+            elif conn.connected:
+                status = "OK"
+            else:
+                status = "DOWN"
             parts.append(f"{ch.value}:{status}({conn.message_count})")
         return " | ".join(parts) if parts else "No connections"

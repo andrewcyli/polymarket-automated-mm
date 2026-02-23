@@ -851,23 +851,42 @@ class TestSubscriptionFormats:
             assert msg["assets_ids"] == ["token_1"]
 
     def test_user_subscribe_format(self):
-        """User subscribe: {auth: {...}, markets: [...], type: 'user'}"""
-        # Create a user connection with auth creds
+        """User subscribe (first call): sets initial_markets and triggers lazy connect.
+        
+        The first call to subscribe_user_orders() stores condition IDs on the
+        WSConnection._initial_markets and starts the connection. The auth message
+        is sent inside connect() with the full format:
+        {auth: {...}, markets: [...], assets_ids: [], type: 'user', initial_dump: true}
+        """
+        # Create a user connection with auth creds (not yet running)
         conn = WSConnection(
             Channel.USER, self.manager.state_store, self.manager.event_bus,
             auth_creds={"apiKey": "test_key", "secret": "test_secret", "passphrase": "test_pass"},
         )
         self.manager._connections[Channel.USER] = conn
+        # Without an event loop, subscribe_user_orders stores initial_markets
+        # but can't actually start the connection (no loop)
         self.manager.subscribe_user_orders(["cond_1", "cond_2"])
+        # Verify the condition IDs were stored for lazy connect
+        assert conn._initial_markets == ["cond_1", "cond_2"]
+        assert conn.auth_creds["apiKey"] == "test_key"
+        assert conn.auth_creds["secret"] == "test_secret"
+        assert conn.auth_creds["passphrase"] == "test_pass"
+
+    def test_user_subscribe_subsequent_call(self):
+        """Subsequent user subscribe (already running): queues operation subscribe."""
+        conn = WSConnection(
+            Channel.USER, self.manager.state_store, self.manager.event_bus,
+            auth_creds={"apiKey": "test_key", "secret": "test_secret", "passphrase": "test_pass"},
+        )
+        conn._running = True  # Simulate already started
+        self.manager._connections[Channel.USER] = conn
+        self.manager.subscribe_user_orders(["cond_3", "cond_4"])
         with self.manager._queue_lock:
             channel, msg = self.manager._sub_queue[0]
             assert channel == Channel.USER
-            assert msg["type"] == "user"
-            assert msg["markets"] == ["cond_1", "cond_2"]
-            assert "auth" in msg
-            assert msg["auth"]["apiKey"] == "test_key"
-            assert msg["auth"]["secret"] == "test_secret"
-            assert msg["auth"]["passphrase"] == "test_pass"
+            assert msg["operation"] == "subscribe"
+            assert msg["markets"] == ["cond_3", "cond_4"]
 
     def test_user_additional_subscribe_format(self):
         """Additional user subscribe: {markets: [...], operation: 'subscribe'}"""
