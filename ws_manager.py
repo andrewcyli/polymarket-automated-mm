@@ -479,14 +479,11 @@ class WSConnection:
                     })
                     logger.info(f"WS [{self.channel.value}] Connected!")
 
-                    # Start text-based PING heartbeat
-                    self._ping_task = asyncio.ensure_future(self._heartbeat_loop())
-
-                    # For user channel: send auth subscription immediately after connect.
+                    # For user channel: send auth subscription FIRST, before anything else.
                     # The Polymarket user WS server disconnects (1006) if no valid
                     # subscription message is sent within a few seconds.
-                    # IMPORTANT: The auth message MUST include at least one condition ID
-                    # in 'markets'. Sending markets=[] causes immediate 1006 disconnect.
+                    # CRITICAL: Auth must be the FIRST message sent on the user channel.
+                    # Heartbeat, resubscribe, and pending processing all happen AFTER auth.
                     if self.channel == Channel.USER and self.auth_creds and self._initial_markets:
                         auth_msg = {
                             "auth": self.auth_creds,
@@ -496,18 +493,32 @@ class WSConnection:
                             "initial_dump": True,
                         }
                         try:
-                            await self._ws.send(json.dumps(auth_msg))
-                            # Store a simplified key for resubscribe tracking
-                            self._user_auth_msg = auth_msg
+                            auth_json = json.dumps(auth_msg)
                             logger.info(
-                                f"WS [user] Auth subscription sent "
-                                f"(key: {self.auth_creds.get('apiKey', '')[:8]}..., "
+                                f"WS [user] Sending auth ({len(auth_json)} bytes, "
+                                f"key: {self.auth_creds.get('apiKey', '')[:8]}..., "
                                 f"markets: {len(self._initial_markets)})"
                             )
+                            await self._ws.send(auth_json)
+                            self._user_auth_msg = auth_msg
+                            logger.info(f"WS [user] Auth sent OK — waiting 1s for server to process...")
+                            # Give the server time to process auth before sending anything else
+                            await asyncio.sleep(1.0)
+                            logger.info(f"WS [user] Post-auth delay complete")
                         except Exception as e:
                             logger.error(f"WS [user] Failed to send auth: {e}")
 
+                    # Start text-based PING heartbeat AFTER auth (for user channel)
+                    self._ping_task = asyncio.ensure_future(self._heartbeat_loop())
+
                     # Re-subscribe to any active subscriptions after reconnect
+                    n_subs = len(self._subscriptions)
+                    n_pending = len(self._pending_subscribes)
+                    if n_subs > 0 or n_pending > 0:
+                        logger.info(
+                            f"WS [{self.channel.value}] Processing {n_subs} resubscriptions "
+                            f"+ {n_pending} pending"
+                        )
                     await self._resubscribe_all()
 
                     # Process pending subscribes
@@ -617,7 +628,13 @@ class WSConnection:
         """Subscribe to a topic on this channel."""
         if self._ws:
             try:
-                await self._ws.send(json.dumps(subscription_msg))
+                msg_json = json.dumps(subscription_msg)
+                if self.channel == Channel.USER:
+                    logger.info(
+                        f"WS [user] subscribe() sending ({len(msg_json)} bytes): "
+                        f"{msg_json[:200]}"
+                    )
+                await self._ws.send(msg_json)
                 sub_key = json.dumps(subscription_msg, sort_keys=True)
                 self._subscriptions.add(sub_key)
                 logger.debug(f"WS [{self.channel.value}] Subscribed: {subscription_msg}")
@@ -625,6 +642,8 @@ class WSConnection:
                 logger.error(f"WS [{self.channel.value}] Subscribe error: {e}")
                 self._pending_subscribes.append(subscription_msg)
         else:
+            if self.channel == Channel.USER:
+                logger.info(f"WS [user] subscribe() queued (no ws): {json.dumps(subscription_msg)[:200]}")
             self._pending_subscribes.append(subscription_msg)
 
     async def unsubscribe(self, unsubscription_msg: dict):
@@ -650,16 +669,22 @@ class WSConnection:
                 msg = json.loads(sub_key)
                 # Skip user auth messages — already sent in connect()
                 if self.channel == Channel.USER and "auth" in msg:
+                    logger.info(f"WS [{self.channel.value}] Skipping auth re-sub (already sent in connect)")
                     continue
+                logger.info(f"WS [{self.channel.value}] Re-subscribing: {json.dumps(msg)[:200]}")
                 await self._ws.send(json.dumps(msg))
-                logger.debug(f"WS [{self.channel.value}] Re-subscribed: {msg}")
             except Exception as e:
                 logger.error(f"WS [{self.channel.value}] Re-subscribe error: {e}")
 
     async def _process_pending(self):
         """Process any pending subscribe/unsubscribe requests."""
+        if self._pending_subscribes:
+            logger.info(
+                f"WS [{self.channel.value}] Processing {len(self._pending_subscribes)} pending subscribes"
+            )
         while self._pending_subscribes:
             msg = self._pending_subscribes.pop(0)
+            logger.info(f"WS [{self.channel.value}] Pending sub: {json.dumps(msg)[:200]}")
             await self.subscribe(msg)
         while self._pending_unsubscribes:
             msg = self._pending_unsubscribes.pop(0)
@@ -1231,6 +1256,11 @@ class WebSocketManager:
             for channel, msg in subs:
                 conn = self._connections.get(channel)
                 if conn:
+                    if channel == Channel.USER:
+                        logger.info(
+                            f"WS [user] Queue processor sending sub: "
+                            f"{json.dumps(msg)[:200]}"
+                        )
                     await conn.subscribe(msg)
 
             for channel, msg in unsubs:
