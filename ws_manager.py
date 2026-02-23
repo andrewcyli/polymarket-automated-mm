@@ -495,16 +495,14 @@ class WSConnection:
                         try:
                             auth_json = json.dumps(auth_msg)
                             logger.info(
-                                f"WS [user] Sending auth ({len(auth_json)} bytes, "
-                                f"key: {self.auth_creds.get('apiKey', '')[:8]}..., "
+                                f"WS [user] Auth sent "
+                                f"(key: {self.auth_creds.get('apiKey', '')[:8]}..., "
                                 f"markets: {len(self._initial_markets)})"
                             )
                             await self._ws.send(auth_json)
                             self._user_auth_msg = auth_msg
-                            logger.info(f"WS [user] Auth sent OK — waiting 1s for server to process...")
                             # Give the server time to process auth before sending anything else
                             await asyncio.sleep(1.0)
-                            logger.info(f"WS [user] Post-auth delay complete")
                         except Exception as e:
                             logger.error(f"WS [user] Failed to send auth: {e}")
 
@@ -512,13 +510,6 @@ class WSConnection:
                     self._ping_task = asyncio.ensure_future(self._heartbeat_loop())
 
                     # Re-subscribe to any active subscriptions after reconnect
-                    n_subs = len(self._subscriptions)
-                    n_pending = len(self._pending_subscribes)
-                    if n_subs > 0 or n_pending > 0:
-                        logger.info(
-                            f"WS [{self.channel.value}] Processing {n_subs} resubscriptions "
-                            f"+ {n_pending} pending"
-                        )
                     await self._resubscribe_all()
 
                     # Process pending subscribes
@@ -629,11 +620,6 @@ class WSConnection:
         if self._ws:
             try:
                 msg_json = json.dumps(subscription_msg)
-                if self.channel == Channel.USER:
-                    logger.info(
-                        f"WS [user] subscribe() sending ({len(msg_json)} bytes): "
-                        f"{msg_json[:200]}"
-                    )
                 await self._ws.send(msg_json)
                 sub_key = json.dumps(subscription_msg, sort_keys=True)
                 self._subscriptions.add(sub_key)
@@ -642,8 +628,6 @@ class WSConnection:
                 logger.error(f"WS [{self.channel.value}] Subscribe error: {e}")
                 self._pending_subscribes.append(subscription_msg)
         else:
-            if self.channel == Channel.USER:
-                logger.info(f"WS [user] subscribe() queued (no ws): {json.dumps(subscription_msg)[:200]}")
             self._pending_subscribes.append(subscription_msg)
 
     async def unsubscribe(self, unsubscription_msg: dict):
@@ -669,9 +653,8 @@ class WSConnection:
                 msg = json.loads(sub_key)
                 # Skip user auth messages — already sent in connect()
                 if self.channel == Channel.USER and "auth" in msg:
-                    logger.info(f"WS [{self.channel.value}] Skipping auth re-sub (already sent in connect)")
                     continue
-                logger.info(f"WS [{self.channel.value}] Re-subscribing: {json.dumps(msg)[:200]}")
+                logger.debug(f"WS [{self.channel.value}] Re-subscribing: {json.dumps(msg)[:120]}")
                 await self._ws.send(json.dumps(msg))
             except Exception as e:
                 logger.error(f"WS [{self.channel.value}] Re-subscribe error: {e}")
@@ -679,12 +662,11 @@ class WSConnection:
     async def _process_pending(self):
         """Process any pending subscribe/unsubscribe requests."""
         if self._pending_subscribes:
-            logger.info(
+            logger.debug(
                 f"WS [{self.channel.value}] Processing {len(self._pending_subscribes)} pending subscribes"
             )
         while self._pending_subscribes:
             msg = self._pending_subscribes.pop(0)
-            logger.info(f"WS [{self.channel.value}] Pending sub: {json.dumps(msg)[:200]}")
             await self.subscribe(msg)
         while self._pending_unsubscribes:
             msg = self._pending_unsubscribes.pop(0)
@@ -1102,6 +1084,9 @@ class WebSocketManager:
         self._unsub_queue: list = []
         self._queue_lock = threading.Lock()
 
+        # Track user channel subscribed condition IDs to avoid re-subscribing
+        self._user_subscribed_cids: set = set()
+
     def set_derived_creds(self, api_key: str, api_secret: str, api_passphrase: str):
         """
         Update with L2 derived API credentials (from ClobClient.create_or_derive_api_creds()).
@@ -1256,11 +1241,6 @@ class WebSocketManager:
             for channel, msg in subs:
                 conn = self._connections.get(channel)
                 if conn:
-                    if channel == Channel.USER:
-                        logger.info(
-                            f"WS [user] Queue processor sending sub: "
-                            f"{json.dumps(msg)[:200]}"
-                        )
                     await conn.subscribe(msg)
 
             for channel, msg in unsubs:
@@ -1330,7 +1310,8 @@ class WebSocketManager:
         condition IDs as the initial markets for auth. The Polymarket user WS
         server requires at least one condition ID in the auth message.
         
-        On subsequent calls: sends additional market subscriptions.
+        On subsequent calls: only sends subscriptions for NEW condition IDs
+        that haven't been subscribed to yet (deduplication).
         
         Per official example: {
             "auth": {"apiKey": "...", "secret": "...", "passphrase": "..."},
@@ -1352,15 +1333,26 @@ class WebSocketManager:
         # If user channel hasn't been started yet, start it now with condition IDs
         if not conn._running:
             conn._initial_markets = condition_ids
+            # Track subscribed condition IDs to avoid re-subscribing
+            if not hasattr(self, '_user_subscribed_cids'):
+                self._user_subscribed_cids = set()
+            self._user_subscribed_cids.update(condition_ids)
             if self._loop and not self._loop.is_closed():
                 logger.info(f"WS [user] Starting lazy connection with {len(condition_ids)} condition IDs")
                 asyncio.run_coroutine_threadsafe(conn.connect(), self._loop)
             else:
                 logger.warning("WS [user] Event loop not available — initial_markets stored for later")
         else:
-            # Already connected — send additional market subscription
+            # Already connected — only subscribe to NEW condition IDs
+            if not hasattr(self, '_user_subscribed_cids'):
+                self._user_subscribed_cids = set()
+            new_cids = [cid for cid in condition_ids if cid not in self._user_subscribed_cids]
+            if not new_cids:
+                return  # All condition IDs already subscribed — skip
+            self._user_subscribed_cids.update(new_cids)
+            logger.info(f"WS [user] Subscribing to {len(new_cids)} new condition IDs")
             msg = {
-                "markets": condition_ids,
+                "markets": new_cids,
                 "operation": "subscribe",
             }
             with self._queue_lock:
