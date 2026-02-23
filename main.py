@@ -952,6 +952,12 @@ class PolyMakerBot(PolymarketBot):
                         self.logger.info("  Sim-merged {} positions".format(merged))
 
                 if cycle % 5 == 0:
+                    # V15.1-P4: Sync live on-chain positions to token_holdings.
+                    # This ensures PnL calc uses real position data, not just
+                    # fill-recorded data which can miss fills (race conditions).
+                    # query_live_positions also feeds the merge scan with accurate data.
+                    if not self.config.dry_run and self.merge_detector.w3:
+                        self.merge_detector.query_live_positions(self.engine._market_cache)
                     self.merge_detector.check_merges(
                         self.engine.token_holdings, self.engine._market_cache)
 

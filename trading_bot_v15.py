@@ -110,6 +110,29 @@ except ImportError:
 
 
 # -----------------------------------------------------------------
+# Web3 v6/v7 compatibility helper
+# -----------------------------------------------------------------
+
+def _encode_abi(contract, fn_name, args):
+    """Encode ABI data for a contract function call.
+    Compatible with both web3 v6 (encodeABI) and v7+ (encode_abi).
+    """
+    if hasattr(contract, 'encodeABI'):
+        return contract.encodeABI(fn_name=fn_name, args=args)
+    elif hasattr(contract, 'encode_abi'):
+        return contract.encode_abi(fn_name=fn_name, args=args)
+    else:
+        # Fallback: try via functions object
+        fn = getattr(contract.functions, fn_name)
+        if hasattr(fn(*args), 'build_transaction'):
+            # web3 v7 style: use the function object directly
+            return fn(*args)._encode_transaction_data()
+        raise AttributeError(
+            "Contract has neither encodeABI nor encode_abi. "
+            "Check web3.py version compatibility.")
+
+
+# -----------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------
 
@@ -1348,13 +1371,85 @@ class AutoMerger:
             raw = raw.rjust(32, b'\x00')
         return raw[:32]
 
+    def query_live_positions(self, market_cache):
+        """Query on-chain CTF balanceOf for all tokens in market_cache.
+        Returns dict {token_id: {"size": float, "cost": 0}} matching
+        the token_holdings format so _find_mergeable can use it directly.
+        Falls back to engine.token_holdings if RPC is unavailable."""
+        if not self.w3 or not self.ctf_contract:
+            if self.engine:
+                return dict(self.engine.token_holdings)
+            return {}
+        wallet = self.config.proxy_wallet
+        if not wallet:
+            if self.engine:
+                return dict(self.engine.token_holdings)
+            return {}
+        wallet_addr = Web3.to_checksum_address(wallet)
+        live = {}
+        token_ids = set()
+        # Also check expired_windows_pending_claim and window_metadata
+        combined_cache = dict(market_cache)
+        if self.engine:
+            for wid, info in self.engine.expired_windows_pending_claim.items():
+                if wid not in combined_cache:
+                    combined_cache[wid] = info
+            for wid, meta in self.engine.window_metadata.items():
+                if wid not in combined_cache:
+                    combined_cache[wid] = meta
+        for wid, market in combined_cache.items():
+            for key in ("token_up", "token_down"):
+                tid = market.get(key, "")
+                if tid:
+                    token_ids.add(tid)
+        queried = 0
+        errors = 0
+        for tid in token_ids:
+            try:
+                self.rpc_limiter.wait()
+                raw = self.ctf_contract.functions.balanceOf(
+                    wallet_addr, int(tid, 16) if tid.startswith("0x") else int(tid)
+                ).call()
+                shares = float(raw) / 1e6
+                queried += 1
+                if shares >= 1.0:  # Ignore dust
+                    live[tid] = {"size": shares, "cost": 0}
+            except Exception as e:
+                errors += 1
+                err = str(e).lower()
+                if "rate limit" in err or "-32090" in err:
+                    self.rpc_limiter.report_rate_limit(10)
+                    self.logger.info("  LIVE POS | RPC rate limited after {} queries".format(queried))
+                    break
+        if queried > 0:
+            self.logger.info("  LIVE POS | Queried {} tokens | {} with balance | {} errors".format(
+                queried, len(live), errors))
+        # Sync back to engine.token_holdings so PnL calc uses live data
+        if self.engine and live:
+            for tid, pos in live.items():
+                if tid in self.engine.token_holdings:
+                    self.engine.token_holdings[tid]["size"] = pos["size"]
+                else:
+                    self.engine.token_holdings[tid] = {"size": pos["size"], "cost": 0}
+            # Also clean up stale holdings that are no longer on-chain
+            for tid in list(self.engine.token_holdings.keys()):
+                if tid in token_ids and tid not in live:
+                    self.engine.token_holdings[tid]["size"] = 0
+        if errors > 0 and queried == 0:
+            # Total RPC failure — fall back to engine data
+            if self.engine:
+                return dict(self.engine.token_holdings)
+        return live
+
     def check_and_merge_all(self, market_cache, token_holdings):
         if not self.config.auto_merge_enabled or not self.w3:
             return 0
         if self.config.dry_run:
             return self._simulate_merges(market_cache, token_holdings)
+        # Use live on-chain positions instead of fill-recorded token_holdings
+        live_holdings = self.query_live_positions(market_cache)
         merged_count = 0
-        window_holdings = self._find_mergeable(market_cache, token_holdings)
+        window_holdings = self._find_mergeable(market_cache, live_holdings)
         for wid, info in window_holdings.items():
             mergeable = min(info["up_size"], info["down_size"])
             if mergeable < self.config.merge_min_shares:
@@ -1377,12 +1472,14 @@ class AutoMerger:
                 self.total_merged_usd += mergeable
                 token_up = market.get("token_up", "")
                 token_down = market.get("token_down", "")
-                if token_up in token_holdings:
-                    token_holdings[token_up]["size"] = max(
-                        0, token_holdings[token_up]["size"] - mergeable)
-                if token_down in token_holdings:
-                    token_holdings[token_down]["size"] = max(
-                        0, token_holdings[token_down]["size"] - mergeable)
+                # Update both the live_holdings and the passed-in token_holdings
+                for holdings in (live_holdings, token_holdings):
+                    if token_up in holdings:
+                        holdings[token_up]["size"] = max(
+                            0, holdings[token_up]["size"] - mergeable)
+                    if token_down in holdings:
+                        holdings[token_down]["size"] = max(
+                            0, holdings[token_down]["size"] - mergeable)
                 if self.engine:
                     self.engine.capital_in_positions = max(
                         0, self.engine.capital_in_positions - mergeable)
@@ -1522,9 +1619,9 @@ class AutoMerger:
             cid_bytes = self._to_bytes32(condition_id)
             decimals = self.config.merge_position_decimals
             amount_raw = int(shares * (10 ** decimals))
-            merge_data = self.ctf_contract.encodeABI(
-                fn_name="mergePositions",
-                args=[usdc_addr, parent, cid_bytes, [1, 2], amount_raw])
+            merge_data = _encode_abi(
+                self.ctf_contract, "mergePositions",
+                [usdc_addr, parent, cid_bytes, [1, 2], amount_raw])
             ctf_addr = Web3.to_checksum_address(CTF_ADDRESS)
             if self.proxy_contract:
                 return self._merge_via_proxy(ctf_addr, merge_data, window_id)
@@ -1861,9 +1958,9 @@ class AutoClaimManager:
                 # Continue anyway — blind redeem is meant to try even without confirmation
             # Try proxy wallet first, then direct
             if self.proxy_contract and self.config.proxy_wallet:
-                redeem_data = self.ctf_contract.encodeABI(
-                    fn_name="redeemPositions",
-                    args=[usdc_addr, parent, cid_bytes, [1, 2]])
+                redeem_data = _encode_abi(
+                    self.ctf_contract, "redeemPositions",
+                    [usdc_addr, parent, cid_bytes, [1, 2]])
                 ctf_addr = Web3.to_checksum_address(CTF_ADDRESS)
                 self.rpc_limiter.wait()
                 nonce = self.w3.eth.get_transaction_count(self.account.address)
@@ -1997,8 +2094,9 @@ class AutoClaimManager:
             usdc_addr = Web3.to_checksum_address(USDC_E_ADDRESS)
             parent = bytes(32)
             cid_bytes = self._to_bytes32(condition_id)
-            redeem_data = self.ctf_contract.encodeABI(
-                fn_name="redeemPositions", args=[usdc_addr, parent, cid_bytes, [1, 2]])
+            redeem_data = _encode_abi(
+                self.ctf_contract, "redeemPositions",
+                [usdc_addr, parent, cid_bytes, [1, 2]])
             ctf_addr = Web3.to_checksum_address(CTF_ADDRESS)
             self.rpc_limiter.wait()
             nonce = self.w3.eth.get_transaction_count(self.account.address)
@@ -2890,6 +2988,21 @@ class TradingEngine:
                     remaining.append(oid)
         self.orders_by_window[window_id] = remaining
         self.total_orders_cancelled += cancelled
+        # V15.1-P4: Batch cancel safety net — ensure exchange-side cleanup.
+        # Individual cancel(oid) can succeed locally but the exchange may
+        # still show the order briefly. cancel_market_orders(asset_id) is a
+        # server-side batch cancel that catches any stragglers.
+        if not self.config.dry_run and self.client and cancelled > 0:
+            cancelled_tokens = set()
+            for oid, info in self._recently_cancelled.items():
+                tid = info.get("token_id", "")
+                if tid and info.get("window_id") == window_id:
+                    cancelled_tokens.add(tid)
+            for tid in cancelled_tokens:
+                try:
+                    self.client.cancel_market_orders(asset_id=str(tid))
+                except Exception:
+                    pass  # Best-effort; individual cancels already succeeded
         self._recalc_exposure()
         return cancelled
 
