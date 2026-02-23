@@ -30,6 +30,14 @@ from trading_bot_v15 import (
 # Import Command Center client
 from polymaker_client import cc
 
+# Import WebSocket manager (Phase 1 async foundation)
+try:
+    from ws_manager import WebSocketManager, EventType, Channel
+    from ws_price_feed import WSPriceFeed, WSOrderBookReader
+    HAS_WS_MANAGER = True
+except ImportError:
+    HAS_WS_MANAGER = False
+
 
 def setup_session_logging(run_id: int, logger: logging.Logger):
     """
@@ -337,6 +345,48 @@ class PolyMakerBot(PolymarketBot):
                            f"cooldown={self.config.hard_loss_cooloff:.0f}s, "
                            f"dry_run={self.config.dry_run}")
 
+        # ── WebSocket Manager (Phase 1 async foundation) ──
+        self.ws_manager = None
+        self._ws_enabled = os.getenv("WS_ENABLED", "true").lower() == "true"
+        if HAS_WS_MANAGER and self._ws_enabled:
+            try:
+                self.ws_manager = WebSocketManager(
+                    api_key=self.config.api_key,
+                    api_secret=self.config.api_secret,
+                    api_passphrase=self.config.api_passphrase,
+                    enable_market=True,
+                    enable_user=bool(self.config.api_key),
+                    enable_rtds=True,
+                    logger_instance=self.logger,
+                )
+                # Wrap price_feed and book_reader with WS-enhanced versions
+                self.price_feed = WSPriceFeed(
+                    self.price_feed,
+                    state_store=self.ws_manager.state_store,
+                    logger_instance=self.logger,
+                )
+                self.book_reader = WSOrderBookReader(
+                    self.book_reader,
+                    state_store=self.ws_manager.state_store,
+                    logger_instance=self.logger,
+                )
+                # Re-inject wrapped readers into strategies that hold references
+                self.mm_strategy.book_reader = self.book_reader
+                self.mm_strategy.price_feed = self.price_feed
+                self.sniper.book_reader = self.book_reader
+                self.sniper.price_feed = self.price_feed
+                self.arb.book_reader = self.book_reader
+                self.contrarian.book_reader = self.book_reader
+                self.contrarian.price_feed = self.price_feed
+                self.logger.info("  WebSocket manager initialized (market+user+rtds)")
+            except Exception as e:
+                self.logger.warning(f"  WebSocket manager init failed: {e}. Using REST-only mode.")
+                self.ws_manager = None
+        elif not HAS_WS_MANAGER:
+            self.logger.info("  WebSocket manager: module not available, using REST-only mode")
+        else:
+            self.logger.info("  WebSocket manager: disabled via WS_ENABLED=false")
+
         # Validate credentials for live mode
         if not self.config.dry_run:
             missing = []
@@ -369,6 +419,14 @@ class PolyMakerBot(PolymarketBot):
         self._print_summary("FINAL")
         self._print_claim_summary()
         self._print_v15_1_summary()
+
+        # Stop WebSocket manager
+        if self.ws_manager:
+            try:
+                self.ws_manager.stop()
+                self.logger.info("WebSocket manager stopped.")
+            except Exception:
+                pass
 
         # Stop CC run with final metrics
         try:
@@ -531,6 +589,25 @@ class PolyMakerBot(PolymarketBot):
             self.logger.info(f"  Command Center: run #{self._cc_run_id}")
         self.logger.info("=" * 70)
 
+        # ── Start WebSocket Manager ──────────────────────────────────────
+        if self.ws_manager:
+            ws_started = self.ws_manager.start()
+            if ws_started:
+                self.logger.info("  WebSocket manager started (background thread)")
+                # Subscribe to RTDS for all configured assets
+                all_assets = list(set(self.config.assets_15m + self.config.assets_5m))
+                self.ws_manager.subscribe_rtds_all([a.upper() for a in all_assets])
+                # Subscribe to user order updates if authenticated
+                if self.config.api_key:
+                    self.ws_manager.subscribe_user_orders()
+                # Give WebSocket connections a moment to establish
+                time.sleep(2)
+                ws_status = self.ws_manager.get_connection_summary()
+                self.logger.info(f"  WebSocket status: {ws_status}")
+            else:
+                self.logger.warning("  WebSocket manager failed to start. Using REST-only mode.")
+                self.ws_manager = None
+
         # ── Live Wallet Check at Startup ─────────────────────────────────
         # CC sets kellyBankroll as the session budget ceiling.
         # We read the actual wallet to: (1) validate we have enough, 
@@ -674,16 +751,21 @@ class PolyMakerBot(PolymarketBot):
                     if cs2["suppressed"] > 0:
                         churn_str = " | Churn:-{:.0f}%".format(cs2["reduction_pct"])
 
+                # WebSocket status (every 10 cycles)
+                ws_str = ""
+                if self.ws_manager and cycle % 10 == 1:
+                    ws_str = " | WS:{}".format(self.ws_manager.get_connection_summary())
+
                 self.logger.info(
                     "\n{}\n  C{} | {} | Ord:{} | Exp:${:.0f} | Avail:${:.0f} | MaxExp:${:.0f}"
-                    "{}{}{}{}{}{}\n{}".format(
+                    "{}{}{}{}{}{}{}\n{}".format(
                         "_" * 60, cycle,
                         datetime.now(timezone.utc).strftime("%H:%M:%S"),
                         stats["active_orders"], stats["total_exposure"],
                         stats["available_capital"],
                         self.config.max_total_exposure,
                         wallet_str, pnl_str, claim_str, hedge_str,
-                        merge_str, churn_str,
+                        merge_str, churn_str, ws_str,
                         "_" * 60))
 
                 self.price_feed.update()
@@ -704,6 +786,10 @@ class PolyMakerBot(PolymarketBot):
                     self.vol_tracker.register_token(market["token_up"], market["asset"])
                     self.vol_tracker.register_token(market["token_down"], market["asset"])
                     self.engine.register_window_metadata(market)
+                    # Subscribe to WebSocket market data for active tokens
+                    if self.ws_manager:
+                        self.ws_manager.subscribe_market(market["token_up"])
+                        self.ws_manager.subscribe_market(market["token_down"])
 
                 self._compute_market_edges(markets)
                 self._resolve_expired_windows(markets)
