@@ -73,11 +73,25 @@ class WSFillDetector:
         # Limit the set size to prevent unbounded growth
         self._max_processed_ids = 10000
 
+        # Phase 4: WS order lifecycle tracking
+        # Track orders confirmed by exchange via PLACEMENT events
+        self._ws_confirmed_orders: set = set()
+        # Track orders cancelled by exchange via CANCELLATION events
+        self._ws_cancelled_orders: Dict[str, dict] = {}  # order_id -> cancel data
+        # Periodic REST reconciliation counter
+        self._cycle_count = 0
+        self._rest_reconcile_interval = 10  # Run REST reconciliation every N cycles
+        self._last_rest_reconcile: float = 0
+        # Track partial fills from cancellation events
+        self._partial_fill_queue: deque = deque()
+
         # Stats
         self._ws_fills_total = 0
         self._ws_fills_session = 0
         self._rest_fallback_count = 0
         self._last_ws_fill_time: float = 0
+        self._ws_cancellations_detected = 0
+        self._ws_placements_confirmed = 0
         self._started = False
 
         # Health tracking
@@ -235,17 +249,88 @@ class WSFillDetector:
         """
         Handle ORDER_UPDATE event from the EventBus.
 
-        Used to track order lifecycle (PLACEMENT, CANCELLATION, etc.)
-        This is informational — we don't process fills from this event,
-        but we log cancellations for debugging.
+        Phase 4: Full order lifecycle tracking.
+        - PLACEMENT: Exchange acknowledged our order — track confirmation
+        - CANCELLATION: Exchange confirmed cancel — check for partial fills
+          and remove from active_orders
+        - Trade status updates (MATCHED, MINED, CONFIRMED, FAILED): logged
         """
-        event_type = update_data.get("event_type", "")
-        if event_type == "order":
+        evt = update_data.get("event_type", "")
+
+        if evt == "order":
             order_type = update_data.get("type", "")
             order_id = update_data.get("order_id", "")
-            if order_type == "CANCELLATION" and order_id:
+            if not order_id:
+                return
+
+            if order_type == "PLACEMENT":
+                # Exchange confirmed our order placement
+                with self._lock:
+                    self._ws_confirmed_orders.add(order_id)
+                    self._ws_placements_confirmed += 1
                 self.logger.debug(
-                    f"WSFillDetector: Order {order_id[:12]}... cancelled via WS"
+                    f"WSFillDetector: Order {order_id[:12]}... confirmed on exchange"
+                )
+
+            elif order_type == "CANCELLATION":
+                size_matched = float(update_data.get("size_matched", "0") or "0")
+                self._ws_cancellations_detected += 1
+
+                with self._lock:
+                    # Remove from confirmed set
+                    self._ws_confirmed_orders.discard(order_id)
+
+                    # Store cancellation data
+                    self._ws_cancelled_orders[order_id] = {
+                        "size_matched": size_matched,
+                        "ts": time.time(),
+                    }
+
+                # If there was a partial fill (size_matched > 0), queue it
+                if size_matched > 0:
+                    info = self.engine.active_orders.get(order_id)
+                    if not info:
+                        info = self.engine._recently_cancelled.get(order_id)
+                    if info:
+                        original_size = info.get("size", 0)
+                        if size_matched < original_size:
+                            # Partial fill — queue the filled portion
+                            with self._lock:
+                                self._partial_fill_queue.append({
+                                    "type": "partial_cancel",
+                                    "order_id": order_id,
+                                    "price": info.get("price", 0),
+                                    "size": size_matched,
+                                    "asset_id": info.get("token_id", ""),
+                                    "side": info.get("side", "BUY"),
+                                    "window_id": info.get("window_id", ""),
+                                    "ts": time.time(),
+                                })
+                            self.logger.info(
+                                f"  PARTIAL FILL via CANCEL | Order {order_id[:12]}... "
+                                f"| {size_matched:.1f}/{original_size:.1f} matched"
+                            )
+
+                # Remove from active_orders — exchange confirmed the cancel
+                cancelled_info = self.engine.active_orders.pop(order_id, None)
+                if cancelled_info:
+                    wid = cancelled_info.get("window_id", "")
+                    if wid in self.engine.orders_by_window:
+                        self.engine.orders_by_window[wid] = [
+                            o for o in self.engine.orders_by_window[wid] if o != order_id
+                        ]
+                    self.logger.debug(
+                        f"WSFillDetector: Order {order_id[:12]}... cancelled — "
+                        f"removed from active_orders | {wid}"
+                    )
+
+        elif evt == "trade":
+            # Trade lifecycle update (MATCHED already handled by ORDER_FILL)
+            status = update_data.get("status", "")
+            if status in ("FAILED", "RETRYING"):
+                taker_id = update_data.get("taker_order_id", "")
+                self.logger.warning(
+                    f"WSFillDetector: Trade {status} for order {taker_id[:12]}..."
                 )
 
     # ── Main Thread Fill Processing ──
@@ -386,10 +471,303 @@ class WSFillDetector:
                 )
             )
 
+        # Phase 4: Also process partial fills from cancellation events
+        with self._lock:
+            partial_pending = list(self._partial_fill_queue)
+            self._partial_fill_queue.clear()
+
+        for pfill in partial_pending:
+            order_id = pfill.get("order_id", "")
+            if not order_id or order_id in self._processed_order_ids:
+                continue
+
+            # For partial fills, use the data we captured from the cancel event
+            fill_price = pfill.get("price", 0)
+            fill_size = pfill.get("size", 0)
+            fill_side = pfill.get("side", "BUY")
+            fill_token = pfill.get("asset_id", "")
+            wid = pfill.get("window_id", "")
+
+            if fill_size <= 0:
+                continue
+
+            # Record the partial fill
+            self.engine.record_fill(fill_token, fill_side, fill_price, fill_size)
+
+            if fill_side == "BUY":
+                cost = fill_price * fill_size
+                self.engine.window_fill_cost[wid] = (
+                    self.engine.window_fill_cost.get(wid, 0) + cost
+                )
+                self.engine.filled_windows.add(wid)
+                self.engine.window_entry_count[wid] = (
+                    self.engine.window_entry_count.get(wid, 0) + 1
+                )
+
+                if wid not in self.engine.window_fill_tokens:
+                    self.engine.window_fill_tokens[wid] = []
+                self.engine.window_fill_tokens[wid].append({
+                    "token_id": fill_token,
+                    "size": fill_size,
+                    "price": fill_price,
+                    "is_up": self.engine._is_up_token_cache.get(fill_token),
+                    "time": time.time(),
+                })
+
+                is_up = self.engine._is_up_token_cache.get(fill_token)
+                side_label = "UP" if is_up else "DOWN"
+                if wid not in self.engine.window_fill_sides:
+                    self.engine.window_fill_sides[wid] = {}
+                if side_label not in self.engine.window_fill_sides[wid]:
+                    self.engine.window_fill_sides[wid][side_label] = []
+                self.engine.window_fill_sides[wid][side_label].append({
+                    "token_id": fill_token,
+                    "price": fill_price,
+                    "size": fill_size,
+                    "time": time.time(),
+                })
+
+                sides = self.engine.window_fill_sides.get(wid, {})
+                if "UP" in sides and "DOWN" in sides:
+                    self.engine.paired_windows.add(wid)
+
+            self._processed_order_ids.add(order_id)
+            self._trim_processed_ids()
+
+            filled += 1
+            self._ws_fills_total += 1
+            self._ws_fills_session += 1
+            self._last_ws_fill_time = time.time()
+
+            self.logger.info(
+                "  FILL [WS-PARTIAL] | {} {} {:.1f} @ ${:.2f} | {}".format(
+                    fill_side, fill_token[:12] + "...",
+                    fill_size, fill_price, wid
+                )
+            )
+
         if filled:
             self.engine._recalc_exposure()
 
         return filled
+
+    def rest_reconcile(self) -> int:
+        """
+        Phase 4: Periodic REST reconciliation.
+
+        Called every N cycles (configured by _rest_reconcile_interval) as a
+        safety net to catch any fills that WS might have missed.
+
+        This replaces the per-cycle REST check_fills() with a much less
+        frequent reconciliation pass.
+
+        Returns:
+            Number of fills detected by REST reconciliation.
+        """
+        self._cycle_count += 1
+
+        if self._cycle_count % self._rest_reconcile_interval != 0:
+            return 0
+
+        if self.engine.config.dry_run or not self.engine.client:
+            return 0
+
+        self._last_rest_reconcile = time.time()
+
+        try:
+            open_orders = self.engine.client.get_orders()
+            open_ids = set()
+            if isinstance(open_orders, list):
+                open_ids = {o.get("id", o.get("orderID", "")) for o in open_orders}
+
+            filled = 0
+            # Check active orders that are NOT in the exchange's open list
+            # AND were NOT cancelled via WS (those are already handled)
+            for oid in list(self.engine.active_orders.keys()):
+                if oid.startswith("DRY-"):
+                    continue
+                if oid in open_ids:
+                    continue
+                if oid in self._processed_order_ids:
+                    continue
+
+                # Check if WS already told us this was cancelled
+                with self._lock:
+                    if oid in self._ws_cancelled_orders:
+                        # WS already handled this cancellation
+                        continue
+
+                # Order not on exchange and not cancelled via WS = filled
+                info = self.engine.active_orders.pop(oid, None)
+                if not info:
+                    continue
+
+                wid = info.get("window_id", "")
+                if wid in self.engine.orders_by_window:
+                    self.engine.orders_by_window[wid] = [
+                        o for o in self.engine.orders_by_window[wid] if o != oid
+                    ]
+
+                fill_price = info.get("price", 0)
+                fill_size = info.get("size", 0)
+                fill_side = info.get("side", "BUY")
+                fill_token = info.get("token_id", "")
+
+                self.engine.record_fill(fill_token, fill_side, fill_price, fill_size)
+
+                if fill_side == "BUY":
+                    cost = fill_price * fill_size
+                    self.engine.window_fill_cost[wid] = (
+                        self.engine.window_fill_cost.get(wid, 0) + cost
+                    )
+                    self.engine.filled_windows.add(wid)
+                    self.engine.window_entry_count[wid] = (
+                        self.engine.window_entry_count.get(wid, 0) + 1
+                    )
+                    if wid not in self.engine.window_fill_tokens:
+                        self.engine.window_fill_tokens[wid] = []
+                    self.engine.window_fill_tokens[wid].append({
+                        "token_id": fill_token, "size": fill_size,
+                        "price": fill_price,
+                        "is_up": self.engine._is_up_token_cache.get(fill_token),
+                        "time": time.time(),
+                    })
+                    is_up = self.engine._is_up_token_cache.get(fill_token)
+                    side_label = "UP" if is_up else "DOWN"
+                    if wid not in self.engine.window_fill_sides:
+                        self.engine.window_fill_sides[wid] = {}
+                    if side_label not in self.engine.window_fill_sides[wid]:
+                        self.engine.window_fill_sides[wid][side_label] = []
+                    self.engine.window_fill_sides[wid][side_label].append({
+                        "token_id": fill_token, "price": fill_price,
+                        "size": fill_size, "time": time.time(),
+                    })
+                    sides = self.engine.window_fill_sides.get(wid, {})
+                    if "UP" in sides and "DOWN" in sides:
+                        self.engine.paired_windows.add(wid)
+                    elif self.engine.config.hedge_completion_enabled:
+                        self.engine._pending_hedges.append({
+                            "window_id": wid, "filled_side": side_label,
+                            "filled_price": fill_price,
+                            "filled_size": fill_size,
+                            "filled_token": fill_token,
+                            "time": time.time(),
+                        })
+
+                self._processed_order_ids.add(oid)
+                self._trim_processed_ids()
+                filled += 1
+                self._ws_fills_total += 1
+                self._last_ws_fill_time = time.time()
+
+                self.logger.info(
+                    "  FILL [REST-RECONCILE] | {} {} {:.1f} @ ${:.2f} | {}".format(
+                        fill_side, fill_token[:12] + "...",
+                        fill_size, fill_price, wid
+                    )
+                )
+
+            # Also check recently cancelled orders
+            for oid in list(self.engine._recently_cancelled.keys()):
+                if oid.startswith("DRY-"):
+                    continue
+                if oid in open_ids:
+                    continue
+                if oid in self._processed_order_ids:
+                    continue
+                with self._lock:
+                    if oid in self._ws_cancelled_orders:
+                        continue
+
+                info = self.engine._recently_cancelled.pop(oid, None)
+                if not info:
+                    continue
+
+                wid = info.get("window_id", "")
+                fill_price = info.get("price", 0)
+                fill_size = info.get("size", 0)
+                fill_side = info.get("side", "BUY")
+                fill_token = info.get("token_id", "")
+
+                self.engine.record_fill(fill_token, fill_side, fill_price, fill_size)
+
+                if fill_side == "BUY":
+                    cost = fill_price * fill_size
+                    self.engine.window_fill_cost[wid] = (
+                        self.engine.window_fill_cost.get(wid, 0) + cost
+                    )
+                    self.engine.filled_windows.add(wid)
+                    self.engine.window_entry_count[wid] = (
+                        self.engine.window_entry_count.get(wid, 0) + 1
+                    )
+                    if wid not in self.engine.window_fill_tokens:
+                        self.engine.window_fill_tokens[wid] = []
+                    self.engine.window_fill_tokens[wid].append({
+                        "token_id": fill_token, "size": fill_size,
+                        "price": fill_price,
+                        "is_up": self.engine._is_up_token_cache.get(fill_token),
+                        "time": time.time(),
+                    })
+                    is_up = self.engine._is_up_token_cache.get(fill_token)
+                    side_label = "UP" if is_up else "DOWN"
+                    if wid not in self.engine.window_fill_sides:
+                        self.engine.window_fill_sides[wid] = {}
+                    if side_label not in self.engine.window_fill_sides[wid]:
+                        self.engine.window_fill_sides[wid][side_label] = []
+                    self.engine.window_fill_sides[wid][side_label].append({
+                        "token_id": fill_token, "price": fill_price,
+                        "size": fill_size, "time": time.time(),
+                    })
+                    sides = self.engine.window_fill_sides.get(wid, {})
+                    if "UP" in sides and "DOWN" in sides:
+                        self.engine.paired_windows.add(wid)
+                    elif self.engine.config.hedge_completion_enabled:
+                        self.engine._pending_hedges.append({
+                            "window_id": wid, "filled_side": side_label,
+                            "filled_price": fill_price,
+                            "filled_size": fill_size,
+                            "filled_token": fill_token,
+                            "time": time.time(),
+                        })
+
+                self._processed_order_ids.add(oid)
+                self._trim_processed_ids()
+                filled += 1
+                self._ws_fills_total += 1
+
+                self.logger.info(
+                    "  FILL [REST-RECONCILE-RECOVERED] | {} {} {:.1f} @ ${:.2f} | {}".format(
+                        fill_side, fill_token[:12] + "...",
+                        fill_size, fill_price, wid
+                    )
+                )
+
+            if filled:
+                self.engine._recalc_exposure()
+                self.logger.info(f"  REST reconciliation found {filled} missed fills")
+
+            return filled
+
+        except Exception as e:
+            self.logger.debug(f"  REST reconciliation error: {e}")
+            return 0
+
+    def purge_ws_cancelled_orders(self, max_age: float = 300.0):
+        """
+        Purge stale entries from _ws_cancelled_orders and _ws_confirmed_orders.
+        Called periodically from the main cycle.
+        """
+        now = time.time()
+        with self._lock:
+            stale = [oid for oid, data in self._ws_cancelled_orders.items()
+                     if now - data.get("ts", 0) > max_age]
+            for oid in stale:
+                del self._ws_cancelled_orders[oid]
+
+            # Trim confirmed orders set
+            if len(self._ws_confirmed_orders) > 10000:
+                # Just clear it — it's informational only
+                self._ws_confirmed_orders.clear()
 
     # ── Health & Fallback ──
 
@@ -447,6 +825,13 @@ class WSFillDetector:
             "processed_ids_count": len(self._processed_order_ids),
             "healthy": self.is_healthy(),
             "fallback_mode": self.should_fallback_to_rest(),
+            # Phase 4 stats
+            "ws_placements_confirmed": self._ws_placements_confirmed,
+            "ws_cancellations_detected": self._ws_cancellations_detected,
+            "ws_confirmed_orders": len(self._ws_confirmed_orders),
+            "ws_cancelled_orders_tracked": len(self._ws_cancelled_orders),
+            "cycle_count": self._cycle_count,
+            "last_rest_reconcile": self._last_rest_reconcile,
         }
 
     def record_rest_fallback(self):

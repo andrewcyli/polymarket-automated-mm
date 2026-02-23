@@ -794,9 +794,11 @@ class PolyMakerBot(PolymarketBot):
                     if hasattr(self, 'ws_fill_detector') and self.ws_fill_detector:
                         fd_stats = self.ws_fill_detector.get_stats()
                         fill_mode = "WS" if not fd_stats["fallback_mode"] else "REST"
-                        ws_str += " | Fills:{}(ws:{},rest:{})".format(
+                        ws_str += " | Fills:{}(ws:{},rest:{},plc:{},cnl:{})".format(
                             fill_mode, fd_stats["ws_fills_session"],
-                            fd_stats["rest_fallback_count"])
+                            fd_stats["rest_fallback_count"],
+                            fd_stats.get("ws_placements_confirmed", 0),
+                            fd_stats.get("ws_cancellations_detected", 0))
                     # Orderbook stats
                     if hasattr(self.book_reader, 'get_stats'):
                         bk_stats = self.book_reader.get_stats()
@@ -862,19 +864,25 @@ class PolyMakerBot(PolymarketBot):
                 # will never detect it, causing capital_in_positions to stay at 0
                 # and triggering false loss-stop warnings.
                 #
-                # Phase 2: WS-first fill detection with REST fallback.
-                # WSFillDetector processes real-time fill events from the user channel.
-                # If WS is unhealthy, we fall back to the original REST polling.
+                 # Phase 4: WS-primary fill detection with periodic REST reconciliation.
+                # WSFillDetector processes real-time fill events AND order lifecycle
+                # events (PLACEMENT, CANCELLATION) from the user channel.
+                # REST reconciliation runs every 10 cycles as a safety net.
+                # If WS is completely unhealthy, fall back to REST every cycle.
                 if not self.config.dry_run:
                     live_fills = 0
                     fill_source = "REST"
-
                     # Try WS fill detection first
                     if hasattr(self, 'ws_fill_detector') and self.ws_fill_detector and not self.ws_fill_detector.should_fallback_to_rest():
                         live_fills = self.ws_fill_detector.check_fills_ws()
                         fill_source = "WS"
+                        # Phase 4: Periodic REST reconciliation (every 10 cycles)
+                        reconciled = self.ws_fill_detector.rest_reconcile()
+                        if reconciled:
+                            live_fills += reconciled
+                            fill_source = "WS+RECONCILE"
                     else:
-                        # Fallback to REST polling
+                        # Full fallback to REST polling (WS unhealthy)
                         live_fills = self.engine.check_fills()
                         fill_source = "REST"
                         if hasattr(self, 'ws_fill_detector') and self.ws_fill_detector:
@@ -911,6 +919,9 @@ class PolyMakerBot(PolymarketBot):
                 self.engine.cleanup_expired_windows(markets, self.churn_manager)
                 self.engine.prune_stale_orders()
                 self.engine.purge_recently_cancelled()
+                # Phase 4: Purge stale WS order lifecycle tracking data
+                if hasattr(self, 'ws_fill_detector') and self.ws_fill_detector:
+                    self.ws_fill_detector.purge_ws_cancelled_orders()
                 if not self.config.dry_run:
                     self.engine.reconcile_capital_from_wallet()
                     self._schedule_live_claims()

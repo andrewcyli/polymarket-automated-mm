@@ -1,5 +1,5 @@
 """
-Tests for WSFillDetector — Phase 2 real-time fill detection.
+Tests for WSFillDetector — Phases 2-4 real-time fill detection.
 
 Tests cover:
 1. Event subscription and handler registration
@@ -11,6 +11,10 @@ Tests cover:
 7. Health check and REST fallback logic
 8. Thread safety
 9. Stats tracking
+10. Phase 4: ORDER_UPDATE lifecycle tracking (PLACEMENT, CANCELLATION)
+11. Phase 4: Partial fill detection from cancellation events
+12. Phase 4: Periodic REST reconciliation
+13. Phase 4: WS order confirmation tracking
 """
 
 import time
@@ -77,6 +81,9 @@ class MockEngine:
     def check_fills(self):
         """Original REST-based check_fills — returns 0 for mock."""
         return 0
+
+    # Mock client for REST reconciliation tests
+    client = None
 
 
 class MockWSManager:
@@ -748,6 +755,313 @@ class TestIntegrationWithMainLoop:
         # Reconnect
         ws.set_user_connected(True)
         assert not detector.should_fallback_to_rest()
+
+
+class TestPhase4OrderLifecycle:
+    """Phase 4: Test ORDER_UPDATE lifecycle tracking."""
+
+    def setup_method(self):
+        self.ws = MockWSManager()
+        self.engine = MockEngine()
+        self.detector = WSFillDetector(self.ws, self.engine)
+        self.detector.start()
+
+    def test_placement_confirmation_tracked(self):
+        """PLACEMENT event should add order to confirmed set."""
+        self.ws.event_bus.emit(EventType.ORDER_UPDATE, {
+            "event_type": "order",
+            "type": "PLACEMENT",
+            "order_id": "order-1",
+            "asset_id": "token-abc",
+            "price": "0.47",
+            "side": "BUY",
+            "original_size": "31.2",
+            "size_matched": "0",
+        })
+        assert "order-1" in self.detector._ws_confirmed_orders
+        assert self.detector._ws_placements_confirmed == 1
+
+    def test_cancellation_removes_from_confirmed(self):
+        """CANCELLATION should remove order from confirmed set."""
+        # First confirm the order
+        self.ws.event_bus.emit(EventType.ORDER_UPDATE, {
+            "event_type": "order",
+            "type": "PLACEMENT",
+            "order_id": "order-1",
+            "asset_id": "token-abc",
+            "price": "0.47",
+            "side": "BUY",
+            "original_size": "31.2",
+            "size_matched": "0",
+        })
+        assert "order-1" in self.detector._ws_confirmed_orders
+
+        # Now cancel it
+        self.engine.active_orders["order-1"] = {
+            "window_id": "BTC-w1", "side": "BUY", "price": 0.47,
+            "size": 31.2, "token_id": "token-abc",
+        }
+        self.ws.event_bus.emit(EventType.ORDER_UPDATE, {
+            "event_type": "order",
+            "type": "CANCELLATION",
+            "order_id": "order-1",
+            "size_matched": "0",
+        })
+        assert "order-1" not in self.detector._ws_confirmed_orders
+        assert self.detector._ws_cancellations_detected == 1
+
+    def test_cancellation_removes_from_active_orders(self):
+        """CANCELLATION event should remove order from engine.active_orders."""
+        self.engine.active_orders["order-1"] = {
+            "window_id": "BTC-w1", "side": "BUY", "price": 0.47,
+            "size": 31.2, "token_id": "token-abc",
+        }
+        self.engine.orders_by_window["BTC-w1"] = ["order-1", "order-2"]
+
+        self.ws.event_bus.emit(EventType.ORDER_UPDATE, {
+            "event_type": "order",
+            "type": "CANCELLATION",
+            "order_id": "order-1",
+            "size_matched": "0",
+        })
+
+        assert "order-1" not in self.engine.active_orders
+        assert self.engine.orders_by_window["BTC-w1"] == ["order-2"]
+
+    def test_cancellation_with_partial_fill(self):
+        """CANCELLATION with size_matched > 0 should queue partial fill."""
+        self.engine.active_orders["order-1"] = {
+            "window_id": "BTC-w1", "side": "BUY", "price": 0.47,
+            "size": 31.2, "token_id": "token-abc",
+        }
+        self.engine._is_up_token_cache["token-abc"] = True
+
+        self.ws.event_bus.emit(EventType.ORDER_UPDATE, {
+            "event_type": "order",
+            "type": "CANCELLATION",
+            "order_id": "order-1",
+            "size_matched": "15.6",  # Half filled before cancel
+        })
+
+        # Should have queued a partial fill
+        assert len(self.detector._partial_fill_queue) == 1
+        pfill = self.detector._partial_fill_queue[0]
+        assert pfill["size"] == 15.6
+        assert pfill["price"] == 0.47
+        assert pfill["window_id"] == "BTC-w1"
+
+        # Process the partial fill
+        fills = self.detector.check_fills_ws()
+        assert fills == 1
+        assert self.engine._record_fill_calls[0]["size"] == 15.6
+        assert "BTC-w1" in self.engine.filled_windows
+
+    def test_cancellation_full_fill_no_partial(self):
+        """CANCELLATION where size_matched == original_size should NOT queue partial."""
+        self.engine.active_orders["order-1"] = {
+            "window_id": "BTC-w1", "side": "BUY", "price": 0.47,
+            "size": 31.2, "token_id": "token-abc",
+        }
+
+        self.ws.event_bus.emit(EventType.ORDER_UPDATE, {
+            "event_type": "order",
+            "type": "CANCELLATION",
+            "order_id": "order-1",
+            "size_matched": "31.2",  # Fully filled — not a partial
+        })
+
+        # Full fill should NOT be queued as partial (it will come via ORDER_FILL)
+        assert len(self.detector._partial_fill_queue) == 0
+
+    def test_cancellation_zero_matched_no_partial(self):
+        """CANCELLATION with size_matched=0 should not queue partial fill."""
+        self.engine.active_orders["order-1"] = {
+            "window_id": "BTC-w1", "side": "BUY", "price": 0.47,
+            "size": 31.2, "token_id": "token-abc",
+        }
+
+        self.ws.event_bus.emit(EventType.ORDER_UPDATE, {
+            "event_type": "order",
+            "type": "CANCELLATION",
+            "order_id": "order-1",
+            "size_matched": "0",
+        })
+
+        assert len(self.detector._partial_fill_queue) == 0
+
+    def test_cancellation_unknown_order_no_crash(self):
+        """CANCELLATION for unknown order should not crash."""
+        self.ws.event_bus.emit(EventType.ORDER_UPDATE, {
+            "event_type": "order",
+            "type": "CANCELLATION",
+            "order_id": "unknown-order",
+            "size_matched": "10",
+        })
+        # Should not crash, partial fill queue should be empty
+        assert len(self.detector._partial_fill_queue) == 0
+        assert self.detector._ws_cancellations_detected == 1
+
+    def test_no_order_id_skipped(self):
+        """ORDER_UPDATE without order_id should be skipped."""
+        self.ws.event_bus.emit(EventType.ORDER_UPDATE, {
+            "event_type": "order",
+            "type": "PLACEMENT",
+            "order_id": "",
+        })
+        assert self.detector._ws_placements_confirmed == 0
+
+    def test_trade_failed_logged(self):
+        """FAILED trade status should be handled without crash."""
+        self.ws.event_bus.emit(EventType.ORDER_UPDATE, {
+            "event_type": "trade",
+            "status": "FAILED",
+            "taker_order_id": "taker-1",
+        })
+        # Should not crash — just logged
+
+    def test_stats_include_phase4_fields(self):
+        """get_stats should include Phase 4 fields."""
+        self.ws.event_bus.emit(EventType.ORDER_UPDATE, {
+            "event_type": "order",
+            "type": "PLACEMENT",
+            "order_id": "order-1",
+            "size_matched": "0",
+        })
+        stats = self.detector.get_stats()
+        assert "ws_placements_confirmed" in stats
+        assert "ws_cancellations_detected" in stats
+        assert stats["ws_placements_confirmed"] == 1
+
+    def test_purge_ws_cancelled_orders(self):
+        """Stale cancelled order entries should be purged."""
+        self.detector._ws_cancelled_orders["old-order"] = {
+            "size_matched": 0, "ts": time.time() - 400,
+        }
+        self.detector._ws_cancelled_orders["new-order"] = {
+            "size_matched": 0, "ts": time.time() - 10,
+        }
+        self.detector.purge_ws_cancelled_orders(max_age=300)
+        assert "old-order" not in self.detector._ws_cancelled_orders
+        assert "new-order" in self.detector._ws_cancelled_orders
+
+
+class TestPhase4RESTReconciliation:
+    """Phase 4: Test periodic REST reconciliation."""
+
+    def setup_method(self):
+        self.ws = MockWSManager()
+        self.engine = MockEngine()
+        # Set up a mock client for REST calls
+        self.engine.client = MagicMock()
+        self.detector = WSFillDetector(self.ws, self.engine)
+        self.detector.start()
+
+    def test_reconcile_skips_non_interval_cycles(self):
+        """REST reconciliation should only run every N cycles."""
+        self.detector._rest_reconcile_interval = 10
+        # Cycles 1-9 should skip
+        for i in range(9):
+            result = self.detector.rest_reconcile()
+            assert result == 0
+        # Cycle 10 should run (but no fills)
+        self.engine.client.get_orders.return_value = []
+        result = self.detector.rest_reconcile()
+        assert result == 0
+        assert self.engine.client.get_orders.called
+
+    def test_reconcile_detects_missing_fill(self):
+        """REST reconciliation should detect fills missed by WS."""
+        self.detector._rest_reconcile_interval = 1  # Run every cycle for testing
+        self.engine.active_orders["order-1"] = {
+            "window_id": "BTC-w1", "side": "BUY", "price": 0.47,
+            "size": 31.2, "token_id": "token-abc",
+        }
+        self.engine._is_up_token_cache["token-abc"] = True
+
+        # REST says order-1 is NOT in open orders (it was filled)
+        self.engine.client.get_orders.return_value = []
+
+        result = self.detector.rest_reconcile()
+        assert result == 1
+        assert "order-1" not in self.engine.active_orders
+        assert "BTC-w1" in self.engine.filled_windows
+
+    def test_reconcile_skips_ws_cancelled_orders(self):
+        """REST reconciliation should skip orders already cancelled via WS."""
+        self.detector._rest_reconcile_interval = 1
+        self.engine.active_orders["order-1"] = {
+            "window_id": "BTC-w1", "side": "BUY", "price": 0.47,
+            "size": 31.2, "token_id": "token-abc",
+        }
+        # Mark as cancelled via WS
+        self.detector._ws_cancelled_orders["order-1"] = {
+            "size_matched": 0, "ts": time.time(),
+        }
+
+        self.engine.client.get_orders.return_value = []
+
+        result = self.detector.rest_reconcile()
+        assert result == 0  # Should skip — already handled by WS cancel
+
+    def test_reconcile_skips_already_processed(self):
+        """REST reconciliation should skip already-processed fills."""
+        self.detector._rest_reconcile_interval = 1
+        self.engine.active_orders["order-1"] = {
+            "window_id": "BTC-w1", "side": "BUY", "price": 0.47,
+            "size": 31.2, "token_id": "token-abc",
+        }
+        self.detector._processed_order_ids.add("order-1")
+
+        self.engine.client.get_orders.return_value = []
+
+        result = self.detector.rest_reconcile()
+        assert result == 0
+
+    def test_reconcile_skips_still_open_orders(self):
+        """REST reconciliation should skip orders still open on exchange."""
+        self.detector._rest_reconcile_interval = 1
+        self.engine.active_orders["order-1"] = {
+            "window_id": "BTC-w1", "side": "BUY", "price": 0.47,
+            "size": 31.2, "token_id": "token-abc",
+        }
+
+        # REST says order-1 IS still open
+        self.engine.client.get_orders.return_value = [{"id": "order-1"}]
+
+        result = self.detector.rest_reconcile()
+        assert result == 0
+        assert "order-1" in self.engine.active_orders  # Still active
+
+    def test_reconcile_recovers_recently_cancelled(self):
+        """REST reconciliation should check _recently_cancelled buffer too."""
+        self.detector._rest_reconcile_interval = 1
+        self.engine._recently_cancelled["order-rc"] = {
+            "window_id": "BTC-w2", "side": "BUY", "price": 0.48,
+            "size": 20.0, "token_id": "token-def",
+            "cancelled_at": time.time(),
+        }
+        self.engine._is_up_token_cache["token-def"] = True
+
+        self.engine.client.get_orders.return_value = []
+
+        result = self.detector.rest_reconcile()
+        assert result == 1
+        assert "order-rc" not in self.engine._recently_cancelled
+        assert "BTC-w2" in self.engine.filled_windows
+
+    def test_reconcile_skips_dry_run(self):
+        """REST reconciliation should skip in dry_run mode."""
+        self.detector._rest_reconcile_interval = 1
+        self.engine.config.dry_run = True
+        result = self.detector.rest_reconcile()
+        assert result == 0
+
+    def test_reconcile_handles_api_error(self):
+        """REST reconciliation should handle API errors gracefully."""
+        self.detector._rest_reconcile_interval = 1
+        self.engine.client.get_orders.side_effect = Exception("API timeout")
+        result = self.detector.rest_reconcile()
+        assert result == 0  # Should not crash
 
 
 if __name__ == "__main__":
