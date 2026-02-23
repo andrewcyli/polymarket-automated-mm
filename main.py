@@ -34,6 +34,7 @@ from polymaker_client import cc
 try:
     from ws_manager import WebSocketManager, EventType, Channel
     from ws_price_feed import WSPriceFeed, WSOrderBookReader
+    from ws_fill_detector import WSFillDetector
     HAS_WS_MANAGER = True
 except ImportError:
     HAS_WS_MANAGER = False
@@ -347,6 +348,7 @@ class PolyMakerBot(PolymarketBot):
 
         # ── WebSocket Manager (Phase 1 async foundation) ──
         self.ws_manager = None
+        self.ws_fill_detector = None
         self._ws_enabled = os.getenv("WS_ENABLED", "true").lower() == "true"
         if HAS_WS_MANAGER and self._ws_enabled:
             try:
@@ -385,9 +387,16 @@ class PolyMakerBot(PolymarketBot):
                         derived.api_key, derived.api_secret, derived.api_passphrase
                     )
                 self.logger.info("  WebSocket manager initialized (market+user+rtds)")
+                # Phase 2: WS-based fill detection
+                self.ws_fill_detector = WSFillDetector(
+                    ws_manager=self.ws_manager,
+                    engine=self.engine,
+                    logger=self.logger,
+                )
             except Exception as e:
                 self.logger.warning(f"  WebSocket manager init failed: {e}. Using REST-only mode.")
                 self.ws_manager = None
+                self.ws_fill_detector = None
         elif not HAS_WS_MANAGER:
             self.logger.info("  WebSocket manager: module not available, using REST-only mode")
         else:
@@ -425,6 +434,19 @@ class PolyMakerBot(PolymarketBot):
         self._print_summary("FINAL")
         self._print_claim_summary()
         self._print_v15_1_summary()
+
+        # Stop WS fill detector
+        if hasattr(self, 'ws_fill_detector') and self.ws_fill_detector:
+            try:
+                self.ws_fill_detector.stop()
+                stats = self.ws_fill_detector.get_stats()
+                self.logger.info(
+                    f"WS fill detector stopped. "
+                    f"WS fills: {stats['ws_fills_session']}, "
+                    f"REST fallbacks: {stats['rest_fallback_count']}"
+                )
+            except Exception:
+                pass
 
         # Stop WebSocket manager
         if self.ws_manager:
@@ -612,9 +634,15 @@ class PolyMakerBot(PolymarketBot):
                 time.sleep(2)
                 ws_status = self.ws_manager.get_connection_summary()
                 self.logger.info(f"  WebSocket status: {ws_status}")
+                # Start WS fill detector (Phase 2)
+                if hasattr(self, 'ws_fill_detector') and self.ws_fill_detector:
+                    self.ws_fill_detector.start()
+                    self.logger.info("  WS fill detector started — real-time fill detection active")
             else:
                 self.logger.warning("  WebSocket manager failed to start. Using REST-only mode.")
                 self.ws_manager = None
+                if hasattr(self, 'ws_fill_detector'):
+                    self.ws_fill_detector = None
 
         # ── Live Wallet Check at Startup ─────────────────────────────────
         # CC sets kellyBankroll as the session budget ceiling.
@@ -763,6 +791,12 @@ class PolyMakerBot(PolymarketBot):
                 ws_str = ""
                 if self.ws_manager and cycle % 10 == 1:
                     ws_str = " | WS:{}".format(self.ws_manager.get_connection_summary())
+                    if hasattr(self, 'ws_fill_detector') and self.ws_fill_detector:
+                        fd_stats = self.ws_fill_detector.get_stats()
+                        fill_mode = "WS" if not fd_stats["fallback_mode"] else "REST"
+                        ws_str += " | Fills:{}(ws:{},rest:{})".format(
+                            fill_mode, fd_stats["ws_fills_session"],
+                            fd_stats["rest_fallback_count"])
 
                 self.logger.info(
                     "\n{}\n  C{} | {} | Ord:{} | Exp:${:.0f} | Avail:${:.0f} | MaxExp:${:.0f}"
@@ -816,10 +850,27 @@ class PolyMakerBot(PolymarketBot):
                 # from active_orders. If a filled order is deleted first, check_fills()
                 # will never detect it, causing capital_in_positions to stay at 0
                 # and triggering false loss-stop warnings.
+                #
+                # Phase 2: WS-first fill detection with REST fallback.
+                # WSFillDetector processes real-time fill events from the user channel.
+                # If WS is unhealthy, we fall back to the original REST polling.
                 if not self.config.dry_run:
-                    live_fills = self.engine.check_fills()
+                    live_fills = 0
+                    fill_source = "REST"
+
+                    # Try WS fill detection first
+                    if hasattr(self, 'ws_fill_detector') and self.ws_fill_detector and not self.ws_fill_detector.should_fallback_to_rest():
+                        live_fills = self.ws_fill_detector.check_fills_ws()
+                        fill_source = "WS"
+                    else:
+                        # Fallback to REST polling
+                        live_fills = self.engine.check_fills()
+                        fill_source = "REST"
+                        if hasattr(self, 'ws_fill_detector') and self.ws_fill_detector:
+                            self.ws_fill_detector.record_rest_fallback()
+
                     if live_fills:
-                        self.logger.info("  {} orders filled".format(live_fills))
+                        self.logger.info("  {} orders filled [{}]".format(live_fills, fill_source))
                         for wid in self.engine.window_fill_sides:
                             self.churn_manager.force_allow(wid)
                         imm_completed = self._process_immediate_pair_completions()
