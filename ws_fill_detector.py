@@ -145,13 +145,23 @@ class WSFillDetector:
             if order_id in self._processed_order_ids:
                 return
 
-            # Check if this order is one of ours (in active_orders)
-            if order_id not in self.engine.active_orders:
+            # Check if this order is one of ours (in active_orders or recently cancelled)
+            is_active = order_id in self.engine.active_orders
+            is_recently_cancelled = (
+                not is_active and order_id in self.engine._recently_cancelled
+            )
+            if not is_active and not is_recently_cancelled:
                 # Not our order — could be a taker order or already processed
                 self.logger.debug(
                     f"WSFillDetector: ORDER_FILL for unknown order {order_id[:12]}... — skipping"
                 )
                 return
+
+            if is_recently_cancelled:
+                self.logger.info(
+                    f"WSFillDetector: ORDER_FILL for recently-cancelled order "
+                    f"{order_id[:12]}... — recovering fill"
+                )
 
             # Queue the fill for processing
             self._fill_queue.append({
@@ -162,6 +172,7 @@ class WSFillDetector:
                 "asset_id": fill_data.get("asset_id", ""),
                 "status": fill_data.get("status", ""),
                 "ts": time.time(),
+                "recovered": is_recently_cancelled,
             })
 
     def _on_user_trade(self, event_type, trade_data: dict):
@@ -192,9 +203,19 @@ class WSFillDetector:
             if taker_order_id in self._processed_order_ids:
                 return
 
-            # Check if the taker order is one of ours
-            if taker_order_id not in self.engine.active_orders:
+            # Check if the taker order is one of ours (active or recently cancelled)
+            is_active = taker_order_id in self.engine.active_orders
+            is_recently_cancelled = (
+                not is_active and taker_order_id in self.engine._recently_cancelled
+            )
+            if not is_active and not is_recently_cancelled:
                 return
+
+            if is_recently_cancelled:
+                self.logger.info(
+                    f"WSFillDetector: USER_TRADE for recently-cancelled order "
+                    f"{taker_order_id[:12]}... — recovering fill"
+                )
 
             # Queue the fill
             self._fill_queue.append({
@@ -207,6 +228,7 @@ class WSFillDetector:
                 "market": trade_data.get("market", ""),
                 "status": trade_data.get("status", ""),
                 "ts": time.time(),
+                "recovered": is_recently_cancelled,
             })
 
     def _on_order_update(self, event_type, update_data: dict):
@@ -259,18 +281,29 @@ class WSFillDetector:
 
             # Look up the order in the engine's active_orders
             info = self.engine.active_orders.get(order_id)
+            recovered = False
             if not info:
-                # Order might have been cancelled or already processed by REST fallback
-                self.logger.debug(
-                    f"WSFillDetector: Order {order_id[:12]}... not in active_orders — "
-                    f"may have been processed by REST fallback"
-                )
-                continue
+                # Check the recently-cancelled buffer — the order may have
+                # filled on Polymarket before our cancel took effect.
+                info = self.engine._recently_cancelled.pop(order_id, None)
+                if info:
+                    recovered = True
+                    self.logger.info(
+                        f"  FILL [WS-RECOVERED] | Order {order_id[:12]}... "
+                        f"filled after cancel — recovering from buffer"
+                    )
+                else:
+                    # Truly unknown — already processed by REST or not ours
+                    self.logger.debug(
+                        f"WSFillDetector: Order {order_id[:12]}... not in active_orders — "
+                        f"may have been processed by REST fallback"
+                    )
+                    continue
 
             # Process the fill using the same logic as check_fills()
             wid = info.get("window_id", "")
 
-            # Remove from active_orders
+            # Remove from active_orders (no-op for recovered fills)
             self.engine.active_orders.pop(order_id, None)
 
             # Remove from orders_by_window
@@ -345,9 +378,10 @@ class WSFillDetector:
             self._last_ws_fill_time = time.time()
 
             latency_ms = (time.time() - fill.get("ts", time.time())) * 1000
+            tag = "WS-RECOVERED" if recovered else "WS"
             self.logger.info(
-                "  FILL [WS] | {} {} {:.1f} @ ${:.2f} | {} | {:.0f}ms".format(
-                    fill_side, fill_token[:12] + "...",
+                "  FILL [{}] | {} {} {:.1f} @ ${:.2f} | {} | {:.0f}ms".format(
+                    tag, fill_side, fill_token[:12] + "...",
                     fill_size, fill_price, wid, latency_ms
                 )
             )

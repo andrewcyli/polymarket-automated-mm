@@ -837,6 +837,10 @@ class PolyMakerBot(PolymarketBot):
                     self.vol_tracker.register_token(market["token_up"], market["asset"])
                     self.vol_tracker.register_token(market["token_down"], market["asset"])
                     self.engine.register_window_metadata(market)
+                    # Phase 3: Populate _is_up_token_cache BEFORE check_fills_ws
+                    # so that recovered fills can correctly classify UP vs DOWN.
+                    self.engine._is_up_token_cache[market["token_up"]] = True
+                    self.engine._is_up_token_cache[market["token_down"]] = False
                     # Collect token IDs for batch WS subscription
                     if self.ws_manager:
                         ws_token_ids.append(market["token_up"])
@@ -906,6 +910,7 @@ class PolyMakerBot(PolymarketBot):
                             self.balance_checker._cache_time = 0
                 self.engine.cleanup_expired_windows(markets, self.churn_manager)
                 self.engine.prune_stale_orders()
+                self.engine.purge_recently_cancelled()
                 if not self.config.dry_run:
                     self.engine.reconcile_capital_from_wallet()
                     self._schedule_live_claims()
@@ -920,8 +925,6 @@ class PolyMakerBot(PolymarketBot):
                         self.logger.info("  Pre-exit: {} sells placed".format(exits))
 
                 for market in markets:
-                    self.engine._is_up_token_cache[market["token_up"]] = True
-                    self.engine._is_up_token_cache[market["token_down"]] = False
                     if self.sim_engine:
                         price = self.price_feed.get_current_price(market["asset"])
                         if price:

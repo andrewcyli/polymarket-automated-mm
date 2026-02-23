@@ -38,6 +38,7 @@ class MockEngine:
         self.paired_windows = set()
         self._pending_hedges = []
         self._is_up_token_cache = {}
+        self._recently_cancelled = {}
         self.token_holdings = {}
         self.capital_in_positions = 0
         self.session_total_spent = 0
@@ -636,7 +637,10 @@ class TestEdgeCases:
         assert len(self.detector._processed_order_ids) <= 10
 
     def test_order_removed_between_queue_and_process(self):
-        """Order removed from active_orders between queue and process should be skipped."""
+        """Order removed from active_orders between queue and process.
+        If it's in _recently_cancelled, the fill should be recovered.
+        If not, it should be skipped."""
+        # Case 1: Order removed but NOT in _recently_cancelled → skip
         self.engine.active_orders["order-1"] = {
             "window_id": "BTC-w1", "side": "BUY", "price": 0.47,
             "size": 31.2, "token_id": "token-abc",
@@ -645,12 +649,32 @@ class TestEdgeCases:
             "order_id": "order-1", "price": 0.47, "size": 31.2,
             "asset_id": "token-abc", "status": "MATCHED",
         })
-
-        # Remove order before processing (simulates REST fallback or cancellation)
+        # Remove order before processing (simulates REST fallback already processed it)
         del self.engine.active_orders["order-1"]
-
         fills = self.detector.check_fills_ws()
-        assert fills == 0  # Should skip since order no longer in active_orders
+        assert fills == 0  # Should skip — not in active_orders or _recently_cancelled
+
+    def test_order_recovered_from_recently_cancelled(self):
+        """Order cancelled but filled on exchange should be recovered."""
+        self.engine.active_orders["order-2"] = {
+            "window_id": "BTC-w2", "side": "BUY", "price": 0.48,
+            "size": 20.0, "token_id": "token-def",
+        }
+        self.engine._is_up_token_cache["token-def"] = True
+        self.ws.event_bus.emit(EventType.ORDER_FILL, {
+            "order_id": "order-2", "price": 0.48, "size": 20.0,
+            "asset_id": "token-def", "status": "MATCHED",
+        })
+        # Simulate cancel: move from active_orders to _recently_cancelled
+        import time as _time
+        info = self.engine.active_orders.pop("order-2")
+        self.engine._recently_cancelled["order-2"] = {**info, "cancelled_at": _time.time()}
+        fills = self.detector.check_fills_ws()
+        assert fills == 1  # Should recover from _recently_cancelled
+        assert "BTC-w2" in self.engine.filled_windows
+        assert self.engine.window_fill_cost.get("BTC-w2", 0) > 0
+        # Verify it was removed from _recently_cancelled after processing
+        assert "order-2" not in self.engine._recently_cancelled
 
     def test_multiple_fills_same_cycle(self):
         """Multiple fills in the same cycle should all be processed."""

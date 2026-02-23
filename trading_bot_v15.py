@@ -2206,6 +2206,14 @@ class TradingEngine:
         # This survives reconcile_capital_from_wallet() which resets window_fill_cost.
         self.filled_windows = set()  # {window_id, ...}
         self.window_entry_count = {}  # {window_id: int} — safety counter
+        # Phase 3: Recently-cancelled orders buffer.
+        # When cancel_window_orders() removes an order from active_orders,
+        # the cancel on Polymarket is async. If the order filled before the
+        # cancel took effect, the WS fill event arrives for an order_id no
+        # longer in active_orders. This buffer preserves the order metadata
+        # so the fill can still be processed correctly.
+        self._recently_cancelled = {}  # {order_id: {**order_info, "cancelled_at": float}}
+        self._recently_cancelled_ttl = 120  # seconds to keep entries
 
         if not config.dry_run and HAS_CLOB:
             try:
@@ -2258,6 +2266,8 @@ class TradingEngine:
             info = self.active_orders.get(oid)
             if info:
                 wid = info.get("window_id", "")
+                self._recently_cancelled[oid] = {
+                    **info, "cancelled_at": time.time()}
                 del self.active_orders[oid]
                 if wid in self.orders_by_window:
                     self.orders_by_window[wid] = [
@@ -2275,6 +2285,8 @@ class TradingEngine:
             oids = self.orders_by_window.pop(wid, [])
             for oid in oids:
                 if oid in self.active_orders:
+                    self._recently_cancelled[oid] = {
+                        **self.active_orders[oid], "cancelled_at": time.time()}
                     del self.active_orders[oid]
                     self.total_orders_cancelled += 1
                 if self.sim_engine and oid in self.sim_engine.pending_orders:
@@ -2625,11 +2637,18 @@ class TradingEngine:
             open_ids = set()
             if isinstance(open_orders, list):
                 open_ids = {o.get("id", o.get("orderID", "")) for o in open_orders}
-            for oid in list(self.active_orders.keys()):
+            # Check active orders + recently cancelled orders
+            all_tracked = list(self.active_orders.keys()) + list(self._recently_cancelled.keys())
+            for oid in all_tracked:
                 if oid.startswith("DRY-"):
                     continue
                 if oid not in open_ids:
                     info = self.active_orders.pop(oid, None)
+                    recovered = False
+                    if not info:
+                        info = self._recently_cancelled.pop(oid, None)
+                        if info:
+                            recovered = True
                     if info:
                         wid = info.get("window_id", "")
                         if wid in self.orders_by_window:
@@ -2677,8 +2696,9 @@ class TradingEngine:
                                     "time": time.time(),
                                 })
                         filled += 1
-                        self.logger.info("  FILL | {} {} {:.1f} @ ${:.2f} | {}".format(
-                            fill_side, fill_token[:12] + "...",
+                        tag = "REST-RECOVERED" if recovered else "REST"
+                        self.logger.info("  FILL [{}] | {} {} {:.1f} @ ${:.2f} | {}".format(
+                            tag, fill_side, fill_token[:12] + "...",
                             fill_size, fill_price, wid))
             if filled:
                 self._recalc_exposure()
@@ -2846,17 +2866,27 @@ class TradingEngine:
                 continue
             if self.config.dry_run:
                 if oid in self.active_orders:
+                    self._recently_cancelled[oid] = {
+                        **self.active_orders[oid], "cancelled_at": time.time()}
                     del self.active_orders[oid]
                     cancelled += 1
                 if self.sim_engine and oid in self.sim_engine.pending_orders:
                     del self.sim_engine.pending_orders[oid]
             else:
                 try:
+                    # Save to recently_cancelled BEFORE cancelling on exchange.
+                    # If the order filled before the cancel takes effect, the
+                    # WS fill event can still be processed using this metadata.
+                    if oid in self.active_orders:
+                        self._recently_cancelled[oid] = {
+                            **self.active_orders[oid], "cancelled_at": time.time()}
                     self.client.cancel(oid)
                     if oid in self.active_orders:
                         del self.active_orders[oid]
                     cancelled += 1
                 except Exception:
+                    # Cancel failed — order may still be live; remove from buffer
+                    self._recently_cancelled.pop(oid, None)
                     remaining.append(oid)
         self.orders_by_window[window_id] = remaining
         self.total_orders_cancelled += cancelled
@@ -2897,6 +2927,14 @@ class TradingEngine:
         }
         attr = counter_map.get(strategy, "mm_trades")
         setattr(self, attr, getattr(self, attr) + 1)
+
+    def purge_recently_cancelled(self):
+        """Remove entries older than TTL from the recently-cancelled buffer."""
+        now = time.time()
+        expired = [oid for oid, info in self._recently_cancelled.items()
+                   if now - info.get("cancelled_at", 0) > self._recently_cancelled_ttl]
+        for oid in expired:
+            del self._recently_cancelled[oid]
 
     def _recalc_exposure(self):
         self.window_exposure = {}
@@ -4203,6 +4241,7 @@ class PolymarketBot:
                 self._resolve_expired_windows(markets)
                 self.engine.cleanup_expired_windows(markets, self.churn_manager)
                 self.engine.prune_stale_orders()
+                self.engine.purge_recently_cancelled()
 
                 if not self.config.dry_run:
                     self.engine.reconcile_capital_from_wallet()
