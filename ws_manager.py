@@ -413,18 +413,30 @@ class WSConnection:
         while self._running:
             try:
                 logger.info(f"WS [{self.channel.value}] Connecting to {self.url}...")
-                extra_headers = {}
+                headers = {}
                 if self.auth_headers:
-                    extra_headers.update(self.auth_headers)
+                    headers.update(self.auth_headers)
+
+                # websockets v14+ renamed extra_headers → additional_headers
+                connect_kwargs = {
+                    "ping_interval": HEARTBEAT_INTERVAL,
+                    "ping_timeout": HEARTBEAT_TIMEOUT,
+                    "close_timeout": 5,
+                    "open_timeout": CONNECTION_TIMEOUT,
+                    "max_size": 2**20,  # 1MB max message size
+                }
+                if headers:
+                    # Detect which parameter name the installed version supports
+                    import inspect
+                    sig = inspect.signature(websockets.connect)
+                    if "additional_headers" in sig.parameters:
+                        connect_kwargs["additional_headers"] = headers
+                    else:
+                        connect_kwargs["extra_headers"] = headers
 
                 async with websockets.connect(
                     self.url,
-                    extra_headers=extra_headers,
-                    ping_interval=HEARTBEAT_INTERVAL,
-                    ping_timeout=HEARTBEAT_TIMEOUT,
-                    close_timeout=5,
-                    open_timeout=CONNECTION_TIMEOUT,
-                    max_size=2**20,  # 1MB max message size
+                    **connect_kwargs,
                 ) as ws:
                     self._ws = ws
                     self._reconnect_delay = INITIAL_RECONNECT_DELAY
