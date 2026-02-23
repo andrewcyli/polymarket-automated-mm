@@ -584,20 +584,21 @@ class PolyMakerBot(PolymarketBot):
         # If CC set sessionBudget, max_total_exposure is already set by apply_cc_config.
         # If CC set budgetPerMarket, max_position_per_market is already set.
         # Only apply v15 defaults if CC didn't set them.
+        # V15.1-18: max_total_exposure = bankroll (the user sets bankroll to what they
+        # want to deploy). No more 80% default — bankroll IS the deployment cap.
         if not self._cc_config or not self._cc_config.get("sessionBudget"):
-            self.config.max_total_exposure = self.config.kelly_bankroll * 0.80
+            self.config.max_total_exposure = self.config.kelly_bankroll
         if not self._cc_config or not self._cc_config.get("budgetPerMarket"):
             self.config.max_position_per_market = min(
                 self.config.max_position_per_market,
                 self.config.max_total_exposure * 0.45)
-        self.logger.info("  Exposure limits: max_total=${:.0f} | max_per_market=${:.0f} | order_size=${:.0f}/side | bankroll=${:.0f}".format(
-            self.config.max_total_exposure, self.config.max_position_per_market,
-            self.config.mm_order_size, self.config.kelly_bankroll))
-        self.logger.info("  Risk controls: max_loss={:.0%} (${:.0f}) | cooldown={:.0f}s | reserve={:.0%}".format(
+        self.logger.info("  Bankroll: ${:.0f} | max_total_exposure=${:.0f} | per_market=${:.0f} | order_size=${:.0f}/side".format(
+            self.config.kelly_bankroll, self.config.max_total_exposure,
+            self.config.max_position_per_market, self.config.mm_order_size))
+        self.logger.info("  Risk controls: max_loss={:.0%} (${:.0f}) | cooldown={:.0f}s".format(
             self.config.hard_loss_stop_pct,
             self.config.hard_loss_stop_pct * self.config.kelly_bankroll,
-            self.config.hard_loss_cooloff,
-            self.config.deploy_reserve_pct))
+            self.config.hard_loss_cooloff))
 
         self.running = True
         cycle = 0

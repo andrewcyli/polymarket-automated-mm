@@ -28,6 +28,15 @@ V15.1 Changes from V15:
            max_order_horizon (default 2700s = 45min). Prevents burning capital
            and API calls on windows 90+ minutes away.
 
+  V15.1-18. BANKROLL MANAGEMENT REDESIGN:
+            get_available_capital() now returns bankroll - total_capital_used
+            (no deploy_reserve_pct deduction). Bankroll = what user wants to
+            deploy. max_total_exposure defaults to bankroll (not 80%).
+            After merge/claim reduces capital_in_positions, available capital
+            increases, allowing new trades. Example: $100 bankroll, 3x$30
+            trades = $90 used, $10 available. After merge returns $40,
+            capital_in_positions drops by $30, available = $40 for next trade.
+
   V15.1-17. FIX MERGE + REDEEM CASHFLOW:
             MERGE: _find_mergeable now builds combined lookup from _market_cache
             + expired_windows_pending_claim + window_metadata + window_fill_tokens.
@@ -2306,21 +2315,25 @@ class TradingEngine:
         self._recalc_exposure()
 
     def get_available_capital(self):
+        """V15.1-18: Bankroll = total capital the bot can invest this session.
+        available = bankroll - capital_deployed (open orders) - capital_in_positions (filled, held)
+        After merge/claim, capital_in_positions decreases, freeing up available capital.
+        Also capped by actual wallet balance if available.
+        """
         bankroll = self.config.kelly_bankroll
-        deployable = bankroll * (1.0 - self.config.deploy_reserve_pct)
+        available = max(0, bankroll - self.total_capital_used)
         if self.balance_checker and self.config.check_wallet_balance:
             wallet_bal = self.balance_checker.get_balance()
             if wallet_bal is not None:
-                return min(wallet_bal, max(0, deployable - self.total_capital_used))
-        return max(0, deployable - self.total_capital_used)
+                return min(wallet_bal, available)
+        return available
 
     def get_strategy_budget(self, strategy):
         if not self.config.strategy_budget_enabled:
             return self.get_available_capital()
         bankroll = self.config.kelly_bankroll
-        deployable = bankroll * (1.0 - self.config.deploy_reserve_pct)
         pct = self.config.strategy_budget_pct.get(strategy, 0.10)
-        return deployable * pct
+        return bankroll * pct
 
     def get_strategy_available(self, strategy):
         if not self.config.strategy_budget_enabled:
