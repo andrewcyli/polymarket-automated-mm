@@ -174,7 +174,7 @@ class StateStore:
     # ── Market Channel Accessors ──
 
     def update_orderbook(self, token_id: str, book_data: dict):
-        """Store a full orderbook snapshot."""
+        """Store a full orderbook snapshot and derive best_bid_ask from it."""
         with self._lock:
             self._orderbooks[token_id] = {
                 **book_data,
@@ -182,6 +182,9 @@ class StateStore:
                 "snapshot_ts": time.time(),  # When the full snapshot was received
                 "update_count": 0,  # Number of incremental updates since snapshot
             }
+            # Also derive and store best_bid_ask from the book snapshot
+            # This ensures BBA is always available when a book exists
+            self._derive_bba_from_book(token_id)
 
     def apply_book_delta(self, token_id: str, side: str, price: str, size: str):
         """
@@ -222,14 +225,54 @@ class StateStore:
             entry[book_side] = new_levels
             entry["timestamp"] = time.time()
             entry["update_count"] = entry.get("update_count", 0) + 1
+            # Re-derive BBA after delta (book may have new best bid/ask)
+            self._derive_bba_from_book(token_id)
 
-    def get_orderbook(self, token_id: str, max_age: float = 30.0) -> Optional[dict]:
-        """Get cached orderbook if fresh enough."""
+    def get_orderbook(self, token_id: str, max_age: float = 120.0) -> Optional[dict]:
+        """Get cached orderbook if fresh enough.
+        
+        Default max_age is 120s because incremental price_change deltas
+        keep the book updated between full snapshots. The 'timestamp' field
+        is updated on every delta, so a book that receives frequent deltas
+        will always appear fresh.
+        """
         with self._lock:
             entry = self._orderbooks.get(token_id)
             if entry and time.time() - entry.get("timestamp", 0) < max_age:
                 return entry
             return None
+
+    def _derive_bba_from_book(self, token_id: str):
+        """Derive best_bid_ask from the stored orderbook. Must be called with lock held."""
+        entry = self._orderbooks.get(token_id)
+        if not entry:
+            return
+        bids = entry.get("bids", [])
+        asks = entry.get("asks", [])
+        if not bids or not asks:
+            return
+        try:
+            # Filter extreme prices (same logic as WSOrderBookReader._compute_spread)
+            real_bids = [b for b in bids if float(b.get("price", 0)) > 0.05]
+            real_asks = [a for a in asks if float(a.get("price", 0)) < 0.95]
+            if not real_bids:
+                real_bids = bids
+            if not real_asks:
+                real_asks = asks
+            if not real_bids or not real_asks:
+                return
+            best_bid = max(float(b.get("price", 0)) for b in real_bids)
+            best_ask = min(float(a.get("price", 0)) for a in real_asks)
+            if best_bid > 0 and best_ask > 0:
+                spread = round(best_ask - best_bid, 4)
+                self._best_bid_ask[token_id] = {
+                    "best_bid": str(best_bid),
+                    "best_ask": str(best_ask),
+                    "spread": str(spread),
+                    "ts": time.time(),
+                }
+        except (ValueError, TypeError):
+            pass
 
     def get_book_freshness(self, token_id: str) -> Optional[dict]:
         """Get book freshness info for diagnostics."""
@@ -268,10 +311,11 @@ class StateStore:
                 "ts": time.time(),
             }
 
-    def get_best_bid_ask(self, asset_id: str) -> Optional[dict]:
+    def get_best_bid_ask(self, asset_id: str, max_age: float = 60.0) -> Optional[dict]:
+        """Get best bid/ask if fresh enough. Default 60s since price_change events update this."""
         with self._lock:
             entry = self._best_bid_ask.get(asset_id)
-            if entry and time.time() - entry.get("ts", 0) < 30:
+            if entry and time.time() - entry.get("ts", 0) < max_age:
                 return entry
             return None
 
@@ -1163,6 +1207,10 @@ class WebSocketManager:
         # Track user channel subscribed condition IDs to avoid re-subscribing
         self._user_subscribed_cids: set = set()
 
+        # Track market channel subscribed token IDs to avoid re-subscribing
+        self._market_subscribed_tokens: set = set()
+        self._market_first_sub_done: bool = False
+
     def set_derived_creds(self, api_key: str, api_secret: str, api_passphrase: str):
         """
         Update with L2 derived API credentials (from ClobClient.create_or_derive_api_creds()).
@@ -1333,19 +1381,44 @@ class WebSocketManager:
         """
         Subscribe to market data for given token IDs. Thread-safe.
         
+        On first call: sends a full subscription with all token IDs.
+        On subsequent calls: only subscribes to NEW token IDs that haven't
+        been subscribed to yet (deduplication). This prevents the server
+        from resetting the subscription and losing book data.
+        
         Per docs: {"assets_ids": ["<token_id>"], "type": "market", "custom_feature_enabled": true}
         """
         if not token_ids:
             return
-        msg = {
-            "assets_ids": token_ids if isinstance(token_ids, list) else [token_ids],
-            "markets": [],
-            "type": "market",
-            "custom_feature_enabled": True,
-            "initial_dump": True,
-        }
-        with self._queue_lock:
-            self._sub_queue.append((Channel.MARKET, msg))
+        token_list = token_ids if isinstance(token_ids, list) else [token_ids]
+
+        if not self._market_first_sub_done:
+            # First subscription: send full list
+            msg = {
+                "assets_ids": token_list,
+                "markets": [],
+                "type": "market",
+                "custom_feature_enabled": True,
+                "initial_dump": True,
+            }
+            self._market_subscribed_tokens.update(token_list)
+            self._market_first_sub_done = True
+            with self._queue_lock:
+                self._sub_queue.append((Channel.MARKET, msg))
+        else:
+            # Subsequent calls: only subscribe to NEW token IDs
+            new_tokens = [t for t in token_list if t not in self._market_subscribed_tokens]
+            if not new_tokens:
+                return  # All tokens already subscribed — skip
+            self._market_subscribed_tokens.update(new_tokens)
+            logger.info(f"WS [market] Subscribing to {len(new_tokens)} new token IDs")
+            msg = {
+                "assets_ids": new_tokens,
+                "operation": "subscribe",
+                "custom_feature_enabled": True,
+            }
+            with self._queue_lock:
+                self._sub_queue.append((Channel.MARKET, msg))
 
     def subscribe_market_additional(self, token_ids: list):
         """

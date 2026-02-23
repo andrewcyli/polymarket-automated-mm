@@ -54,8 +54,22 @@ class TestStateStore:
         book = {"bids": [], "asks": []}
         self.store.update_orderbook("token_abc", book)
         with self.store._lock:
-            self.store._orderbooks["token_abc"]["timestamp"] = time.time() - 60
+            # Must be older than 120s (new default max_age) to be stale
+            self.store._orderbooks["token_abc"]["timestamp"] = time.time() - 130
         result = self.store.get_orderbook("token_abc")
+        assert result is None
+
+    def test_get_orderbook_custom_max_age(self):
+        """Test that custom max_age parameter works."""
+        book = {"bids": [], "asks": []}
+        self.store.update_orderbook("token_abc", book)
+        with self.store._lock:
+            self.store._orderbooks["token_abc"]["timestamp"] = time.time() - 60
+        # With default max_age=120, should still be fresh
+        result = self.store.get_orderbook("token_abc")
+        assert result is not None
+        # With custom max_age=30, should be stale
+        result = self.store.get_orderbook("token_abc", max_age=30.0)
         assert result is None
 
     def test_get_orderbook_missing(self):
@@ -91,8 +105,69 @@ class TestStateStore:
     def test_best_bid_ask_stale(self):
         self.store.update_best_bid_ask("asset_1", "0.50", "0.55", "0.05")
         with self.store._lock:
-            self.store._best_bid_ask["asset_1"]["ts"] = time.time() - 60
+            # Must be older than 60s (new default max_age) to be stale
+            self.store._best_bid_ask["asset_1"]["ts"] = time.time() - 70
         assert self.store.get_best_bid_ask("asset_1") is None
+
+    def test_best_bid_ask_custom_max_age(self):
+        """Test custom max_age parameter for BBA."""
+        self.store.update_best_bid_ask("asset_1", "0.50", "0.55", "0.05")
+        with self.store._lock:
+            self.store._best_bid_ask["asset_1"]["ts"] = time.time() - 40
+        # Default max_age=60 → still fresh
+        assert self.store.get_best_bid_ask("asset_1") is not None
+        # Custom max_age=30 → stale
+        assert self.store.get_best_bid_ask("asset_1", max_age=30.0) is None
+
+    # ── BBA Derivation from Book ──
+
+    def test_derive_bba_from_book_snapshot(self):
+        """update_orderbook should also populate best_bid_ask."""
+        book = {
+            "bids": [{"price": "0.45", "size": "100"}, {"price": "0.40", "size": "200"}],
+            "asks": [{"price": "0.55", "size": "100"}, {"price": "0.60", "size": "200"}],
+        }
+        self.store.update_orderbook("token_xyz", book)
+        bba = self.store.get_best_bid_ask("token_xyz")
+        assert bba is not None
+        assert float(bba["best_bid"]) == 0.45
+        assert float(bba["best_ask"]) == 0.55
+        assert float(bba["spread"]) == pytest.approx(0.10, abs=0.001)
+
+    def test_derive_bba_from_book_delta(self):
+        """apply_book_delta should update best_bid_ask."""
+        book = {
+            "bids": [{"price": "0.45", "size": "100"}],
+            "asks": [{"price": "0.55", "size": "100"}],
+        }
+        self.store.update_orderbook("token_xyz", book)
+        # Add a better bid
+        self.store.apply_book_delta("token_xyz", "BUY", "0.48", "50")
+        bba = self.store.get_best_bid_ask("token_xyz")
+        assert bba is not None
+        assert float(bba["best_bid"]) == 0.48
+        assert float(bba["best_ask"]) == 0.55
+
+    def test_derive_bba_empty_book_no_crash(self):
+        """Empty book should not crash BBA derivation."""
+        book = {"bids": [], "asks": []}
+        self.store.update_orderbook("token_empty", book)
+        bba = self.store.get_best_bid_ask("token_empty")
+        # No bids/asks → no BBA derived
+        assert bba is None
+
+    def test_derive_bba_filters_extreme_prices(self):
+        """BBA derivation should filter extreme prices (< 0.05 bids, > 0.95 asks)."""
+        book = {
+            "bids": [{"price": "0.01", "size": "1000"}, {"price": "0.45", "size": "100"}],
+            "asks": [{"price": "0.55", "size": "100"}, {"price": "0.99", "size": "1000"}],
+        }
+        self.store.update_orderbook("token_extreme", book)
+        bba = self.store.get_best_bid_ask("token_extreme")
+        assert bba is not None
+        # Should filter out 0.01 bid and 0.99 ask
+        assert float(bba["best_bid"]) == 0.45
+        assert float(bba["best_ask"]) == 0.55
 
     # ── Trades ──
 
@@ -823,7 +898,7 @@ class TestSubscriptionFormats:
         )
 
     def test_market_subscribe_format(self):
-        """Market subscribe: {assets_ids: [...], type: 'market', custom_feature_enabled: true}"""
+        """Market subscribe (first call): {assets_ids: [...], type: 'market', custom_feature_enabled: true, initial_dump: true}"""
         self.manager.subscribe_market(["token_1", "token_2"])
         with self.manager._queue_lock:
             assert len(self.manager._sub_queue) == 1
@@ -832,6 +907,7 @@ class TestSubscriptionFormats:
             assert msg["type"] == "market"
             assert msg["assets_ids"] == ["token_1", "token_2"]
             assert msg["custom_feature_enabled"] is True
+            assert msg["initial_dump"] is True
 
     def test_market_additional_subscribe_format(self):
         """Additional subscribe: {assets_ids: [...], operation: 'subscribe', custom_feature_enabled: true}"""
@@ -927,6 +1003,54 @@ class TestSubscriptionFormats:
             topics = [msg["subscriptions"][0]["topic"] for _, msg in self.manager._sub_queue]
             assert "crypto_prices" in topics
             assert "crypto_prices_chainlink" in topics
+
+    def test_market_subscribe_dedup_first_call(self):
+        """First call to subscribe_market sends full subscription with initial_dump."""
+        self.manager.subscribe_market(["token_1", "token_2"])
+        with self.manager._queue_lock:
+            assert len(self.manager._sub_queue) == 1
+            channel, msg = self.manager._sub_queue[0]
+            assert msg["type"] == "market"
+            assert msg["initial_dump"] is True
+            assert msg["assets_ids"] == ["token_1", "token_2"]
+        assert self.manager._market_first_sub_done is True
+        assert self.manager._market_subscribed_tokens == {"token_1", "token_2"}
+
+    def test_market_subscribe_dedup_subsequent_same_tokens(self):
+        """Subsequent call with same tokens should be a no-op (no new subscription)."""
+        self.manager.subscribe_market(["token_1", "token_2"])
+        with self.manager._queue_lock:
+            self.manager._sub_queue.clear()  # Clear first subscription
+        # Call again with same tokens
+        self.manager.subscribe_market(["token_1", "token_2"])
+        with self.manager._queue_lock:
+            assert len(self.manager._sub_queue) == 0  # No new subscription
+
+    def test_market_subscribe_dedup_new_tokens_only(self):
+        """Subsequent call with mix of old+new tokens should only subscribe new ones."""
+        self.manager.subscribe_market(["token_1", "token_2"])
+        with self.manager._queue_lock:
+            self.manager._sub_queue.clear()
+        # Call with 2 old + 1 new token
+        self.manager.subscribe_market(["token_1", "token_2", "token_3"])
+        with self.manager._queue_lock:
+            assert len(self.manager._sub_queue) == 1
+            channel, msg = self.manager._sub_queue[0]
+            assert msg["operation"] == "subscribe"  # Incremental, not full
+            assert msg["assets_ids"] == ["token_3"]
+            assert "type" not in msg  # No type field for incremental
+            assert "initial_dump" not in msg  # No initial_dump for incremental
+
+    def test_market_subscribe_dedup_all_new_tokens(self):
+        """Subsequent call with entirely new tokens should subscribe all of them."""
+        self.manager.subscribe_market(["token_1"])
+        with self.manager._queue_lock:
+            self.manager._sub_queue.clear()
+        self.manager.subscribe_market(["token_2", "token_3"])
+        with self.manager._queue_lock:
+            assert len(self.manager._sub_queue) == 1
+            channel, msg = self.manager._sub_queue[0]
+            assert set(msg["assets_ids"]) == {"token_2", "token_3"}
 
     def test_set_derived_creds(self):
         self.manager.set_derived_creds("derived_key", "derived_secret", "derived_pass")
