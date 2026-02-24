@@ -216,7 +216,8 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
 
     print(f"  Hedge: {'ON' if config.hedge_completion_enabled else 'OFF'} "
           f"(delay={config.hedge_completion_delay}s, maxCost=${config.hedge_max_combined_cost:.2f}, "
-          f"minProfit=${config.hedge_min_profit_per_share:.3f})    print(f"  Momentum Exit: {'ON' if config.momentum_exit_enabled else 'OFF'} "
+          f"minProfit=${config.hedge_min_profit_per_share:.3f})")
+    print(f"  Momentum Exit: {'ON' if config.momentum_exit_enabled else 'OFF'} "
           f"(threshold={config.momentum_exit_threshold:.1%}, "
           f"maxWait={config.momentum_exit_max_wait_secs:.0f}s)")
 
@@ -233,7 +234,8 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     if config.trading_blackout_windows:
         print(f"  Blackout windows: {config.trading_blackout_windows}")
 
-    # ── Auto-claim/redeem: reclaim USDC after market resolution ──────────    # After a 15-min market resolves, winning shares are worth $1 each.
+    # ── Auto-claim/redeem: reclaim USDC after market resolution ──────────
+    # After a 15-min market resolves, winning shares are worth $1 each.
     # Auto-claim redeems them back to USDC so capital returns to bankroll.
     # This is FREE (gasless) through Polymarket's relayer system.
     config.auto_claim_enabled = True
