@@ -327,6 +327,14 @@ class BotConfig:
     momentum_exit_min_hold_secs: float = 10.0  # Min hold time before checking
     momentum_exit_max_wait_secs: float = 120.0 # Max wait for hedge before checking momentum
 
+    # V15.1-19: Pre-entry filters for orphan reduction
+    momentum_gate_threshold: float = 0.003   # Skip MM if |momentum| > 0.3%
+    momentum_gate_lookback: int = 5          # Lookback minutes for momentum gate
+    min_book_depth: float = 5.0              # Min $ depth within 2c of target price
+    max_spread_asymmetry: float = 0.02       # Max spread difference between UP/DN
+    # V15.1-19: Session blackout windows (list of [start_hour_utc, end_hour_utc] pairs)
+    trading_blackout_windows: list = field(default_factory=list)
+
     rpc_gas_cache_ttl: float = 30.0
     rpc_min_call_interval: float = 1.5
 
@@ -2327,6 +2335,8 @@ class TradingEngine:
         # This survives reconcile_capital_from_wallet() which resets window_fill_cost.
         self.filled_windows = set()  # {window_id, ...}
         self.window_entry_count = {}  # {window_id: int} — safety counter
+        # V15.1-19: Closed windows — permanently block re-entry after momentum exit
+        self.closed_windows = set()  # {window_id, ...}
         # Phase 3: Recently-cancelled orders buffer.
         # When cancel_window_orders() removes an order from active_orders,
         # the cancel on Polymarket is async. If the order filled before the
@@ -2950,8 +2960,8 @@ class TradingEngine:
                     "Held {:.0f}s".format(
                         wid, filled_side, fill_size, fill_price, current_bid,
                         price_change, sell_profit, net_profit, fee_est, hold_secs))
-                # Cancel any remaining orders on this window first
-                self.cancel_window_orders(wid, strategy_filter="mm")
+                # Cancel ALL remaining orders on this window (no strategy filter)
+                self.cancel_window_orders(wid)
                 # Place sell order as taker
                 result = self.place_order(
                     fill_token, "SELL", current_bid, fill_size,
@@ -2962,8 +2972,9 @@ class TradingEngine:
                     self.window_fill_sides.pop(wid, None)
                     self.window_fill_cost.pop(wid, None)
                     self.window_fill_tokens.pop(wid, None)
-                    # V15.1-15: Release filled window guard after momentum exit
-                    self.filled_windows.discard(wid)
+                    # V15.1-19: Mark window as permanently closed after momentum exit
+                    # Keep in filled_windows AND add to closed_windows to block re-entry
+                    self.closed_windows.add(wid)
                     self.window_entry_count.pop(wid, None)
                     # Update capital tracking
                     cost = fill_price * fill_size
@@ -3122,6 +3133,7 @@ class TradingEngine:
             "unredeemed_value": self.unredeemed_position_value,
             "paired_windows": len(self.paired_windows),
             "filled_windows": len(self.filled_windows),
+            "closed_windows": len(self.closed_windows),
             "session_realized_returns": self.session_realized_returns,
             "session_realized_cost": self.session_realized_cost,
             "session_realized_pnl": self.session_realized_returns - self.session_realized_cost,
@@ -3404,6 +3416,12 @@ class MarketMakingStrategy:
         # V15.1-6: Skip windows too far out
         if time_remaining > self.config.max_order_horizon:
             return
+        # V15.1-19: Closed window guard — permanently blocked after momentum exit
+        if window_id in self.engine.closed_windows:
+            self.logger.debug(
+                "  CLOSED GUARD | {} | Window closed (momentum exit) — no re-entry".format(
+                    window_id))
+            return
         # V15.1-15: PERSISTENT filled window guard (replaces CC-OPT-C).
         # filled_windows survives reconcile_capital_from_wallet() which resets
         # window_fill_cost. This is the PRIMARY re-entry prevention mechanism.
@@ -3484,6 +3502,24 @@ class MarketMakingStrategy:
             return
         if not self.config.mm_enabled:
             return
+        # V15.1-19 Filter A: Momentum Gate — skip if short-term momentum too strong
+        if (self.config.momentum_gate_threshold > 0 and momentum is not None
+                and abs(momentum) > self.config.momentum_gate_threshold):
+            self.logger.info(
+                "  MOMENTUM GATE | {} | Mom: {:+.3f}% > {:.3f}% | Skipping MM".format(
+                    window_id, momentum * 100, self.config.momentum_gate_threshold * 100))
+            return
+        # V15.1-19 Filter C: Spread Symmetry — skip if UP/DN spreads diverge too much
+        if (self.config.max_spread_asymmetry > 0 and spread_down):
+            dn_spread = spread_down.get("spread", 0)
+            spread_delta = abs(spread - dn_spread)
+            if spread_delta > self.config.max_spread_asymmetry:
+                self.logger.info(
+                    "  SPREAD ASYM | {} | UP sprd: {:.3f} DN sprd: {:.3f} | "
+                    "Delta {:.3f} > max {:.3f} | Skipping".format(
+                        window_id, spread, dn_spread, spread_delta,
+                        self.config.max_spread_asymmetry))
+                return
         # V15.1-12: Relaxed directional filter — CL-DN/CL-UP now only block
         # at STRONG confidence (>80%). At 60-80% (CL- prefix), the skew already
         # adjusts prices to favor the predicted side, which is sufficient protection.
@@ -3582,6 +3618,30 @@ class MarketMakingStrategy:
                 "Profit: ${:.3f}/pair | Reward: {:.1%} | Vol: {}".format(
                     window_id, optimal_d, buy_up_price, buy_down_price,
                     final_pair_cost, final_pair_profit, reward_score, vol_level))
+
+        # V15.1-19 Filter B: Order Book Depth — check both sides have liquidity
+        if self.config.min_book_depth > 0:
+            up_book = self.book_reader.get_book(market["token_up"])
+            dn_book = self.book_reader.get_book(market["token_down"])
+            for side_name, book, target_price in [
+                    ("UP", up_book, buy_up_price), ("DN", dn_book, buy_down_price)]:
+                if not book:
+                    self.logger.info(
+                        "  DEPTH GATE | {} | {} book unavailable | Skipping".format(
+                            window_id, side_name))
+                    return
+                # Sum ask-side size within 2c of our buy price (sellers willing to sell to us)
+                asks = book.get("asks", [])
+                depth_usd = 0.0
+                for order in asks:
+                    op = float(order["price"])
+                    if op <= target_price + 0.02:
+                        depth_usd += float(order["size"]) * op
+                if depth_usd < self.config.min_book_depth:
+                    self.logger.info(
+                        "  DEPTH GATE | {} | {} depth ${:.2f} < min ${:.2f} | Skipping".format(
+                            window_id, side_name, depth_usd, self.config.min_book_depth))
+                    return
 
         # V15.1-2: Pre-check capital for FULL PAIR before placing either side
         total_pair_dollar_cost = (buy_up_price * up_size) + (buy_down_price * down_size)
@@ -3696,6 +3756,9 @@ class LateSniper:
         if not self.config.sniper_enabled:
             return
         window_id = market["window_id"]
+        # V15.1-19: Skip closed windows
+        if window_id in self.engine.closed_windows:
+            return
         # V15.1-15: Skip windows with existing fills
         if window_id in self.engine.filled_windows:
             return
@@ -3784,6 +3847,9 @@ class CombinedProbArb:
         if not self.config.arb_enabled:
             return
         window_id = market["window_id"]
+        # V15.1-19: Skip closed windows
+        if window_id in self.engine.closed_windows:
+            return
         # V15.1-15: Skip windows with existing fills
         if window_id in self.engine.filled_windows:
             return
@@ -3861,6 +3927,9 @@ class ContrarianFade:
         if not self.config.contrarian_enabled:
             return
         window_id = market["window_id"]
+        # V15.1-19: Skip closed windows
+        if window_id in self.engine.closed_windows:
+            return
         # V15.1-15: Skip windows with existing fills
         if window_id in self.engine.filled_windows:
             return
@@ -4238,10 +4307,19 @@ class PolymarketBot:
 
     # V15-6 + V15.1-6: Score/sort uses maker_edge for priority
     def _score_and_sort_markets(self, markets):
+        """V15.1-19: Enhanced scoring with fill-probability factors.
+
+        Score = edge * vol_penalty * fill_prob_bonus
+        fill_prob_bonus considers:
+        - Spread symmetry (UP vs DN spread similarity)
+        - Momentum (lower = better for pair fill)
+        - Time remaining (more time = more chance to fill both sides)
+        """
         if not markets:
             return markets
         for market in markets:
             token_up = market["token_up"]
+            token_dn = market.get("token_down", "")
             vol_level, vol_sum = self.vol_tracker.get_volatility_level(token_up)
             edge = market.get("maker_edge", market.get("edge", 0))
             vol_penalty = 1.0
@@ -4251,7 +4329,40 @@ class PolymarketBot:
                 vol_penalty = 0.5
             elif vol_level == "MEDIUM":
                 vol_penalty = 0.8
-            market["_sort_score"] = edge * vol_penalty
+
+            # Fill probability bonus (1.0 = neutral, >1 = better fill chance)
+            fill_prob = 1.0
+
+            # Factor 1: Spread symmetry — similar spreads = balanced book
+            spread_up = self.book_reader.get_spread(token_up)
+            spread_dn = self.book_reader.get_spread(token_dn) if token_dn else None
+            if spread_up and spread_dn:
+                sp_delta = abs(spread_up["spread"] - spread_dn["spread"])
+                if sp_delta < 0.005:
+                    fill_prob *= 1.15  # Very symmetric — bonus
+                elif sp_delta < 0.01:
+                    fill_prob *= 1.05
+                elif sp_delta > 0.03:
+                    fill_prob *= 0.85  # Asymmetric — penalty
+
+            # Factor 2: Momentum — low momentum = balanced fills
+            asset = market.get("asset", "")
+            mom = self.price_feed.get_momentum(asset, self.config.tf_lookback_minutes)
+            if mom is not None:
+                abs_mom = abs(mom)
+                if abs_mom < 0.001:
+                    fill_prob *= 1.10  # Very calm — bonus
+                elif abs_mom > 0.005:
+                    fill_prob *= 0.90  # Trending — penalty
+
+            # Factor 3: Time remaining — more time = more fill opportunity
+            time_left = market.get("time_left", 0)
+            if time_left > 600:
+                fill_prob *= 1.05  # >10 min left
+            elif time_left < 120:
+                fill_prob *= 0.90  # <2 min left — risky
+
+            market["_sort_score"] = edge * vol_penalty * fill_prob
         markets.sort(key=lambda m: m.get("_sort_score", 0), reverse=True)
         return markets
 
@@ -4468,10 +4579,28 @@ class PolymarketBot:
                         self._loss_stop_until = now + self.config.hard_loss_cooloff
                         trading_halted = True
 
+                # V15.1-19: Session blackout windows
+                if self.config.trading_blackout_windows and not trading_halted:
+                    import datetime
+                    utc_now = datetime.datetime.utcnow()
+                    current_hour_min = utc_now.hour + utc_now.minute / 60.0
+                    for bw in self.config.trading_blackout_windows:
+                        if len(bw) == 2:
+                            start_h, end_h = float(bw[0]), float(bw[1])
+                            if start_h <= current_hour_min < end_h:
+                                if cycle % 10 == 1:
+                                    self.logger.info(
+                                        "  SESSION BLACKOUT | {:.2f}-{:.2f} UTC | "
+                                        "Current: {:.2f} | MM paused".format(
+                                            start_h, end_h, current_hour_min))
+                                trading_halted = True
+                                break
+
                 # V15-2 + V15.1-6 + V15.1-10: Dual-path tradeable filter
                 # with condition_id deduplication
                 tradeable_markets = []
-                active_window_ids = set(self.engine.window_exposure.keys())
+                # V15.1-19: Include filled_windows in active count (positions held, not just orders)
+                active_window_ids = set(self.engine.window_exposure.keys()) | self.engine.filled_windows
                 # V15.1-10: Track condition_ids with active exposure
                 active_condition_ids = set()
                 for awid in active_window_ids:
@@ -4515,8 +4644,9 @@ class PolymarketBot:
                     try:
                         if trading_halted:
                             continue
-                        # V15.1-7: Dynamic max_concurrent_windows enforcement
-                        current_active = set(self.engine.window_exposure.keys())
+                        # V15.1-7/19: Dynamic max_concurrent_windows enforcement
+                        # Include filled_windows so held positions count toward the limit
+                        current_active = set(self.engine.window_exposure.keys()) | self.engine.filled_windows
                         wid = market["window_id"]
                         if (len(current_active) >= self.config.max_concurrent_windows
                                 and wid not in current_active):

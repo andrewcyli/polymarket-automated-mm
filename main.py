@@ -216,13 +216,24 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
 
     print(f"  Hedge: {'ON' if config.hedge_completion_enabled else 'OFF'} "
           f"(delay={config.hedge_completion_delay}s, maxCost=${config.hedge_max_combined_cost:.2f}, "
-          f"minProfit=${config.hedge_min_profit_per_share:.3f})")
-    print(f"  Momentum Exit: {'ON' if config.momentum_exit_enabled else 'OFF'} "
+          f"minProfit=${config.hedge_min_profit_per_share:.3f})    print(f"  Momentum Exit: {'ON' if config.momentum_exit_enabled else 'OFF'} "
           f"(threshold={config.momentum_exit_threshold:.1%}, "
           f"maxWait={config.momentum_exit_max_wait_secs:.0f}s)")
 
-    # ── Auto-claim/redeem: reclaim USDC after market resolution ──────
-    # After a 15-min market resolves, winning shares are worth $1 each.
+    # V15.1-19: Pre-entry filters for orphan reduction
+    config.momentum_gate_threshold = float(cc_config.get("momentumGate", 0.003))
+    config.min_book_depth = float(cc_config.get("minBookDepth", 5.0))
+    config.max_spread_asymmetry = float(cc_config.get("maxSpreadAsymmetry", 0.02))
+    # Session blackout windows: list of [start_hour_utc, end_hour_utc] pairs
+    blackout_raw = cc_config.get("tradingBlackoutWindows", [])
+    config.trading_blackout_windows = blackout_raw if isinstance(blackout_raw, list) else []
+
+    print(f"  Pre-entry filters: MomGate={config.momentum_gate_threshold:.3f} | "
+          f"MinDepth=${config.min_book_depth:.0f} | MaxSpreadAsym={config.max_spread_asymmetry:.3f}")
+    if config.trading_blackout_windows:
+        print(f"  Blackout windows: {config.trading_blackout_windows}")
+
+    # ── Auto-claim/redeem: reclaim USDC after market resolution ──────────    # After a 15-min market resolves, winning shares are worth $1 each.
     # Auto-claim redeems them back to USDC so capital returns to bankroll.
     # This is FREE (gasless) through Polymarket's relayer system.
     config.auto_claim_enabled = True
