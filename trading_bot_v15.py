@@ -270,6 +270,12 @@ class BotConfig:
     # V15.1-6: Don't place orders on windows too far out
     max_order_horizon: float = 2700.0  # 45 minutes
 
+    # V15.1-22: Max time sessions to consider per timeframe (closest N)
+    # e.g. 3 means only look at the 3 closest 5m sessions and 3 closest 15m sessions
+    max_order_sessions: int = 3
+    # V15.1-22: Enable dynamic re-prioritization (cancel+re-place when better markets appear)
+    dynamic_reprioritize: bool = True
+
     # Simulation
     sim_fill_rate: float = 0.25
     sim_slippage_max: float = 0.002
@@ -3101,8 +3107,35 @@ class TradingEngine:
                     "Held {:.0f}s".format(
                         wid, filled_side, fill_size, fill_price, current_bid,
                         price_change, sell_profit, net_profit, fee_est, hold_secs))
-                # Cancel ALL remaining orders on this window (no strategy filter)
-                self.cancel_window_orders(wid)
+                # V15.1-22: Cancel ALL remaining orders on this window.
+                # Collect opposite-side token IDs BEFORE cancelling so we can
+                # issue a batch cancel_market_orders as a safety net.
+                opposite_tokens = set()
+                for oid, oinfo in list(self.active_orders.items()):
+                    if oinfo.get("window_id") == wid:
+                        tid = oinfo.get("token_id", "")
+                        if tid and tid != fill_token:
+                            opposite_tokens.add(tid)
+                cancelled = self.cancel_window_orders(wid)
+                self.logger.info(
+                    "  MOM-EXIT CANCEL | {} | Cancelled {} orders | "
+                    "Opposite tokens: {}".format(
+                        wid, cancelled, list(opposite_tokens)))
+                # V15.1-22: Safety net — batch cancel on opposite-side token_ids.
+                # cancel_window_orders does individual cancel(oid) + batch cancel
+                # for the same window, but the opposite-side order may have been
+                # tracked under a slightly different state. Belt-and-suspenders:
+                if not self.config.dry_run and self.client and opposite_tokens:
+                    for tid in opposite_tokens:
+                        try:
+                            self.client.cancel_market_orders(asset_id=str(tid))
+                            self.logger.info(
+                                "  MOM-EXIT BATCH CANCEL | {} | token {}".format(
+                                    wid, tid[:16] + "..."))
+                        except Exception as e:
+                            self.logger.warning(
+                                "  MOM-EXIT BATCH CANCEL FAIL | {} | {}".format(
+                                    wid, str(e)[:100]))
                 # Place sell order as taker
                 result = self.place_order(
                     fill_token, "SELL", current_bid, fill_size,
@@ -3123,6 +3156,13 @@ class TradingEngine:
                     cost = fill_price * fill_size
                     self.capital_in_positions = max(0, self.capital_in_positions - cost)
                     self._update_total_capital()
+                else:
+                    # Sell failed — log but still mark window as closed to prevent
+                    # re-entry. The position remains but no new orders will be placed.
+                    self.logger.warning(
+                        "  MOM-EXIT SELL FAILED | {} | Sell order rejected, "
+                        "position still held".format(wid))
+                    self.closed_windows.add(wid)
             else:
                 self.logger.debug(
                     "  MOM CHECK | {} | {} @ ${:.2f} | bid ${:.2f} | {:+.1%} < {:.1%} | {:.0f}s".format(

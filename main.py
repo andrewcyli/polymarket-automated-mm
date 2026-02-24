@@ -124,6 +124,11 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     if max_concurrent and max_concurrent > 0:
         config.max_concurrent_windows = int(max_concurrent)
 
+    # V15.1-22: Max time sessions to consider per timeframe
+    max_sessions = cc_config.get("maxOrderSessions")
+    if max_sessions and max_sessions > 0:
+        config.max_order_sessions = int(max_sessions)
+
     max_loss_pct = cc_config.get("maxLossPct")
     if max_loss_pct is not None and max_loss_pct > 0:
         config.hard_loss_stop_pct = float(max_loss_pct)
@@ -729,6 +734,8 @@ class PolyMakerBot(PolymarketBot):
 
         self.running = True
         cycle = 0
+        # V15.1-22: Track which windows had priority last cycle for re-prioritization
+        self._prev_priority_wids = set()
 
         while self.running:
             cycle += 1
@@ -1036,88 +1043,152 @@ class PolyMakerBot(PolymarketBot):
                             self._loss_stop_until = now + self.config.hard_loss_cooloff
                             trading_halted = True
 
-                # V15-2 + V15.1-6 + V15.1-10: Dual-path tradeable filter
-                # with condition_id deduplication
-                tradeable_markets = []
-                active_window_ids = set(self.engine.window_exposure.keys())
-                # V15.1-15: Include filled windows in "active" set for filtering
-                # This prevents filled windows from passing concurrent/edge filters
+                # ═══════════════════════════════════════════════════════════
+                # V15.1-22: PRIORITIZED MARKET SELECTION
+                # 1. Filter to closest N sessions per timeframe
+                # 2. Remove filled/closed windows
+                # 3. Score and rank all candidates
+                # 4. Pick top max_concurrent_windows by score
+                # 5. Cancel orders on windows that lost priority
+                # 6. Execute strategies only on priority windows
+                # ═══════════════════════════════════════════════════════════
                 filled_wids = self.engine.filled_windows
-                # V15.1-10: Track condition_ids that already have exposure
-                # to prevent entering the same underlying market via
-                # different timeframes (e.g. 15m and 5m for same BTC 8:45)
+                closed_wids = self.engine.closed_windows
+
+                # Step 1: Group markets by timeframe and pick closest N sessions
+                tf_sessions = {}  # {timeframe: {end_time: [markets]}}
+                for market in markets:
+                    tf = market.get("timeframe", "")
+                    end_t = market.get("end_time", 0)
+                    if tf not in tf_sessions:
+                        tf_sessions[tf] = {}
+                    if end_t not in tf_sessions[tf]:
+                        tf_sessions[tf][end_t] = []
+                    tf_sessions[tf][end_t].append(market)
+
+                session_limited_markets = []
+                max_sessions = self.config.max_order_sessions
+                for tf, sessions in tf_sessions.items():
+                    sorted_times = sorted(sessions.keys())[:max_sessions]
+                    for t in sorted_times:
+                        session_limited_markets.extend(sessions[t])
+                    if len(sorted_times) < len(sessions):
+                        skipped = len(sessions) - len(sorted_times)
+                        self.logger.debug(
+                            "  SESSION LIMIT | {} | {} sessions -> {} (skipped {})".format(
+                                tf, len(sessions), len(sorted_times), skipped))
+
+                # Step 2: Basic eligibility filter
+                eligible_markets = []
                 active_condition_ids = set()
-                for awid in active_window_ids:
-                    cid = self.window_conditions.get(awid, "")
+                # Track condition_ids from FILLED windows (positions we hold)
+                for fwid in filled_wids:
+                    cid = self.window_conditions.get(fwid, "")
                     if cid:
                         active_condition_ids.add(cid)
-                for market in markets:
+                for cwid in closed_wids:
+                    cid = self.window_conditions.get(cwid, "")
+                    if cid:
+                        active_condition_ids.add(cid)
+
+                for market in session_limited_markets:
                     wid = market["window_id"]
-                    # V15.1-15: Skip windows that already have fills (persistent guard)
-                    if wid in filled_wids:
+                    # Skip filled/closed windows
+                    if wid in filled_wids or wid in closed_wids:
                         continue
+                    # Skip advance windows if disabled
+                    if market.get("is_advance", False) and not self.config.trade_advance_windows:
+                        continue
+                    # Edge filter
                     edge = market.get("edge", 0)
                     maker_edge = market.get("maker_edge", edge)
                     if (edge < self.config.min_pair_edge
                             and maker_edge < self.config.pair_min_profit):
-                        if wid not in active_window_ids:
-                            continue
-                    if market.get("is_advance", False) and not self.config.trade_advance_windows:
                         continue
+                    # Time horizon filter
                     if market.get("time_left", 0) > self.config.max_order_horizon:
-                        if market["window_id"] not in active_window_ids:
-                            continue
-                    if len(active_window_ids) >= self.config.max_concurrent_windows:
-                        if market["window_id"] not in active_window_ids:
-                            continue
-                    # V15.1-10: Skip markets whose condition_id already has
-                    # exposure from a different window (same underlying)
+                        continue
+                    # Condition_id dedup: skip if same underlying already has
+                    # a filled/closed position
                     mkt_cid = market.get("condition_id", "")
                     if mkt_cid and mkt_cid in active_condition_ids:
-                        if market["window_id"] not in active_window_ids:
-                            self.logger.debug(
-                                "  DEDUP SKIP | {} | condition {} already active via another window".format(
-                                    market["window_id"], mkt_cid[:16]))
-                            continue
-                    tradeable_markets.append(market)
+                        self.logger.debug(
+                            "  DEDUP SKIP | {} | condition {} already has position".format(
+                                wid, mkt_cid[:16]))
+                        continue
+                    eligible_markets.append(market)
 
-                tradeable_markets = self._score_and_sort_markets(tradeable_markets)
+                # Step 3: Score all eligible markets
+                eligible_markets = self._score_and_sort_markets(eligible_markets)
+
+                # Step 4: Pick top N markets (max_concurrent_windows)
+                # Dedup by condition_id within the priority list
+                max_concurrent = self.config.max_concurrent_windows
+                priority_markets = []
+                priority_cids = set()
+                for market in eligible_markets:
+                    if len(priority_markets) >= max_concurrent:
+                        break
+                    mkt_cid = market.get("condition_id", "")
+                    if mkt_cid and mkt_cid in priority_cids:
+                        self.logger.debug(
+                            "  DEDUP PRIORITY | {} | condition {} already in priority list".format(
+                                market["window_id"], mkt_cid[:16]))
+                        continue
+                    priority_markets.append(market)
+                    if mkt_cid:
+                        priority_cids.add(mkt_cid)
+
+                priority_wids = {m["window_id"] for m in priority_markets}
+
+                # Step 5: Cancel orders on windows that LOST priority
+                # Only if dynamic_reprioritize is enabled
+                if self.config.dynamic_reprioritize:
+                    current_order_wids = set(self.engine.window_exposure.keys())
+                    demoted_wids = current_order_wids - priority_wids - filled_wids - closed_wids
+                    for dwid in demoted_wids:
+                        # Don't cancel if the window has fills (it's being held)
+                        if dwid in self.engine.window_fill_sides:
+                            continue
+                        self.logger.info(
+                            "  REPRIORITIZE | {} | Lost priority, cancelling orders".format(dwid))
+                        self.engine.cancel_window_orders(dwid)
+                        # Clean up MM strategy tracking so it can re-place if promoted again
+                        self.mm_strategy.cleanup_window(dwid)
+
+                # Log priority changes
+                if priority_wids != self._prev_priority_wids and cycle > 1:
+                    new_wids = priority_wids - self._prev_priority_wids
+                    lost_wids = self._prev_priority_wids - priority_wids
+                    if new_wids or lost_wids:
+                        self.logger.info(
+                            "  PRIORITY CHANGE | +{} -{} | Active: {} | Top: {}".format(
+                                len(new_wids), len(lost_wids),
+                                ", ".join(sorted(priority_wids)),
+                                ", ".join(
+                                    "{} ({:.3f})".format(m["window_id"], m.get("_sort_score", 0))
+                                    for m in priority_markets[:4])))
+                self._prev_priority_wids = priority_wids
 
                 if cycle % self.config.edge_map_interval == 1:
-                    self._print_edge_map(markets, tradeable_markets)
+                    self._print_edge_map(markets, priority_markets)
 
-                for market in tradeable_markets:
+                # Step 6: Execute strategies ONLY on priority markets
+                for market in priority_markets:
                     try:
                         if trading_halted:
                             continue
                         wid = market["window_id"]
-                        # V15.1-15: Dynamic filled window guard within strategy loop
+                        # Dynamic filled window guard
                         if wid in self.engine.filled_windows:
                             continue
-                        # V15.1-7: Dynamic max_concurrent_windows enforcement
-                        # Re-check after each market because place_order() updates
-                        # window_exposure during the loop. Without this, cycle 1
-                        # lets all markets through the pre-filter (which checks
-                        # the STALE snapshot) and overshoots the limit.
+                        # Dynamic concurrent check (belt-and-suspenders)
                         current_active = set(self.engine.window_exposure.keys())
-                        if (len(current_active) >= self.config.max_concurrent_windows
+                        if (len(current_active) >= max_concurrent
                                 and wid not in current_active):
                             self.logger.debug(
                                 "  CONCURRENT SKIP | {} | {}/{} windows active".format(
-                                    wid, len(current_active),
-                                    self.config.max_concurrent_windows))
-                            continue
-                        # V15.1-10: Dynamic condition_id dedup within strategy loop
-                        current_cids = set()
-                        for awid in current_active:
-                            c = self.window_conditions.get(awid, "")
-                            if c:
-                                current_cids.add(c)
-                        mkt_cid = market.get("condition_id", "")
-                        if mkt_cid and mkt_cid in current_cids and wid not in current_active:
-                            self.logger.debug(
-                                "  DEDUP SKIP (loop) | {} | condition {} already active".format(
-                                    wid, mkt_cid[:16]))
+                                    wid, len(current_active), max_concurrent))
                             continue
                         if self.config.mm_enabled:
                             self.mm_strategy.execute(market)
