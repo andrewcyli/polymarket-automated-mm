@@ -116,11 +116,13 @@ except ImportError:
 def _encode_abi(contract, fn_name, args):
     """Encode ABI data for a contract function call.
     Compatible with both web3 v6 (encodeABI) and v7+ (encode_abi).
+    v6 uses encodeABI(fn_name=...), v7 renamed to encode_abi(abi_element_identifier=...).
+    We use positional args to avoid keyword mismatch.
     """
     if hasattr(contract, 'encodeABI'):
-        return contract.encodeABI(fn_name=fn_name, args=args)
+        return contract.encodeABI(fn_name, args=args)
     elif hasattr(contract, 'encode_abi'):
-        return contract.encode_abi(fn_name=fn_name, args=args)
+        return contract.encode_abi(fn_name, args=args)  # positional: abi_element_identifier
     else:
         # Fallback: try via functions object
         fn = getattr(contract.functions, fn_name)
