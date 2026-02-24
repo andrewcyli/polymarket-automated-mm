@@ -3620,6 +3620,8 @@ class MarketMakingStrategy:
                     final_pair_cost, final_pair_profit, reward_score, vol_level))
 
         # V15.1-19 Filter B: Order Book Depth — check both sides have liquidity
+        # We place MAKER (limit) orders, so we measure bid-side depth (activity near our price)
+        # plus ask-side depth within 5c of midpoint to gauge overall market activity.
         if self.config.min_book_depth > 0:
             up_book = self.book_reader.get_book(market["token_up"])
             dn_book = self.book_reader.get_book(market["token_down"])
@@ -3630,12 +3632,18 @@ class MarketMakingStrategy:
                         "  DEPTH GATE | {} | {} book unavailable | Skipping".format(
                             window_id, side_name))
                     return
-                # Sum ask-side size within 2c of our buy price (sellers willing to sell to us)
+                # Sum bid-side depth within 5c of our buy price (other buyers = market activity)
+                bids = book.get("bids", [])
                 asks = book.get("asks", [])
                 depth_usd = 0.0
+                for order in bids:
+                    op = float(order["price"])
+                    if abs(op - target_price) <= 0.05:
+                        depth_usd += float(order["size"]) * op
+                # Also count asks within 5c of midpoint (sellers = potential fills)
                 for order in asks:
                     op = float(order["price"])
-                    if op <= target_price + 0.02:
+                    if op <= target_price + 0.05:
                         depth_usd += float(order["size"]) * op
                 if depth_usd < self.config.min_book_depth:
                     self.logger.info(
