@@ -1518,6 +1518,12 @@ class AutoMerger:
                     merge_cost = min(old_fill, mergeable) if old_fill > 0 else mergeable
                     self.engine.session_realized_returns += mergeable
                     self.engine.session_realized_cost += merge_cost
+                    # V15.1-20: Release held_windows when capital is recovered.
+                    # If window_fill_cost is now 0, all capital from this window
+                    # has been returned via merge — safe to release the slot.
+                    remaining_fill = self.engine.window_fill_cost.get(wid, 0)
+                    if remaining_fill <= 0:
+                        self.engine.held_windows.discard(wid)
                 self.logger.info(
                     "  MERGED OK | {} | {:.1f} shares -> ~${:.2f} USDC returned".format(
                         wid, mergeable, mergeable))
@@ -2209,6 +2215,8 @@ class AutoClaimManager:
             fill_cost = info.get("fill_cost", 0)
             self.engine.session_realized_returns += total_size
             self.engine.session_realized_cost += fill_cost
+            # V15.1-20: Release held_windows — capital recovered via claim
+            self.engine.held_windows.discard(wid)
         self.logger.info("  CLAIMED | {} | {} | Est: ${:.2f}".format(wid, method, total_size))
 
     def _log_manual_claim_instructions(self, wid, info):
@@ -2337,6 +2345,10 @@ class TradingEngine:
         self.window_entry_count = {}  # {window_id: int} — safety counter
         # V15.1-19: Closed windows — permanently block re-entry after momentum exit
         self.closed_windows = set()  # {window_id, ...}
+        # V15.1-20: Held windows — windows with tokens still on-chain (not yet merged/claimed/sold).
+        # Unlike filled_windows (cleared on expiry), held_windows persists until capital is recovered.
+        # Used in concurrent window count to prevent unlimited window accumulation.
+        self.held_windows = set()  # {window_id, ...}
         # Phase 3: Recently-cancelled orders buffer.
         # When cancel_window_orders() removes an order from active_orders,
         # the cancel on Polymarket is async. If the order filled before the
@@ -2581,14 +2593,27 @@ class TradingEngine:
         return total
 
     def get_live_pnl(self):
+        """V15.1-20: Return dict with wallet_delta (primary) and total_pnl (estimated).
+        wallet_delta = current_wallet - starting_wallet (hard fact, no estimation)
+        total_pnl = wallet_delta + position_value + capital_deployed (includes estimates)
+        """
         if self.starting_wallet_balance is None or not self.balance_checker:
             return None
         current = self.balance_checker.get_balance()
         if current is None:
             return None
-        # V15.1-16: Use actual position value instead of hardcoded 0.50
+        wallet_delta = current - self.starting_wallet_balance
+        # V15.1-20: Position value is an estimate — orphan tokens may be worth $0
+        # but get_position_value marks them at market price. Use conservatively.
         held_value = self.get_position_value()
-        return (current + self.capital_deployed + held_value) - self.starting_wallet_balance
+        total_pnl = wallet_delta + self.capital_deployed + held_value
+        return {
+            "wallet_delta": wallet_delta,
+            "total_pnl": total_pnl,
+            "held_value": held_value,
+            "capital_deployed": self.capital_deployed,
+            "wallet_now": current,
+        }
 
     # V15.1-4: Verbose order rejection logging
     def place_order(self, token_id, side, price, size, window_id, label="",
@@ -2701,6 +2726,7 @@ class TradingEngine:
                         self.window_fill_cost.get(window_id, 0) + price * size)
                     # V15.1-15: Mark window as filled — prevents re-entry
                     self.filled_windows.add(window_id)
+                    self.held_windows.add(window_id)  # V15.1-20: track until capital recovered
                     self.window_entry_count[window_id] = self.window_entry_count.get(window_id, 0) + 1
                     is_up = self._is_up_token_cache.get(token_id)
                     side_label = "UP" if is_up else "DOWN"
@@ -2796,6 +2822,7 @@ class TradingEngine:
                                 self.window_fill_cost.get(wid, 0) + cost)
                             # V15.1-15: Mark window as filled — prevents re-entry
                             self.filled_windows.add(wid)
+                            self.held_windows.add(wid)  # V15.1-20: track until capital recovered
                             self.window_entry_count[wid] = self.window_entry_count.get(wid, 0) + 1
                             if wid not in self.window_fill_tokens:
                                 self.window_fill_tokens[wid] = []
@@ -2975,6 +3002,8 @@ class TradingEngine:
                     # V15.1-19: Mark window as permanently closed after momentum exit
                     # Keep in filled_windows AND add to closed_windows to block re-entry
                     self.closed_windows.add(wid)
+                    # V15.1-20: Release held_windows — capital recovered via CLOB sell
+                    self.held_windows.discard(wid)
                     self.window_entry_count.pop(wid, None)
                     # Update capital tracking
                     cost = fill_price * fill_size
@@ -3107,7 +3136,20 @@ class TradingEngine:
         self._update_total_capital()
 
     def get_stats(self):
-        live_pnl = self.get_live_pnl()
+        pnl_data = self.get_live_pnl()  # V15.1-20: now returns dict or None
+        # Backward-compat: extract scalar live_pnl for existing consumers
+        if pnl_data and isinstance(pnl_data, dict):
+            live_pnl = pnl_data.get("wallet_delta")  # Primary metric: hard wallet change
+            wallet_delta = pnl_data.get("wallet_delta")
+            total_pnl = pnl_data.get("total_pnl")
+            held_value = pnl_data.get("held_value", 0)
+            wallet_now = pnl_data.get("wallet_now")
+        else:
+            live_pnl = pnl_data  # Legacy: None
+            wallet_delta = None
+            total_pnl = None
+            held_value = 0
+            wallet_now = None
         return {
             "active_orders": len(self.active_orders),
             "total_placed": self.total_orders_placed,
@@ -3125,7 +3167,11 @@ class TradingEngine:
             "available_capital": self.get_available_capital(),
             "session_spent": self.session_total_spent,
             "token_holdings": len(self.token_holdings),
-            "live_pnl": live_pnl,
+            "live_pnl": live_pnl,  # V15.1-20: now wallet_delta (hard fact)
+            "wallet_delta": wallet_delta,
+            "total_pnl_est": total_pnl,
+            "held_value": held_value,
+            "wallet_now": wallet_now,
             "pending_claims": len(self.expired_windows_pending_claim),
             "hedges_completed": self.hedges_completed,
             "hedges_skipped": self.hedges_skipped,
@@ -3134,6 +3180,7 @@ class TradingEngine:
             "paired_windows": len(self.paired_windows),
             "filled_windows": len(self.filled_windows),
             "closed_windows": len(self.closed_windows),
+            "held_windows": len(self.held_windows),
             "session_realized_returns": self.session_realized_returns,
             "session_realized_cost": self.session_realized_cost,
             "session_realized_pnl": self.session_realized_returns - self.session_realized_cost,
@@ -3437,6 +3484,7 @@ class MarketMakingStrategy:
         fill_cost = self.engine.window_fill_cost.get(window_id, 0)
         if fill_cost > 0:
             self.engine.filled_windows.add(window_id)  # Repair missing entry
+            self.engine.held_windows.add(window_id)  # V15.1-20: repair held tracking too
             self.logger.debug(
                 "  FILL SKIP | {} | Already filled ${:.2f} — position established".format(
                     window_id, fill_cost))
@@ -4198,10 +4246,16 @@ class PolymarketBot:
         self.logger.info("  Merges:           {} ok / {} fail | ${:.2f} returned".format(
             merge_stats["merges_completed"], merge_stats["merges_failed"],
             merge_stats["total_merged_usd"]))
-        live_pnl = stats.get("live_pnl")
-        if live_pnl is not None:
-            tag = "PROFIT" if live_pnl >= 0 else "LOSS"
-            self.logger.info("  [{}] Live P&L:   ${:+,.2f}".format(tag, live_pnl))
+        wallet_delta = stats.get("wallet_delta")
+        if wallet_delta is not None:
+            tag = "PROFIT" if wallet_delta >= 0 else "LOSS"
+            self.logger.info("  [{}] Wallet \u0394:    ${:+,.2f}".format(tag, wallet_delta))
+            held_val = stats.get("held_value", 0)
+            total_est = stats.get("total_pnl_est")
+            if total_est is not None:
+                self.logger.info("  Est Total P&L: ${:+,.2f} (W\u0394 + ${:.0f} deployed + ${:.0f} held)".format(
+                    total_est, stats.get("capital_deployed", 0), held_val))
+            self.logger.info("  Held Windows:  {}".format(stats.get("held_windows", 0)))
         self.logger.info("  -- Strategies --")
         self.logger.info("  MM: {}  Sniper: {}  Arb: {}  Contrarian: {}".format(
             stats["mm_trades"], stats["sniper_trades"],
@@ -4456,9 +4510,13 @@ class PolymarketBot:
                     bal = self.balance_checker.get_balance()
                     if bal is not None:
                         wallet_str = " | W:${:.0f}".format(bal)
-                    live_pnl = stats.get("live_pnl")
-                    if live_pnl is not None:
-                        pnl_str = " | P&L:${:+.2f}".format(live_pnl)
+                    # V15.1-20: Show wallet delta as primary P&L (hard fact)
+                    wallet_delta = stats.get("wallet_delta")
+                    if wallet_delta is not None:
+                        pnl_str = " | W\u0394:${:+.2f}".format(wallet_delta)
+                        held_val = stats.get("held_value", 0)
+                        if held_val > 0:
+                            pnl_str += " +${:.0f}held".format(held_val)
 
                 cs = self.claim_manager.get_claim_stats()
                 claim_str = ""
@@ -4482,16 +4540,21 @@ class PolymarketBot:
                     if cs2["suppressed"] > 0:
                         churn_str = " | Churn:-{:.0f}%".format(cs2["reduction_pct"])
 
+                held_str = ""
+                held_count = stats.get("held_windows", 0)
+                if held_count > 0:
+                    held_str = " | Held:{}".format(held_count)
+
                 self.logger.info(
                     "\n{}\n  C{} | {} | Ord:{} | Exp:${:.0f} | Avail:${:.0f} | MaxExp:${:.0f}"
-                    "{}{}{}{}{}{}\n{}".format(
+                    "{}{}{}{}{}{}{}".format(
                         "_" * 60, cycle,
                         datetime.now(timezone.utc).strftime("%H:%M:%S"),
                         stats["active_orders"], stats["total_exposure"],
                         stats["available_capital"],
                         self.config.max_total_exposure,
                         wallet_str, pnl_str, claim_str, hedge_str,
-                        merge_str, churn_str,
+                        merge_str, churn_str, held_str,
                         "_" * 60))
 
                 self.price_feed.update()
@@ -4586,6 +4649,31 @@ class PolymarketBot:
                     if s["realized_pnl"] < loss_limit:
                         self._loss_stop_until = now + self.config.hard_loss_cooloff
                         trading_halted = True
+                elif not self.config.dry_run and self.engine.starting_wallet_balance:
+                    # V15.1-20: LIVE-MODE LOSS STOP using wallet delta
+                    # The sim_engine check above only works in dry run.
+                    # In live mode, use actual wallet balance change as the loss metric.
+                    wallet_now = None
+                    if self.balance_checker:
+                        wallet_now = self.balance_checker.get_balance()
+                    if wallet_now is not None:
+                        wallet_delta = wallet_now - self.engine.starting_wallet_balance
+                        loss_limit = -self.config.hard_loss_stop_pct * self.config.kelly_bankroll
+                        if wallet_delta < loss_limit:
+                            self._loss_stop_until = now + self.config.hard_loss_cooloff
+                            self.logger.warning(
+                                "  LIVE LOSS STOP | W\u0394: ${:.2f} < limit ${:.2f} "
+                                "({}% of ${:.0f} bankroll) | Halting for {}s".format(
+                                    wallet_delta, loss_limit,
+                                    self.config.hard_loss_stop_pct * 100,
+                                    self.config.kelly_bankroll,
+                                    self.config.hard_loss_cooloff))
+                            trading_halted = True
+                        elif cycle % 10 == 1:
+                            # Periodic wallet delta status (every 10 cycles)
+                            self.logger.info(
+                                "  LOSS MONITOR | W\u0394: ${:+.2f} / limit ${:.2f}".format(
+                                    wallet_delta, loss_limit))
 
                 # V15.1-19: Session blackout windows
                 if self.config.trading_blackout_windows and not trading_halted:
@@ -4607,8 +4695,12 @@ class PolymarketBot:
                 # V15-2 + V15.1-6 + V15.1-10: Dual-path tradeable filter
                 # with condition_id deduplication
                 tradeable_markets = []
-                # V15.1-19: Include filled_windows in active count (positions held, not just orders)
-                active_window_ids = set(self.engine.window_exposure.keys()) | self.engine.filled_windows
+                # V15.1-20: Include held_windows in active count.
+                # held_windows persists even after cleanup_expired_windows (unlike filled_windows).
+                # This prevents unlimited window accumulation when merge/claim is broken.
+                active_window_ids = (set(self.engine.window_exposure.keys())
+                                     | self.engine.filled_windows
+                                     | self.engine.held_windows)
                 # V15.1-10: Track condition_ids with active exposure
                 active_condition_ids = set()
                 for awid in active_window_ids:
@@ -4652,9 +4744,11 @@ class PolymarketBot:
                     try:
                         if trading_halted:
                             continue
-                        # V15.1-7/19: Dynamic max_concurrent_windows enforcement
-                        # Include filled_windows so held positions count toward the limit
-                        current_active = set(self.engine.window_exposure.keys()) | self.engine.filled_windows
+                        # V15.1-7/20: Dynamic max_concurrent_windows enforcement
+                        # Include held_windows so on-chain positions count toward the limit
+                        current_active = (set(self.engine.window_exposure.keys())
+                                          | self.engine.filled_windows
+                                          | self.engine.held_windows)
                         wid = market["window_id"]
                         if (len(current_active) >= self.config.max_concurrent_windows
                                 and wid not in current_active):

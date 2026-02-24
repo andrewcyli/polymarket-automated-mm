@@ -490,11 +490,11 @@ class PolyMakerBot(PolymarketBot):
 
         stats = self.engine.get_stats()
 
-        # Calculate PnL: prefer real wallet P&L, fall back to sim/engine
+        # V15.1-20: Calculate PnL: wallet_delta is primary (hard fact)
         total_pnl = 0.0
-        real_pnl = getattr(self, '_real_pnl', None)
-        if real_pnl is not None:
-            total_pnl = real_pnl  # Ground truth from wallet
+        wallet_delta = stats.get("wallet_delta")
+        if wallet_delta is not None:
+            total_pnl = wallet_delta  # Ground truth: actual wallet change
         elif self.sim_engine:
             s = self.sim_engine.get_summary()
             total_pnl = s.get("realized_pnl", 0)
@@ -546,10 +546,11 @@ class PolyMakerBot(PolymarketBot):
             return
 
         stats = self.engine.get_stats()
+        # V15.1-20: wallet_delta is primary P&L metric
         total_pnl = 0.0
-        real_pnl = getattr(self, '_real_pnl', None)
-        if real_pnl is not None:
-            total_pnl = real_pnl
+        wallet_delta = stats.get("wallet_delta")
+        if wallet_delta is not None:
+            total_pnl = wallet_delta
         elif self.sim_engine:
             s = self.sim_engine.get_summary()
             total_pnl = s.get("realized_pnl", 0)
@@ -777,10 +778,13 @@ class PolyMakerBot(PolymarketBot):
                                     "  ⚠️  WALLET READ FAILED {} consecutive times. "
                                     "Real P&L tracking unreliable. Check RPC connection.".format(
                                         self._wallet_read_failures))
-                        # Fall back to engine's live P&L estimate
-                        live_pnl = stats.get("live_pnl")
-                        if live_pnl is not None:
-                            pnl_str = " | estP&L:${:+.2f}".format(live_pnl)
+                        # V15.1-20: Use wallet_delta as primary P&L
+                        wallet_delta = stats.get("wallet_delta")
+                        if wallet_delta is not None:
+                            pnl_str = " | W\u0394:${:+.2f}".format(wallet_delta)
+                            held_val = stats.get("held_value", 0)
+                            if held_val > 0:
+                                pnl_str += " +${:.0f}held".format(held_val)
 
                 cs = self.claim_manager.get_claim_stats()
                 claim_str = ""
