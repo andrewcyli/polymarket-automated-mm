@@ -311,17 +311,23 @@ class WSFillDetector:
                                 f"| {size_matched:.1f}/{original_size:.1f} matched"
                             )
 
-                # Remove from active_orders — exchange confirmed the cancel
+                # Move from active_orders to _recently_cancelled so that
+                # a late ORDER_FILL event can still recover the fill.
+                # (V15.1-21: Fix race condition where CANCELLATION event
+                #  arrived before ORDER_FILL, causing lost fills)
                 cancelled_info = self.engine.active_orders.pop(order_id, None)
                 if cancelled_info:
                     wid = cancelled_info.get("window_id", "")
+                    # Preserve in _recently_cancelled for fill recovery
+                    self.engine._recently_cancelled[order_id] = {
+                        **cancelled_info, "cancelled_at": time.time()}
                     if wid in self.engine.orders_by_window:
                         self.engine.orders_by_window[wid] = [
                             o for o in self.engine.orders_by_window[wid] if o != order_id
                         ]
                     self.logger.debug(
                         f"WSFillDetector: Order {order_id[:12]}... cancelled — "
-                        f"removed from active_orders | {wid}"
+                        f"moved to _recently_cancelled | {wid}"
                     )
 
         elif evt == "trade":

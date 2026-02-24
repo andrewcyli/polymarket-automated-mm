@@ -412,7 +412,9 @@ CTF_FULL_ABI = json.loads("""[
     {"inputs":[{"internalType":"address","name":"collateralToken","type":"address"},{"internalType":"bytes32","name":"parentCollectionId","type":"bytes32"},{"internalType":"bytes32","name":"conditionId","type":"bytes32"},{"internalType":"uint256[]","name":"indexSets","type":"uint256[]"}],"name":"redeemPositions","outputs":[],"stateMutability":"nonpayable","type":"function"},
     {"inputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"name":"payoutDenominator","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
     {"inputs":[{"internalType":"address","name":"collateralToken","type":"address"},{"internalType":"bytes32","name":"parentCollectionId","type":"bytes32"},{"internalType":"bytes32","name":"conditionId","type":"bytes32"},{"internalType":"uint256[]","name":"indexSets","type":"uint256[]"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"mergePositions","outputs":[],"stateMutability":"nonpayable","type":"function"},
-    {"inputs":[{"internalType":"address","name":"account","type":"address"},{"internalType":"uint256","name":"id","type":"uint256"}],"name":"balanceOf","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
+    {"inputs":[{"internalType":"address","name":"account","type":"address"},{"internalType":"uint256","name":"id","type":"uint256"}],"name":"balanceOf","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"inputs":[{"internalType":"address","name":"owner","type":"address"},{"internalType":"address","name":"operator","type":"address"}],"name":"isApprovedForAll","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},
+    {"inputs":[{"internalType":"address","name":"operator","type":"address"},{"internalType":"bool","name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"}
 ]""")
 
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
@@ -1661,7 +1663,34 @@ class AutoMerger:
 
     def _merge_via_proxy(self, ctf_addr, merge_data, window_id):
         if not self.proxy_contract or not self.account:
+            self.logger.warning("  MERGE SKIP | {} | No proxy_contract or account".format(window_id))
             return False
+        # V15.1-21: Check CTF approval status for proxy wallet before merge.
+        # mergePositions requires the caller (proxy) to have approval to move
+        # the CTF tokens. If proxy isn't approved, the tx will revert.
+        proxy_addr = Web3.to_checksum_address(self.config.proxy_wallet)
+        try:
+            self.rpc_limiter.wait()
+            is_approved = self.ctf_contract.functions.isApprovedForAll(
+                proxy_addr, ctf_addr).call()
+            self.logger.info("  MERGE APPROVAL CHECK | {} | proxy={} approved_for_ctf={}".format(
+                window_id, proxy_addr[:10] + "...", is_approved))
+            if not is_approved:
+                # Try to set approval: proxy must approve CTF to manage its tokens
+                # This is done via the proxy's execute() function
+                self.logger.info("  MERGE | Setting CTF approval for proxy...")
+                approval_data = _encode_abi(
+                    self.ctf_contract, "setApprovalForAll",
+                    [ctf_addr, True])
+                success = self._proxy_exec_tx(
+                    ctf_addr, approval_data, window_id, "setApprovalForAll")
+                if not success:
+                    self.logger.warning("  MERGE | Failed to set CTF approval — merge will likely fail")
+                else:
+                    self.logger.info("  MERGE | CTF approval set successfully")
+        except Exception as e_check:
+            self.logger.info("  MERGE APPROVAL CHECK FAILED | {} | {}".format(
+                window_id, str(e_check)[:100]))
         self.rpc_limiter.wait()
         nonce = self.w3.eth.get_transaction_count(self.account.address)
         gas_price = self.rpc_limiter.get_gas_price(self.w3)
@@ -1685,10 +1714,26 @@ class AutoMerger:
                         window_id, fn_name, self.w3.to_hex(tx_hash)[:20]))
                     return True
                 else:
-                    self.logger.warning("  MERGE TX REVERTED | {} | {}".format(window_id, fn_name))
+                    # V15.1-21: Verbose revert logging — capture tx hash and gas used
+                    self.logger.warning(
+                        "  MERGE TX REVERTED | {} | {} | Tx: {} | Gas used: {} | "
+                        "Signer: {} | Proxy: {}".format(
+                            window_id, fn_name,
+                            self.w3.to_hex(tx_hash),
+                            receipt.gasUsed,
+                            self.account.address[:10] + "...",
+                            proxy_addr[:10] + "..."))
             except Exception as e1:
-                err = str(e1).lower()
-                if "rate limit" in err or "-32090" in err:
+                err = str(e1)
+                err_lower = err.lower()
+                # V15.1-21: Verbose error logging for merge failures
+                self.logger.warning(
+                    "  MERGE TX ERROR | {} | {} | Signer: {} | Proxy: {} | Error: {}".format(
+                        window_id, fn_name,
+                        self.account.address[:10] + "...",
+                        proxy_addr[:10] + "...",
+                        err[:200]))
+                if "rate limit" in err_lower or "-32090" in err_lower:
                     self.rpc_limiter.report_rate_limit(15)
                     return False
                 self.rpc_limiter.wait()
@@ -1698,8 +1743,54 @@ class AutoMerger:
                     return False
         return False
 
+    def _proxy_exec_tx(self, target_addr, call_data, window_id, label):
+        """Execute a transaction through the proxy wallet.
+        Used for approval and other setup transactions."""
+        if not self.proxy_contract or not self.account:
+            return False
+        try:
+            self.rpc_limiter.wait()
+            nonce = self.w3.eth.get_transaction_count(self.account.address)
+            gas_price = self.rpc_limiter.get_gas_price(self.w3)
+            for fn_name, fn_args_builder in [
+                ("execute", lambda: (target_addr, 0, bytes.fromhex(call_data[2:]))),
+                ("exec", lambda: (target_addr, bytes.fromhex(call_data[2:]))),
+            ]:
+                try:
+                    fn = getattr(self.proxy_contract.functions, fn_name)
+                    txn = fn(*fn_args_builder()).build_transaction({
+                        "from": self.account.address, "nonce": nonce,
+                        "gas": 200000, "gasPrice": int(gas_price * 1.3),
+                        "chainId": self.config.chain_id,
+                    })
+                    signed = self.w3.eth.account.sign_transaction(txn, self.config.private_key)
+                    self.rpc_limiter.wait()
+                    tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+                    receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+                    if receipt.status == 1:
+                        self.logger.info("  PROXY TX OK | {} | {} | {}".format(
+                            label, fn_name, self.w3.to_hex(tx_hash)[:20]))
+                        return True
+                    else:
+                        self.logger.warning("  PROXY TX REVERTED | {} | {} | {}".format(
+                            label, fn_name, self.w3.to_hex(tx_hash)))
+                except Exception as e1:
+                    err = str(e1).lower()
+                    if "rate limit" in err or "-32090" in err:
+                        self.rpc_limiter.report_rate_limit(15)
+                        return False
+                    self.rpc_limiter.wait()
+                    try:
+                        nonce = self.w3.eth.get_transaction_count(self.account.address)
+                    except Exception:
+                        return False
+        except Exception as e:
+            self.logger.warning("  PROXY TX ERROR | {} | {}".format(label, str(e)[:100]))
+        return False
+
     def _merge_direct(self, ctf_addr, merge_data, window_id):
         if not self.account:
+            self.logger.warning("  MERGE SKIP (direct) | {} | No account".format(window_id))
             return False
         try:
             self.rpc_limiter.wait()
@@ -1719,9 +1810,21 @@ class AutoMerger:
                 self.logger.info("  MERGE TX OK (direct) | {} | Tx: {}...".format(
                     window_id, self.w3.to_hex(tx_hash)[:20]))
                 return True
+            else:
+                # V15.1-21: Verbose revert logging for direct merge
+                self.logger.warning(
+                    "  MERGE TX REVERTED (direct) | {} | Tx: {} | Gas used: {} | "
+                    "Signer: {}".format(
+                        window_id, self.w3.to_hex(tx_hash),
+                        receipt.gasUsed, self.account.address[:10] + "..."))
         except Exception as e:
-            err = str(e).lower()
-            if "rate limit" in err or "-32090" in err:
+            err = str(e)
+            err_lower = err.lower()
+            # V15.1-21: Verbose error logging
+            self.logger.warning(
+                "  MERGE TX ERROR (direct) | {} | Signer: {} | Error: {}".format(
+                    window_id, self.account.address[:10] + "...", err[:200]))
+            if "rate limit" in err_lower or "-32090" in err_lower:
                 self.rpc_limiter.report_rate_limit(15)
         return False
 
@@ -2356,7 +2459,7 @@ class TradingEngine:
         # longer in active_orders. This buffer preserves the order metadata
         # so the fill can still be processed correctly.
         self._recently_cancelled = {}  # {order_id: {**order_info, "cancelled_at": float}}
-        self._recently_cancelled_ttl = 120  # seconds to keep entries
+        self._recently_cancelled_ttl = 900  # V15.1-21: 15 min to catch late fills (was 120s)
 
         if not config.dry_run and HAS_CLOB:
             try:
@@ -2461,11 +2564,22 @@ class TradingEngine:
                 sides = self.window_fill_sides.get(wid, {})
                 self.logger.info("  CLAIM QUEUED | {} | sides: {} | cost ${:.2f}".format(
                     wid, "+".join(sorted(sides.keys())) if sides else "?", fill_cost))
-            self.window_fill_sides.pop(wid, None)
+            # V15.1-21: Only pop window_fill_sides if the window is paired
+            # (both sides filled) or has no fills. One-sided fills must be
+            # preserved for process_momentum_exits to act on them.
+            sides = self.window_fill_sides.get(wid, {})
+            is_one_sided = len(sides) == 1 and wid not in self.paired_windows
+            if not is_one_sided:
+                self.window_fill_sides.pop(wid, None)
+            else:
+                self.logger.info("  PRESERVING fill_sides for momentum exit | {} | sides: {}".format(
+                    wid, "+".join(sorted(sides.keys()))))
             self._market_cache.pop(wid, None)
-            # V15.1-15: Release filled window tracking on expiry
-            self.filled_windows.discard(wid)
-            self.window_entry_count.pop(wid, None)
+            # V15.1-15/21: Only release filled_windows if NOT one-sided
+            # (one-sided fills need to stay locked for momentum exit)
+            if not is_one_sided:
+                self.filled_windows.discard(wid)
+                self.window_entry_count.pop(wid, None)
         self.known_windows = active_ids
         self._recalc_exposure()
 
