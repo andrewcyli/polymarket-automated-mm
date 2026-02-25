@@ -1758,10 +1758,11 @@ class AutoMerger:
             ).call()
             # 3. Sign the hash with the owner's private key (eth_sign style)
             #    Gnosis Safe expects an eth_sign signature: sign("\x19Ethereum Signed Message:\n32" + hash)
-            from eth_account.messages import defunct_hash_message
-            msg_hash = defunct_hash_message(primitive=safe_tx_hash)
+            from eth_account.messages import encode_defunct
+            # safe_tx_hash is HexBytes — convert to raw bytes for encode_defunct
+            msg = encode_defunct(primitive=bytes(safe_tx_hash))
             signed_msg = self.w3.eth.account.sign_message(
-                msg_hash, private_key=self.config.private_key)
+                msg, private_key=self.config.private_key)
             # Pack signature as r(32) + s(32) + v(1) with v += 4 for eth_sign
             sig = (signed_msg.r.to_bytes(32, 'big') +
                    signed_msg.s.to_bytes(32, 'big') +
