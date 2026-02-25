@@ -2943,16 +2943,16 @@ class TradingEngine:
             return 0
         now = time.time()
         completed = 0
-        # V15.1-23: Tiered hedge pricing — progressively wider max cost as time passes.
-        # config.hedge_tiers is a list of (seconds_after_fill, max_combined_cost)
-        # sorted by seconds ascending. We pick the tier whose time threshold has been
-        # reached but don't remove from _pending_hedges until the last tier expires.
+        # V15.2: Percentage-based tiered hedge pricing.
+        # config.hedge_tiers is a list of (pct_remaining_threshold, max_combined_cost)
+        # sorted by pct descending (T1=67% triggers first, T3=13% triggers last).
+        # Tier triggers when % of window time remaining < threshold.
+        # This auto-scales to any window duration (5m, 15m, etc.).
         hedge_tiers = getattr(self.config, 'hedge_tiers', [
-            (30, 1.03), (60, 1.05), (120, 1.08)
+            (67, 1.03), (33, 1.05), (13, 1.08)
         ])
-        # Sort tiers by seconds ascending
-        hedge_tiers = sorted(hedge_tiers, key=lambda t: t[0])
-        last_tier_secs = hedge_tiers[-1][0] if hedge_tiers else 120
+        # Sort tiers by pct descending (highest pct = earliest trigger)
+        hedge_tiers = sorted(hedge_tiers, key=lambda t: t[0], reverse=True)
 
         for hedge in list(self._pending_hedges):
             wid = hedge["window_id"]
@@ -2961,12 +2961,30 @@ class TradingEngine:
             filled_size = hedge["filled_size"]
             elapsed = now - hedge["time"]
 
-            # Determine which tier applies based on elapsed time
+            # Get window end_time and interval from market cache to compute % remaining
+            market = self._market_cache.get(wid)
+            if market:
+                window_end = market.get("end_time", 0)
+                window_duration = market.get("interval", 900)  # 900s=15m, 300s=5m
+            else:
+                # Fallback: try metadata
+                meta = self.window_metadata.get(wid, {})
+                window_end = meta.get("end_time", 0)
+                window_duration = 900  # default 15m
+
+            time_remaining = max(0, window_end - now)
+            pct_remaining = (time_remaining / window_duration * 100) if window_duration > 0 else 0
+
+            # Determine which tier applies based on % remaining
+            # Tiers are sorted descending by pct. The first tier whose threshold
+            # is >= pct_remaining is the active one (most aggressive that applies).
             active_tier = None
-            for tier_secs, tier_cost in hedge_tiers:
-                if elapsed >= tier_secs:
-                    active_tier = (tier_secs, tier_cost)
-            
+            active_tier_idx = -1
+            for idx, (tier_pct, tier_cost) in enumerate(hedge_tiers):
+                if pct_remaining < tier_pct:
+                    active_tier = (tier_pct, tier_cost)
+                    active_tier_idx = idx
+
             # Not yet reached first tier — skip for now
             if active_tier is None:
                 continue
@@ -2978,17 +2996,16 @@ class TradingEngine:
                 self._pending_hedges.remove(hedge)
                 continue
 
-            market = self._market_cache.get(wid)
             if not market:
-                # Past last tier with no market data — give up
-                if elapsed > last_tier_secs:
+                # Window expired with no market data — give up
+                if time_remaining <= 0:
                     self._pending_hedges.remove(hedge)
                 continue
 
             other_token = market["token_up"] if other_side == "UP" else market["token_down"]
             spread = book_reader.get_spread(other_token)
             if not spread:
-                if elapsed > last_tier_secs:
+                if time_remaining <= 0:
                     self._pending_hedges.remove(hedge)
                     self.hedges_skipped += 1
                 continue
@@ -2998,31 +3015,33 @@ class TradingEngine:
             fee_other = self.fee_calc._interp_fee_per_share(other_ask)
             total_cost = filled_price + other_ask + fee_filled + fee_other
             profit_per_share = 1.0 - total_cost
-            tier_secs, tier_max_cost = active_tier
+            tier_pct, tier_max_cost = active_tier
+            is_last_tier = (active_tier_idx == len(hedge_tiers) - 1)
 
             # Check against the active tier's max combined cost
             max_other_price = tier_max_cost - filled_price - fee_filled - fee_other
             if other_ask > max_other_price:
                 # If we haven't exhausted all tiers, keep waiting for next tier
-                if elapsed < last_tier_secs:
+                if not is_last_tier and time_remaining > 0:
                     self.logger.debug(
                         "  HEDGE WAIT T{} | {} | {} ask ${:.2f} > max ${:.2f} | "
-                        "elapsed {:.0f}s < next tier".format(
-                            hedge_tiers.index(active_tier) + 1, wid,
-                            other_side, other_ask, max_other_price, elapsed))
+                        "{:.0f}% remaining ({}s left)".format(
+                            active_tier_idx + 1, wid,
+                            other_side, other_ask, max_other_price,
+                            pct_remaining, int(time_remaining)))
                     continue
-                # Past last tier — give up
+                # Past last tier or window expired — give up
                 self.logger.info(
                     "  HEDGE PRICE CAP (ALL TIERS) | {} | {} @ ${:.2f} | {} ask ${:.2f} > max ${:.2f} | "
-                    "Combined ${:.3f} > T3 cap ${:.3f} | elapsed {:.0f}s".format(
+                    "Combined ${:.3f} > T3 cap ${:.3f} | {:.0f}% rem".format(
                         wid, filled_side, filled_price, other_side, other_ask,
-                        max_other_price, total_cost, tier_max_cost, elapsed))
+                        max_other_price, total_cost, tier_max_cost, pct_remaining))
                 self._pending_hedges.remove(hedge)
                 self.hedges_skipped += 1
                 continue
 
             if profit_per_share < self.config.hedge_min_profit_per_share:
-                if elapsed < last_tier_secs:
+                if not is_last_tier and time_remaining > 0:
                     continue
                 self.logger.info(
                     "  HEDGE LOW PROFIT | {} | {} @ ${:.2f} | {} ask ${:.2f} | "
@@ -3034,13 +3053,13 @@ class TradingEngine:
                 continue
 
             size = filled_size
-            tier_label = "T{}".format(hedge_tiers.index(active_tier) + 1)
+            tier_label = "T{}".format(active_tier_idx + 1)
             profit_str = "${:+.3f}/sh".format(profit_per_share)
             self.logger.info(
                 "\n  HEDGE COMPLETE [{}] | {} | {} @ ${:.2f} | Buy {} @ ${:.2f} | "
-                "Pair: ${:.3f} | {} | {:.0f} shares | {:.0f}s elapsed".format(
+                "Pair: ${:.3f} | {} | {:.0f} shares | {:.0f}% rem ({:.0f}s left)".format(
                     tier_label, wid, filled_side, filled_price, other_side, other_ask,
-                    total_cost, profit_str, size, elapsed))
+                    total_cost, profit_str, size, pct_remaining, time_remaining))
             result = self.place_order(
                 other_token, "BUY", other_ask, size,
                 wid, "HEDGE-{}".format(other_side), "mm", is_taker=True)

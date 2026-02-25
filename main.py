@@ -210,14 +210,17 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     config.hedge_completion_enabled = bool(cc_config.get("hedgeEnabled", True))
     config.hedge_min_profit_per_share = float(cc_config.get("hedgeMinProfit", 0.005))
     config.hedge_max_loss_per_share = 0.02    # Legacy fallback threshold
-    # Tiered hedge: list of (seconds_after_fill, max_combined_cost)
+    # Tiered hedge: list of (pct_remaining_threshold, max_combined_cost)
+    # pct_remaining is the % of window time left — tier triggers when remaining < threshold
     config.hedge_tiers = [
-        (float(cc_config.get("hedgeTier1Secs", 30)), float(cc_config.get("hedgeTier1Cost", 1.03))),
-        (float(cc_config.get("hedgeTier2Secs", 60)), float(cc_config.get("hedgeTier2Cost", 1.05))),
-        (float(cc_config.get("hedgeTier3Secs", 120)), float(cc_config.get("hedgeTier3Cost", 1.08))),
+        (float(cc_config.get("hedgeTier1Pct", 67)), float(cc_config.get("hedgeTier1Cost", 1.03))),
+        (float(cc_config.get("hedgeTier2Pct", 33)), float(cc_config.get("hedgeTier2Cost", 1.05))),
+        (float(cc_config.get("hedgeTier3Pct", 13)), float(cc_config.get("hedgeTier3Cost", 1.08))),
     ]
+    # Sort tiers by pct descending (T1=67% triggers first, T3=13% triggers last)
+    config.hedge_tiers = sorted(config.hedge_tiers, key=lambda t: t[0], reverse=True)
     # Keep legacy fields for backward compat (use tier 1 as default)
-    config.hedge_completion_delay = config.hedge_tiers[0][0]
+    config.hedge_completion_delay = 30  # Legacy fallback
     config.hedge_max_combined_cost = config.hedge_tiers[0][1]
 
     # V15.1-14: Momentum exit — sell one-sided fill if price rises >X%
@@ -230,7 +233,7 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     config.pause_orders = bool(cc_config.get("pauseOrders", False))
 
     print(f"  Hedge: {'ON' if config.hedge_completion_enabled else 'OFF'} "
-          f"(tiers: {', '.join(f'${t[1]:.2f}@{t[0]:.0f}s' for t in config.hedge_tiers)}, "
+          f"(tiers: {', '.join(f'${t[1]:.2f}@<{t[0]:.0f}%rem' for t in config.hedge_tiers)}, "
           f"minProfit=${config.hedge_min_profit_per_share:.3f})")
     print(f"  Momentum Exit: {'ON' if config.momentum_exit_enabled else 'OFF'} "
           f"(threshold={config.momentum_exit_threshold:.1%}, "
@@ -762,11 +765,11 @@ class PolyMakerBot(PolymarketBot):
                         self.config.pause_orders = bool(fresh_config.get("pauseOrders", False))
                         self.config.hedge_completion_enabled = bool(fresh_config.get("hedgeEnabled", True))
                         self.config.hedge_min_profit_per_share = float(fresh_config.get("hedgeMinProfit", 0.005))
-                        self.config.hedge_tiers = [
-                            (float(fresh_config.get("hedgeTier1Secs", 30)), float(fresh_config.get("hedgeTier1Cost", 1.03))),
-                            (float(fresh_config.get("hedgeTier2Secs", 60)), float(fresh_config.get("hedgeTier2Cost", 1.05))),
-                            (float(fresh_config.get("hedgeTier3Secs", 120)), float(fresh_config.get("hedgeTier3Cost", 1.08))),
-                        ]
+                        self.config.hedge_tiers = sorted([
+                            (float(fresh_config.get("hedgeTier1Pct", 67)), float(fresh_config.get("hedgeTier1Cost", 1.03))),
+                            (float(fresh_config.get("hedgeTier2Pct", 33)), float(fresh_config.get("hedgeTier2Cost", 1.05))),
+                            (float(fresh_config.get("hedgeTier3Pct", 13)), float(fresh_config.get("hedgeTier3Cost", 1.08))),
+                        ], key=lambda t: t[0], reverse=True)
                         self.config.momentum_exit_enabled = bool(fresh_config.get("momentumExitEnabled", True))
                         self.config.momentum_exit_threshold = float(fresh_config.get("momentumExitThreshold", 0.03))
                         self.config.momentum_exit_max_wait_secs = float(fresh_config.get("momentumExitMaxWait", 120.0))
