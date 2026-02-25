@@ -759,29 +759,35 @@ class PolyMakerBot(PolymarketBot):
             cycle += 1
             cc.increment_cycle()
             try:
-                # V15.1-24: Hot-reload config from CC every cycle.
-                # Reads pauseOrders, tiered hedge, and other tunable params.
-                if cycle % 5 == 0 and cc._is_ready():
+                # V15.1-30: Fetch pauseOrders EVERY cycle for instant response.
+                # Full config refresh still every 5 cycles (heavier payload).
+                if cc._is_ready():
                     fresh_config = cc.get_config()
                     if fresh_config:
-                        # Update only hot-reloadable params (not assets/bankroll)
+                        # Pause is checked every cycle for instant response
+                        was_paused = getattr(self.config, 'pause_orders', False)
                         self.config.pause_orders = bool(fresh_config.get("pauseOrders", False))
-                        self.config.hedge_completion_enabled = bool(fresh_config.get("hedgeEnabled", True))
-                        self.config.hedge_min_profit_per_share = float(fresh_config.get("hedgeMinProfit", 0.005))
-                        self.config.hedge_tiers = sorted([
-                            (float(fresh_config.get("hedgeTier1Pct", 67)), float(fresh_config.get("hedgeTier1Cost", 1.03))),
-                            (float(fresh_config.get("hedgeTier2Pct", 33)), float(fresh_config.get("hedgeTier2Cost", 1.05))),
-                            (float(fresh_config.get("hedgeTier3Pct", 13)), float(fresh_config.get("hedgeTier3Cost", 1.08))),
-                        ], key=lambda t: t[0], reverse=True)
-                        self.config.momentum_exit_enabled = bool(fresh_config.get("momentumExitEnabled", True))
-                        self.config.momentum_exit_threshold = float(fresh_config.get("momentumExitThreshold", 0.03))
-                        self.config.momentum_exit_max_wait_secs = float(fresh_config.get("momentumExitMaxWait", 120.0))
-                        self.config.momentum_gate_threshold = float(fresh_config.get("momentumGate", 0.005))
-                        self.config.momentum_gate_max_consec = int(fresh_config.get("momentumGateMaxConsec", 3))
-                        self.config.min_book_depth = float(fresh_config.get("minBookDepth", 5.0))
-                        self.config.max_spread_asymmetry = float(fresh_config.get("maxSpreadAsymmetry", 0.02))
-                        if self.config.pause_orders and cycle % 10 == 0:
-                            self.logger.info("  \u26a0\ufe0f  PAUSED from CC \u2014 no new orders this cycle")
+                        # Log state transitions immediately
+                        if self.config.pause_orders and not was_paused:
+                            self.logger.info("  \u26a0\ufe0f  PAUSED from CC \u2014 no new orders will be placed")
+                        elif not self.config.pause_orders and was_paused:
+                            self.logger.info("  \u2705  RESUMED from CC \u2014 order placement re-enabled")
+                        # Full config refresh every 5 cycles
+                        if cycle % 5 == 0:
+                            self.config.hedge_completion_enabled = bool(fresh_config.get("hedgeEnabled", True))
+                            self.config.hedge_min_profit_per_share = float(fresh_config.get("hedgeMinProfit", 0.005))
+                            self.config.hedge_tiers = sorted([
+                                (float(fresh_config.get("hedgeTier1Pct", 67)), float(fresh_config.get("hedgeTier1Cost", 1.03))),
+                                (float(fresh_config.get("hedgeTier2Pct", 33)), float(fresh_config.get("hedgeTier2Cost", 1.05))),
+                                (float(fresh_config.get("hedgeTier3Pct", 13)), float(fresh_config.get("hedgeTier3Cost", 1.08))),
+                            ], key=lambda t: t[0], reverse=True)
+                            self.config.momentum_exit_enabled = bool(fresh_config.get("momentumExitEnabled", True))
+                            self.config.momentum_exit_threshold = float(fresh_config.get("momentumExitThreshold", 0.03))
+                            self.config.momentum_exit_max_wait_secs = float(fresh_config.get("momentumExitMaxWait", 120.0))
+                            self.config.momentum_gate_threshold = float(fresh_config.get("momentumGate", 0.005))
+                            self.config.momentum_gate_max_consec = int(fresh_config.get("momentumGateMaxConsec", 3))
+                            self.config.min_book_depth = float(fresh_config.get("minBookDepth", 5.0))
+                            self.config.max_spread_asymmetry = float(fresh_config.get("maxSpreadAsymmetry", 0.02))
 
                 self.engine.check_daily_reset()
                 self.engine.sync_exchange_balance()
@@ -1104,9 +1110,26 @@ class PolyMakerBot(PolymarketBot):
                             self._loss_stop_until = now + self.config.hard_loss_cooloff
                             trading_halted = True
 
-                # V15.1-24: CC pause control — skip new order placement
+                # V15.1-30: CC pause control — skip new orders AND cancel existing
                 if getattr(self.config, 'pause_orders', False):
                     trading_halted = True
+                    # On first pause cycle, cancel all active orders to prevent
+                    # late fills creating orphans while paused
+                    if not getattr(self, '_pause_orders_cancelled', False):
+                        try:
+                            active_count = len(self.engine.active_orders)
+                            if active_count > 0:
+                                self.engine.cancel_all()
+                                self.logger.info(
+                                    "  PAUSE CANCEL | Cancelled {} active orders on pause".format(
+                                        active_count))
+                            self._pause_orders_cancelled = True
+                        except Exception as e:
+                            self.logger.warning(
+                                "  PAUSE CANCEL ERROR | {}".format(str(e)[:100]))
+                else:
+                    # Reset flag when unpaused so next pause triggers cancel again
+                    self._pause_orders_cancelled = False
 
                 # ═══════════════════════════════════════════════════════════
                 # V15.1-22: PRIORITIZED MARKET SELECTION

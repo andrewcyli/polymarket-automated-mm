@@ -4720,87 +4720,12 @@ class PolymarketBot:
             self.engine.cancel_all()
         except Exception:
             pass
-        # V15.1-29 Strategy 5: Orphan recovery at shutdown
-        # Sell one-sided (orphan) positions at market bid to avoid holding
-        # through resolution with only one side of a pair.
-        try:
-            self._shutdown_orphan_recovery()
-        except Exception as e:
-            self.logger.warning("  SHUTDOWN ORPHAN RECOVERY ERROR | {}".format(str(e)[:200]))
         self._print_summary("FINAL")
         self._print_claim_summary()
         self._print_v15_1_summary()
         self.logger.info("All orders cancelled. Exiting.")
         os._exit(0)
 
-    def _shutdown_orphan_recovery(self):
-        """V15.1-29: At shutdown, attempt to sell any one-sided (orphan) positions
-        at market bid. This prevents holding directional risk through resolution."""
-        orphans_found = 0
-        orphans_sold = 0
-        for wid, sides in list(self.engine.window_fill_sides.items()):
-            has_up = "UP" in sides and len(sides["UP"]) > 0
-            has_down = "DOWN" in sides and len(sides["DOWN"]) > 0
-            # Skip fully paired windows — merge will handle
-            if has_up and has_down:
-                continue
-            # Skip windows with no fills
-            if not has_up and not has_down:
-                continue
-            orphans_found += 1
-            filled_side = "UP" if has_up else "DOWN"
-            fills = sides[filled_side]
-            total_shares = sum(f.get("size", f.get("shares", 0)) for f in fills)
-            if total_shares < 1.0:
-                continue
-            # Get the token for the filled side
-            tokens = self.engine.window_fill_tokens.get(wid, {})
-            fill_token = tokens.get(filled_side)
-            if not fill_token:
-                market = self.engine._market_cache.get(wid)
-                if market:
-                    fill_token = market["token_up"] if filled_side == "UP" else market["token_down"]
-            if not fill_token:
-                self.logger.info(
-                    "  SHUTDOWN ORPHAN | {} | {} {:.1f} shares | No token found, skipping".format(
-                        wid, filled_side, total_shares))
-                continue
-            # Get current bid for the filled side
-            spread = self.book_reader.get_spread(fill_token)
-            if not spread or spread["bid"] <= 0.02:
-                self.logger.info(
-                    "  SHUTDOWN ORPHAN | {} | {} {:.1f} shares | No bid, skipping".format(
-                        wid, filled_side, total_shares))
-                continue
-            current_bid = spread["bid"]
-            avg_cost = sum(f.get("price", 0) * f.get("size", f.get("shares", 0))
-                          for f in fills) / total_shares if total_shares > 0 else 0
-            pnl = (current_bid - avg_cost) * total_shares
-            self.logger.info(
-                "  SHUTDOWN ORPHAN SELL | {} | {} {:.1f} shares @ bid ${:.2f} | "
-                "Avg cost ${:.3f} | Est P&L ${:+.2f}".format(
-                    wid, filled_side, total_shares, current_bid, avg_cost, pnl))
-            try:
-                result = self.engine.place_order(
-                    fill_token, "SELL", current_bid, total_shares,
-                    wid, "SHUTDOWN-ORPHAN", "mm", is_taker=True)
-                if result:
-                    orphans_sold += 1
-                    self.logger.info(
-                        "  SHUTDOWN ORPHAN SOLD | {} | {} {:.1f} shares".format(
-                            wid, filled_side, total_shares))
-                else:
-                    self.logger.warning(
-                        "  SHUTDOWN ORPHAN SELL FAILED | {} | Order rejected".format(wid))
-            except Exception as e:
-                self.logger.warning(
-                    "  SHUTDOWN ORPHAN SELL ERROR | {} | {}".format(wid, str(e)[:100]))
-        if orphans_found > 0:
-            self.logger.info(
-                "  SHUTDOWN ORPHAN SUMMARY | Found {} orphans | Sold {}".format(
-                    orphans_found, orphans_sold))
-        else:
-            self.logger.info("  SHUTDOWN | No orphan positions to recover")
 
     def _process_immediate_pair_completions(self):
         if not self.config.immediate_pair_completion:
