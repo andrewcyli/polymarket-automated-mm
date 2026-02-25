@@ -559,6 +559,7 @@ class PolyMakerBot(PolymarketBot):
             claims_completed=claim_stats.get("claimed_total", 0),
             total_claimed_usd=claim_stats.get("total_claimed_usd", 0),
             claims_pending=claim_stats.get("pending_claims", 0),
+            hedge_analytics=stats.get("hedge_analytics"),
         )
 
     def _push_final_metrics(self, status="completed"):
@@ -601,6 +602,7 @@ class PolyMakerBot(PolymarketBot):
             claims_completed=claim_stats.get("claimed_total", 0),
             total_claimed_usd=claim_stats.get("total_claimed_usd", 0),
             claims_pending=claim_stats.get("pending_claims", 0),
+            hedge_analytics=stats.get("hedge_analytics"),
         )
 
     def run(self):

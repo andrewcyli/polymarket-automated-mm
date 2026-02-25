@@ -1550,6 +1550,16 @@ class AutoMerger:
                 self.logger.info(
                     "  MERGED OK | {} | {:.1f} shares -> ~${:.2f} USDC returned".format(
                         wid, mergeable, mergeable))
+                # V15.1-25: Track merge analytics
+                if self.engine:
+                    self.engine.hedge_analytics["resolved_by_merge"] += 1
+                    asset = wid.split("-")[0] if "-" in wid else "unknown"
+                    if asset not in self.engine.hedge_analytics["per_asset"]:
+                        self.engine.hedge_analytics["per_asset"][asset] = {
+                            "one_sided": 0, "hedges": 0, "exits": 0,
+                            "merges": 0, "abandoned": 0
+                        }
+                    self.engine.hedge_analytics["per_asset"][asset]["merges"] += 1
             else:
                 self.merges_failed += 1
                 cycle_fails += 1
@@ -2390,6 +2400,22 @@ class TradingEngine:
         self._market_cache = {}
         self.hedges_completed = 0
         self.hedges_skipped = 0
+        # V15.1-25: Hedge & exit analytics tracker
+        self.hedge_analytics = {
+            "one_sided_fills": 0,       # Total one-sided fills detected
+            "resolved_by_hedge": 0,     # Completed via hedge (any tier)
+            "resolved_by_exit": 0,      # Completed via momentum exit sell
+            "resolved_by_merge": 0,     # Completed via merge (both sides filled naturally)
+            "resolved_abandoned": 0,    # Abandoned (expired without resolution)
+            "tier_counts": {"t1": 0, "t2": 0, "t3": 0},  # Hedge completions per tier
+            "tier_costs": {"t1": [], "t2": [], "t3": []},  # Combined cost per hedge per tier
+            "tier_times": {"t1": [], "t2": [], "t3": []},  # Seconds to complete per tier
+            "exit_profits": [],          # Profit per momentum exit (sell_price - buy_cost)
+            "exit_hold_times": [],       # Hold time in seconds for each momentum exit
+            "gate_blocks": 0,           # Total momentum gate blocks
+            "gate_bypasses": 0,         # Total momentum gate bypasses
+            "per_asset": {},            # Per-asset breakdown {asset: {hedges, exits, merges, abandoned}}
+        }
         self.estimated_rewards_total = 0.0
         self.reward_snapshots = []
         self.window_edge = {}
@@ -2942,6 +2968,15 @@ class TradingEngine:
                                     "filled_token": fill_token,
                                     "time": time.time(),
                                 })
+                                # V15.1-25: Track one-sided fill for analytics
+                                self.hedge_analytics["one_sided_fills"] += 1
+                                asset = wid.split("-")[0] if "-" in wid else "unknown"
+                                if asset not in self.hedge_analytics["per_asset"]:
+                                    self.hedge_analytics["per_asset"][asset] = {
+                                        "one_sided": 0, "hedges": 0, "exits": 0,
+                                        "merges": 0, "abandoned": 0
+                                    }
+                                self.hedge_analytics["per_asset"][asset]["one_sided"] += 1
                         filled += 1
                         tag = "REST-RECOVERED" if recovered else "REST"
                         self.logger.info("  FILL [{}] | {} {} {:.1f} @ ${:.2f} | {}".format(
@@ -3023,6 +3058,15 @@ class TradingEngine:
                 if time_remaining <= 0:
                     self._pending_hedges.remove(hedge)
                     self.hedges_skipped += 1
+                    # V15.1-25: Track abandoned hedge
+                    self.hedge_analytics["resolved_abandoned"] += 1
+                    asset = wid.split("-")[0] if "-" in wid else "unknown"
+                    if asset not in self.hedge_analytics["per_asset"]:
+                        self.hedge_analytics["per_asset"][asset] = {
+                            "one_sided": 0, "hedges": 0, "exits": 0,
+                            "merges": 0, "abandoned": 0
+                        }
+                    self.hedge_analytics["per_asset"][asset]["abandoned"] += 1
                 continue
 
             other_ask = spread["ask"]
@@ -3053,6 +3097,15 @@ class TradingEngine:
                         max_other_price, total_cost, tier_max_cost, pct_remaining))
                 self._pending_hedges.remove(hedge)
                 self.hedges_skipped += 1
+                # V15.1-25: Track abandoned hedge (price cap)
+                self.hedge_analytics["resolved_abandoned"] += 1
+                asset = wid.split("-")[0] if "-" in wid else "unknown"
+                if asset not in self.hedge_analytics["per_asset"]:
+                    self.hedge_analytics["per_asset"][asset] = {
+                        "one_sided": 0, "hedges": 0, "exits": 0,
+                        "merges": 0, "abandoned": 0
+                    }
+                self.hedge_analytics["per_asset"][asset]["abandoned"] += 1
                 continue
 
             if profit_per_share < self.config.hedge_min_profit_per_share:
@@ -3065,6 +3118,15 @@ class TradingEngine:
                         total_cost, profit_per_share, self.config.hedge_min_profit_per_share))
                 self._pending_hedges.remove(hedge)
                 self.hedges_skipped += 1
+                # V15.1-25: Track abandoned hedge (low profit)
+                self.hedge_analytics["resolved_abandoned"] += 1
+                asset = wid.split("-")[0] if "-" in wid else "unknown"
+                if asset not in self.hedge_analytics["per_asset"]:
+                    self.hedge_analytics["per_asset"][asset] = {
+                        "one_sided": 0, "hedges": 0, "exits": 0,
+                        "merges": 0, "abandoned": 0
+                    }
+                self.hedge_analytics["per_asset"][asset]["abandoned"] += 1
                 continue
 
             size = filled_size
@@ -3081,6 +3143,20 @@ class TradingEngine:
             if result:
                 completed += 1
                 self.hedges_completed += 1
+                # V15.1-25: Track hedge tier analytics
+                tier_key = "t{}".format(active_tier_idx + 1)
+                self.hedge_analytics["resolved_by_hedge"] += 1
+                self.hedge_analytics["tier_counts"][tier_key] += 1
+                self.hedge_analytics["tier_costs"][tier_key].append(total_cost)
+                elapsed = time.time() - hedge["time"]
+                self.hedge_analytics["tier_times"][tier_key].append(elapsed)
+                asset = wid.split("-")[0] if "-" in wid else "unknown"
+                if asset not in self.hedge_analytics["per_asset"]:
+                    self.hedge_analytics["per_asset"][asset] = {
+                        "one_sided": 0, "hedges": 0, "exits": 0,
+                        "merges": 0, "abandoned": 0
+                    }
+                self.hedge_analytics["per_asset"][asset]["hedges"] += 1
             self._pending_hedges.remove(hedge)
         return completed
 
@@ -3225,6 +3301,18 @@ class TradingEngine:
                     cost = fill_price * sell_size
                     self.capital_in_positions = max(0, self.capital_in_positions - cost)
                     self._update_total_capital()
+                    # V15.1-25: Track momentum exit analytics
+                    exit_profit = (current_bid - fill_price) * sell_size
+                    self.hedge_analytics["resolved_by_exit"] += 1
+                    self.hedge_analytics["exit_profits"].append(exit_profit)
+                    self.hedge_analytics["exit_hold_times"].append(hold_secs)
+                    asset = wid.split("-")[0] if "-" in wid else "unknown"
+                    if asset not in self.hedge_analytics["per_asset"]:
+                        self.hedge_analytics["per_asset"][asset] = {
+                            "one_sided": 0, "hedges": 0, "exits": 0,
+                            "merges": 0, "abandoned": 0
+                        }
+                    self.hedge_analytics["per_asset"][asset]["exits"] += 1
                 else:
                     self.logger.warning(
                         "  MOM-EXIT SELL FAILED | {} | Sell order rejected, "
@@ -3375,6 +3463,41 @@ class TradingEngine:
         self.total_exposure = sum(self.window_exposure.values())
         self._update_total_capital()
 
+    def _get_hedge_analytics_summary(self):
+        """V15.1-25: Build a summary of hedge/exit analytics for CC reporting."""
+        ha = self.hedge_analytics
+        # Compute averages for tier costs and times
+        summary = {
+            "one_sided_fills": ha["one_sided_fills"],
+            "resolved_by_hedge": ha["resolved_by_hedge"],
+            "resolved_by_exit": ha["resolved_by_exit"],
+            "resolved_by_merge": ha["resolved_by_merge"],
+            "resolved_abandoned": ha["resolved_abandoned"],
+            "gate_blocks": ha["gate_blocks"],
+            "gate_bypasses": ha["gate_bypasses"],
+            "tier_counts": ha["tier_counts"],
+            "tier_avg_cost": {},
+            "tier_avg_time": {},
+            "exit_count": len(ha["exit_profits"]),
+            "exit_total_profit": sum(ha["exit_profits"]) if ha["exit_profits"] else 0,
+            "exit_avg_profit": (sum(ha["exit_profits"]) / len(ha["exit_profits"])) if ha["exit_profits"] else 0,
+            "exit_avg_hold_time": (sum(ha["exit_hold_times"]) / len(ha["exit_hold_times"])) if ha["exit_hold_times"] else 0,
+            "per_asset": ha["per_asset"],
+        }
+        for tier in ["t1", "t2", "t3"]:
+            costs = ha["tier_costs"][tier]
+            times = ha["tier_times"][tier]
+            summary["tier_avg_cost"][tier] = (sum(costs) / len(costs)) if costs else 0
+            summary["tier_avg_time"][tier] = (sum(times) / len(times)) if times else 0
+        # Resolution rate
+        total_resolved = ha["resolved_by_hedge"] + ha["resolved_by_exit"] + ha["resolved_by_merge"]
+        total_one_sided = ha["one_sided_fills"] or 1
+        summary["resolution_rate"] = total_resolved / total_one_sided
+        summary["hedge_vs_exit_ratio"] = (
+            ha["resolved_by_hedge"] / max(1, ha["resolved_by_exit"])
+        ) if ha["resolved_by_exit"] > 0 else float('inf') if ha["resolved_by_hedge"] > 0 else 0
+        return summary
+
     def get_stats(self):
         pnl_data = self.get_live_pnl()  # V15.1-20: now returns dict or None
         # Backward-compat: extract scalar live_pnl for existing consumers
@@ -3424,6 +3547,7 @@ class TradingEngine:
             "session_realized_returns": self.session_realized_returns,
             "session_realized_cost": self.session_realized_cost,
             "session_realized_pnl": self.session_realized_returns - self.session_realized_cost,
+            "hedge_analytics": self._get_hedge_analytics_summary(),
         }
 
 
@@ -3809,6 +3933,8 @@ class MarketMakingStrategy:
                 self.logger.info(
                     "  MOMENTUM GATE | {} | Mom: {:+.3f}% > {:.3f}%{} | Skipping MM".format(
                         window_id, momentum * 100, effective_threshold * 100, bypass_str))
+                # V15.1-25: Track gate block analytics
+                self.hedge_analytics["gate_blocks"] += 1
                 return
             else:
                 if bypassed:
@@ -3817,6 +3943,8 @@ class MarketMakingStrategy:
                         "Consecutive blocks: {} | Allowing MM".format(
                             window_id, momentum * 100, effective_threshold * 100,
                             self.config.momentum_gate_threshold * 100, consec))
+                    # V15.1-25: Track gate bypass analytics
+                    self.hedge_analytics["gate_bypasses"] += 1
                 # Reset counter on pass
                 self._gate_block_count[asset] = 0
         # V15.1-19 Filter C: Spread Symmetry — skip if UP/DN spreads diverge too much

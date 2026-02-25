@@ -226,6 +226,7 @@ class PolyMakerClient:
             "total_claimed_usd": "totalClaimedUsd",
             "claims_pending": "claimsPending",
             "position_value": "positionValue",
+            "hedge_analytics": "hedgeAnalytics",
         }
         data: Dict[str, Any] = {"runId": rid}
         for k, v in metrics.items():
@@ -277,6 +278,7 @@ class PolyMakerClient:
             "claims_completed": "claimsCompleted",
             "total_claimed_usd": "totalClaimedUsd",
             "claims_pending": "claimsPending",
+            "hedge_analytics": "hedgeAnalytics",
         }
         data: Dict[str, Any] = {"runId": rid, "status": status}
         if error_message:
