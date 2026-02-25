@@ -1110,26 +1110,11 @@ class PolyMakerBot(PolymarketBot):
                             self._loss_stop_until = now + self.config.hard_loss_cooloff
                             trading_halted = True
 
-                # V15.1-30: CC pause control — skip new orders AND cancel existing
+                # V15.1-30: CC pause control — stop new order placement only.
+                # Existing orders are LEFT on the book so pending pairs can
+                # complete naturally (cancelling them would orphan filled sides).
                 if getattr(self.config, 'pause_orders', False):
                     trading_halted = True
-                    # On first pause cycle, cancel all active orders to prevent
-                    # late fills creating orphans while paused
-                    if not getattr(self, '_pause_orders_cancelled', False):
-                        try:
-                            active_count = len(self.engine.active_orders)
-                            if active_count > 0:
-                                self.engine.cancel_all()
-                                self.logger.info(
-                                    "  PAUSE CANCEL | Cancelled {} active orders on pause".format(
-                                        active_count))
-                            self._pause_orders_cancelled = True
-                        except Exception as e:
-                            self.logger.warning(
-                                "  PAUSE CANCEL ERROR | {}".format(str(e)[:100]))
-                else:
-                    # Reset flag when unpaused so next pause triggers cancel again
-                    self._pause_orders_cancelled = False
 
                 # ═══════════════════════════════════════════════════════════
                 # V15.1-22: PRIORITIZED MARKET SELECTION
