@@ -410,9 +410,14 @@ def setup_logging(level="INFO"):
 # -----------------------------------------------------------------
 
 PROXY_EXEC_ABI = json.loads("""[
-    {"inputs":[{"name":"to","type":"address"},{"name":"value","type":"uint256"},{"name":"data","type":"bytes"}],"name":"execute","outputs":[{"name":"","type":"bool"},{"name":"","type":"bytes"}],"stateMutability":"nonpayable","type":"function"},
-    {"inputs":[{"name":"to","type":"address"},{"name":"data","type":"bytes"}],"name":"exec","outputs":[{"name":"","type":"bool"},{"name":"","type":"bytes"}],"stateMutability":"nonpayable","type":"function"}
+    {"inputs":[{"name":"to","type":"address"},{"name":"value","type":"uint256"},{"name":"data","type":"bytes"},{"name":"operation","type":"uint8"},{"name":"safeTxGas","type":"uint256"},{"name":"baseGas","type":"uint256"},{"name":"gasPrice","type":"uint256"},{"name":"gasToken","type":"address"},{"name":"refundReceiver","type":"address"},{"name":"signatures","type":"bytes"}],"name":"execTransaction","outputs":[{"name":"success","type":"bool"}],"stateMutability":"payable","type":"function"},
+    {"inputs":[],"name":"nonce","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"inputs":[{"name":"to","type":"address"},{"name":"value","type":"uint256"},{"name":"data","type":"bytes"},{"name":"operation","type":"uint8"},{"name":"safeTxGas","type":"uint256"},{"name":"baseGas","type":"uint256"},{"name":"gasPrice","type":"uint256"},{"name":"gasToken","type":"address"},{"name":"refundReceiver","type":"address"},{"name":"_nonce","type":"uint256"}],"name":"getTransactionHash","outputs":[{"name":"","type":"bytes32"}],"stateMutability":"view","type":"function"},
+    {"inputs":[],"name":"getOwners","outputs":[{"name":"","type":"address[]"}],"stateMutability":"view","type":"function"},
+    {"inputs":[],"name":"getThreshold","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
 ]""")
+
+ZERO_ADDR = "0x0000000000000000000000000000000000000000"
 
 CTF_FULL_ABI = json.loads("""[
     {"inputs":[{"internalType":"address","name":"collateralToken","type":"address"},{"internalType":"bytes32","name":"parentCollectionId","type":"bytes32"},{"internalType":"bytes32","name":"conditionId","type":"bytes32"},{"internalType":"uint256[]","name":"indexSets","type":"uint256[]"}],"name":"redeemPositions","outputs":[],"stateMutability":"nonpayable","type":"function"},
@@ -1464,9 +1469,18 @@ class AutoMerger:
             return 0
         if self.config.dry_run:
             return self._simulate_merges(market_cache, token_holdings)
+        # V15.1-23: Circuit breaker — skip all merges if last N consecutive
+        # attempts all failed (likely systemic issue like no gas).
+        # Reset when a merge succeeds or after a cooldown period.
+        if not hasattr(self, '_merge_consecutive_fails'):
+            self._merge_consecutive_fails = 0
+            self._merge_circuit_open_until = 0
+        if time.time() < self._merge_circuit_open_until:
+            return 0  # Circuit breaker is open, skip merges this cycle
         # Use live on-chain positions instead of fill-recorded token_holdings
         live_holdings = self.query_live_positions(market_cache)
         merged_count = 0
+        cycle_fails = 0
         window_holdings = self._find_mergeable(market_cache, live_holdings)
         for wid, info in window_holdings.items():
             mergeable = min(info["up_size"], info["down_size"])
@@ -1537,7 +1551,30 @@ class AutoMerger:
                         wid, mergeable, mergeable))
             else:
                 self.merges_failed += 1
-                self.logger.warning("  MERGE FAILED | {} | Will retry".format(wid))
+                cycle_fails += 1
+                self._merge_consecutive_fails += 1
+                self.logger.warning("  MERGE FAILED | {} | Consecutive fails: {}".format(
+                    wid, self._merge_consecutive_fails))
+                # V15.1-23: Circuit breaker — if 3 consecutive fails in this
+                # cycle, stop trying. If 5+ total consecutive fails, open
+                # circuit for 5 minutes (likely systemic issue).
+                if cycle_fails >= 3:
+                    self.logger.warning(
+                        "  MERGE CIRCUIT BREAKER | {} consecutive fails this cycle — "
+                        "stopping merges".format(cycle_fails))
+                    break
+                if self._merge_consecutive_fails >= 5:
+                    cooldown = 300  # 5 minutes
+                    self._merge_circuit_open_until = time.time() + cooldown
+                    self.logger.warning(
+                        "  MERGE CIRCUIT OPEN | {} consecutive fails total — "
+                        "pausing merges for {}s".format(
+                            self._merge_consecutive_fails, cooldown))
+                    break
+        if merged_count > 0:
+            # Reset circuit breaker on any success
+            self._merge_consecutive_fails = 0
+            self._merge_circuit_open_until = 0
         return merged_count
 
     def _simulate_merges(self, market_cache, token_holdings):
@@ -1668,131 +1705,110 @@ class AutoMerger:
             return False
 
     def _merge_via_proxy(self, ctf_addr, merge_data, window_id):
+        """Execute mergePositions through the Gnosis Safe proxy wallet.
+        V15.1-23: Rewritten to use Safe's execTransaction instead of broken execute/exec."""
         if not self.proxy_contract or not self.account:
             self.logger.warning("  MERGE SKIP | {} | No proxy_contract or account".format(window_id))
             return False
-        # V15.1-21: Check CTF approval status for proxy wallet before merge.
-        # mergePositions requires the caller (proxy) to have approval to move
-        # the CTF tokens. If proxy isn't approved, the tx will revert.
         proxy_addr = Web3.to_checksum_address(self.config.proxy_wallet)
-        try:
-            self.rpc_limiter.wait()
-            is_approved = self.ctf_contract.functions.isApprovedForAll(
-                proxy_addr, ctf_addr).call()
-            self.logger.info("  MERGE APPROVAL CHECK | {} | proxy={} approved_for_ctf={}".format(
-                window_id, proxy_addr[:10] + "...", is_approved))
-            if not is_approved:
-                # Try to set approval: proxy must approve CTF to manage its tokens
-                # This is done via the proxy's execute() function
-                self.logger.info("  MERGE | Setting CTF approval for proxy...")
-                approval_data = _encode_abi(
-                    self.ctf_contract, "setApprovalForAll",
-                    [ctf_addr, True])
-                success = self._proxy_exec_tx(
-                    ctf_addr, approval_data, window_id, "setApprovalForAll")
-                if not success:
-                    self.logger.warning("  MERGE | Failed to set CTF approval — merge will likely fail")
-                else:
-                    self.logger.info("  MERGE | CTF approval set successfully")
-        except Exception as e_check:
-            self.logger.info("  MERGE APPROVAL CHECK FAILED | {} | {}".format(
-                window_id, str(e_check)[:100]))
-        self.rpc_limiter.wait()
-        nonce = self.w3.eth.get_transaction_count(self.account.address)
-        gas_price = self.rpc_limiter.get_gas_price(self.w3)
-        for fn_name, fn_args_builder in [
-            ("execute", lambda: (ctf_addr, 0, bytes.fromhex(merge_data[2:]))),
-            ("exec", lambda: (ctf_addr, bytes.fromhex(merge_data[2:]))),
-        ]:
-            try:
-                fn = getattr(self.proxy_contract.functions, fn_name)
-                txn = fn(*fn_args_builder()).build_transaction({
-                    "from": self.account.address, "nonce": nonce,
-                    "gas": 350000, "gasPrice": int(gas_price * 1.3),
-                    "chainId": self.config.chain_id,
-                })
-                signed = self.w3.eth.account.sign_transaction(txn, self.config.private_key)
-                self.rpc_limiter.wait()
-                tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
-                if receipt.status == 1:
-                    self.logger.info("  MERGE TX OK | {} | {} | Tx: {}...".format(
-                        window_id, fn_name, self.w3.to_hex(tx_hash)[:20]))
-                    return True
-                else:
-                    # V15.1-21: Verbose revert logging — capture tx hash and gas used
-                    self.logger.warning(
-                        "  MERGE TX REVERTED | {} | {} | Tx: {} | Gas used: {} | "
-                        "Signer: {} | Proxy: {}".format(
-                            window_id, fn_name,
-                            self.w3.to_hex(tx_hash),
-                            receipt.gasUsed,
-                            self.account.address[:10] + "...",
-                            proxy_addr[:10] + "..."))
-            except Exception as e1:
-                err = str(e1)
-                err_lower = err.lower()
-                # V15.1-21: Verbose error logging for merge failures
-                self.logger.warning(
-                    "  MERGE TX ERROR | {} | {} | Signer: {} | Proxy: {} | Error: {}".format(
-                        window_id, fn_name,
-                        self.account.address[:10] + "...",
-                        proxy_addr[:10] + "...",
-                        err[:200]))
-                if "rate limit" in err_lower or "-32090" in err_lower:
-                    self.rpc_limiter.report_rate_limit(15)
-                    return False
-                self.rpc_limiter.wait()
-                try:
-                    nonce = self.w3.eth.get_transaction_count(self.account.address)
-                except Exception:
-                    return False
-        return False
+        inner_data = bytes.fromhex(merge_data[2:]) if merge_data.startswith("0x") else bytes.fromhex(merge_data)
+        return self._safe_exec_tx(ctf_addr, inner_data, window_id, "MERGE", gas_limit=350000)
 
     def _proxy_exec_tx(self, target_addr, call_data, window_id, label):
-        """Execute a transaction through the proxy wallet.
-        Used for approval and other setup transactions."""
+        """Execute a transaction through the Gnosis Safe proxy wallet.
+        V15.1-23: Rewritten to use Safe's execTransaction."""
         if not self.proxy_contract or not self.account:
             return False
+        inner_data = bytes.fromhex(call_data[2:]) if call_data.startswith("0x") else bytes.fromhex(call_data)
+        return self._safe_exec_tx(
+            Web3.to_checksum_address(target_addr), inner_data,
+            window_id, label, gas_limit=200000)
+
+    def _safe_exec_tx(self, target_addr, inner_data, window_id, label, gas_limit=350000):
+        """Execute a call through the Gnosis Safe proxy using execTransaction.
+        V15.1-23: Core Safe execution helper. Signs the Safe tx hash with the
+        owner key and submits via execTransaction.
+        
+        The Safe's execTransaction signature:
+          execTransaction(to, value, data, operation, safeTxGas, baseGas,
+                          gasPrice, gasToken, refundReceiver, signatures)
+        For a single-owner Safe with threshold=1, we sign the Safe tx hash
+        and pack it as r+s+v (65 bytes)."""
+        if not self.proxy_contract or not self.account:
+            return False
+        proxy_addr = Web3.to_checksum_address(self.config.proxy_wallet)
+        zero = Web3.to_checksum_address(ZERO_ADDR)
         try:
+            # 1. Get the Safe's internal nonce
             self.rpc_limiter.wait()
-            nonce = self.w3.eth.get_transaction_count(self.account.address)
+            safe_nonce = self.proxy_contract.functions.nonce().call()
+            # 2. Compute the Safe transaction hash on-chain
+            self.rpc_limiter.wait()
+            safe_tx_hash = self.proxy_contract.functions.getTransactionHash(
+                target_addr,   # to
+                0,             # value
+                inner_data,    # data
+                0,             # operation (CALL)
+                0,             # safeTxGas
+                0,             # baseGas
+                0,             # gasPrice (no refund)
+                zero,          # gasToken
+                zero,          # refundReceiver
+                safe_nonce     # _nonce
+            ).call()
+            # 3. Sign the hash with the owner's private key (eth_sign style)
+            #    Gnosis Safe expects an eth_sign signature: sign("\x19Ethereum Signed Message:\n32" + hash)
+            from eth_account.messages import defunct_hash_message
+            msg_hash = defunct_hash_message(primitive=safe_tx_hash)
+            signed_msg = self.w3.eth.account.sign_message(
+                msg_hash, private_key=self.config.private_key)
+            # Pack signature as r(32) + s(32) + v(1) with v += 4 for eth_sign
+            sig = (signed_msg.r.to_bytes(32, 'big') +
+                   signed_msg.s.to_bytes(32, 'big') +
+                   bytes([signed_msg.v + 4]))
+            # 4. Build and send the outer transaction calling execTransaction
+            self.rpc_limiter.wait()
+            eth_nonce = self.w3.eth.get_transaction_count(self.account.address)
             gas_price = self.rpc_limiter.get_gas_price(self.w3)
-            for fn_name, fn_args_builder in [
-                ("execute", lambda: (target_addr, 0, bytes.fromhex(call_data[2:]))),
-                ("exec", lambda: (target_addr, bytes.fromhex(call_data[2:]))),
-            ]:
-                try:
-                    fn = getattr(self.proxy_contract.functions, fn_name)
-                    txn = fn(*fn_args_builder()).build_transaction({
-                        "from": self.account.address, "nonce": nonce,
-                        "gas": 200000, "gasPrice": int(gas_price * 1.3),
-                        "chainId": self.config.chain_id,
-                    })
-                    signed = self.w3.eth.account.sign_transaction(txn, self.config.private_key)
-                    self.rpc_limiter.wait()
-                    tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-                    receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-                    if receipt.status == 1:
-                        self.logger.info("  PROXY TX OK | {} | {} | {}".format(
-                            label, fn_name, self.w3.to_hex(tx_hash)[:20]))
-                        return True
-                    else:
-                        self.logger.warning("  PROXY TX REVERTED | {} | {} | {}".format(
-                            label, fn_name, self.w3.to_hex(tx_hash)))
-                except Exception as e1:
-                    err = str(e1).lower()
-                    if "rate limit" in err or "-32090" in err:
-                        self.rpc_limiter.report_rate_limit(15)
-                        return False
-                    self.rpc_limiter.wait()
-                    try:
-                        nonce = self.w3.eth.get_transaction_count(self.account.address)
-                    except Exception:
-                        return False
+            txn = self.proxy_contract.functions.execTransaction(
+                target_addr, 0, inner_data, 0, 0, 0, 0, zero, zero, sig
+            ).build_transaction({
+                "from": self.account.address,
+                "nonce": eth_nonce,
+                "gas": gas_limit,
+                "gasPrice": int(gas_price * 1.3),
+                "chainId": self.config.chain_id,
+            })
+            signed_tx = self.w3.eth.account.sign_transaction(
+                txn, self.config.private_key)
+            self.rpc_limiter.wait()
+            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+            if receipt.status == 1:
+                self.logger.info("  SAFE TX OK | {} | {} | Tx: {} | Gas: {}".format(
+                    label, window_id, self.w3.to_hex(tx_hash)[:20], receipt.gasUsed))
+                return True
+            else:
+                self.logger.warning(
+                    "  SAFE TX REVERTED | {} | {} | Tx: {} | Gas: {} | "
+                    "Signer: {} | Proxy: {}".format(
+                        label, window_id,
+                        self.w3.to_hex(tx_hash), receipt.gasUsed,
+                        self.account.address[:10] + "...",
+                        proxy_addr[:10] + "..."))
+                return False
         except Exception as e:
-            self.logger.warning("  PROXY TX ERROR | {} | {}".format(label, str(e)[:100]))
-        return False
+            err = str(e)
+            err_lower = err.lower()
+            self.logger.warning(
+                "  SAFE TX ERROR | {} | {} | Signer: {} | Proxy: {} | Error: {}".format(
+                    label, window_id,
+                    self.account.address[:10] + "...",
+                    proxy_addr[:10] + "...",
+                    err[:200]))
+            if "rate limit" in err_lower or "-32090" in err_lower:
+                self.rpc_limiter.report_rate_limit(15)
+            return False
 
     def _merge_direct(self, ctf_addr, merge_data, window_id):
         if not self.account:
@@ -2090,59 +2106,19 @@ class AutoClaimManager:
                 self.logger.info("  BLIND REDEEM | {} | payoutDenominator check failed: {}".format(
                     window_id, str(e_denom)[:80]))
                 # Continue anyway — blind redeem is meant to try even without confirmation
-            # Try proxy wallet first, then direct
+            # V15.1-23: Try proxy wallet first using Safe execTransaction
             if self.proxy_contract and self.config.proxy_wallet:
                 redeem_data = _encode_abi(
                     self.ctf_contract, "redeemPositions",
                     [usdc_addr, parent, cid_bytes, [1, 2]])
                 ctf_addr = Web3.to_checksum_address(CTF_ADDRESS)
-                self.rpc_limiter.wait()
-                nonce = self.w3.eth.get_transaction_count(self.account.address)
-                gas_price = self.rpc_limiter.get_gas_price(self.w3)
-                for fn_name, fn_args_builder in [
-                    ("execute", lambda: (ctf_addr, 0, bytes.fromhex(redeem_data[2:]))),
-                    ("exec", lambda: (ctf_addr, bytes.fromhex(redeem_data[2:]))),
-                ]:
-                    try:
-                        fn = getattr(self.proxy_contract.functions, fn_name)
-                        txn = fn(*fn_args_builder()).build_transaction({
-                            "from": self.account.address, "nonce": nonce,
-                            "gas": 300000, "gasPrice": int(gas_price * 1.3),
-                            "chainId": self.config.chain_id,
-                        })
-                        signed = self.w3.eth.account.sign_transaction(txn, self.config.private_key)
-                        self.rpc_limiter.wait()
-                        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-                        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-                        if receipt.status == 1:
-                            self.blind_redeem_successes += 1
-                            self.logger.info("  BLIND REDEEM OK | {} | {} | Tx: {}...".format(
-                                window_id, fn_name, self.w3.to_hex(tx_hash)[:20]))
-                            return True
-                        else:
-                            self.logger.info("  BLIND REDEEM REVERTED | {} | {} | Tx: {}...".format(
-                                window_id, fn_name, self.w3.to_hex(tx_hash)[:20]))
-                            return False
-                    except Exception as e1:
-                        err = str(e1).lower()
-                        self.logger.info("  BLIND REDEEM FAIL | {} | {} | {}".format(
-                            window_id, fn_name, str(e1)[:100]))
-                        if "rate limit" in err or "-32090" in err:
-                            self.rpc_limiter.report_rate_limit(self._parse_rate_limit_delay(e1))
-                            return False
-                        if "revert" in err or "execution reverted" in err:
-                            # Try next fn_name variant
-                            try:
-                                self.rpc_limiter.wait()
-                                nonce = self.w3.eth.get_transaction_count(self.account.address)
-                            except Exception:
-                                return False
-                            continue
-                        try:
-                            self.rpc_limiter.wait()
-                            nonce = self.w3.eth.get_transaction_count(self.account.address)
-                        except Exception:
-                            return False
+                inner_data = bytes.fromhex(redeem_data[2:]) if redeem_data.startswith("0x") else bytes.fromhex(redeem_data)
+                success = self._safe_exec_tx(
+                    ctf_addr, inner_data, window_id, "BLIND-REDEEM", gas_limit=300000)
+                if success:
+                    self.blind_redeem_successes += 1
+                    self.logger.info("  BLIND REDEEM OK (safe) | {}".format(window_id))
+                    return True
             # V15.1-16: Fall back to direct redeem if no proxy or proxy failed
             return self._redeem_direct(condition_id, window_id)
         except Exception as e:
@@ -2220,6 +2196,8 @@ class AutoClaimManager:
             return False
 
     def _redeem_via_proxy(self, condition_id, window_id):
+        """Redeem positions through the Gnosis Safe proxy wallet.
+        V15.1-23: Rewritten to use Safe's execTransaction."""
         if not self.w3 or not self.proxy_contract or not self.account:
             return False
         if self.rpc_limiter.is_backed_off:
@@ -2232,42 +2210,17 @@ class AutoClaimManager:
                 self.ctf_contract, "redeemPositions",
                 [usdc_addr, parent, cid_bytes, [1, 2]])
             ctf_addr = Web3.to_checksum_address(CTF_ADDRESS)
-            self.rpc_limiter.wait()
-            nonce = self.w3.eth.get_transaction_count(self.account.address)
-            gas_price = self.rpc_limiter.get_gas_price(self.w3)
-            for fn_name, fn_args_builder in [
-                ("execute", lambda: (ctf_addr, 0, bytes.fromhex(redeem_data[2:]))),
-                ("exec", lambda: (ctf_addr, bytes.fromhex(redeem_data[2:]))),
-            ]:
-                try:
-                    fn = getattr(self.proxy_contract.functions, fn_name)
-                    txn = fn(*fn_args_builder()).build_transaction({
-                        "from": self.account.address, "nonce": nonce,
-                        "gas": 350000, "gasPrice": int(gas_price * 1.3),
-                        "chainId": self.config.chain_id,
-                    })
-                    signed = self.w3.eth.account.sign_transaction(txn, self.config.private_key)
-                    self.rpc_limiter.wait()
-                    tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-                    receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
-                    if receipt.status == 1:
-                        self.logger.info("  CLAIMED (proxy/{}) | {}".format(fn_name, window_id))
-                        return True
-                except Exception as e1:
-                    err = str(e1).lower()
-                    if "rate limit" in err or "-32090" in err:
-                        self.rpc_limiter.report_rate_limit(self._parse_rate_limit_delay(e1))
-                        return False
-                    self.rpc_limiter.wait()
-                    try:
-                        nonce = self.w3.eth.get_transaction_count(self.account.address)
-                    except Exception:
-                        return False
-            return False
+            inner_data = bytes.fromhex(redeem_data[2:]) if redeem_data.startswith("0x") else bytes.fromhex(redeem_data)
+            success = self._safe_exec_tx(
+                ctf_addr, inner_data, window_id, "REDEEM", gas_limit=350000)
+            if success:
+                self.logger.info("  CLAIMED (proxy/safe) | {}".format(window_id))
+            return success
         except Exception as e:
             err = str(e).lower()
             if "rate limit" in err or "-32090" in err:
                 self.rpc_limiter.report_rate_limit(self._parse_rate_limit_delay(e))
+            self.logger.warning("  REDEEM PROXY ERROR | {} | {}".format(window_id, str(e)[:100]))
             return False
 
     def _fallback_sell(self, wid, info):
