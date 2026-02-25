@@ -2943,67 +2943,111 @@ class TradingEngine:
             return 0
         now = time.time()
         completed = 0
+        # V15.1-23: Tiered hedge pricing — progressively wider max cost as time passes.
+        # config.hedge_tiers is a list of (seconds_after_fill, max_combined_cost)
+        # sorted by seconds ascending. We pick the tier whose time threshold has been
+        # reached but don't remove from _pending_hedges until the last tier expires.
+        hedge_tiers = getattr(self.config, 'hedge_tiers', [
+            (30, 1.03), (60, 1.05), (120, 1.08)
+        ])
+        # Sort tiers by seconds ascending
+        hedge_tiers = sorted(hedge_tiers, key=lambda t: t[0])
+        last_tier_secs = hedge_tiers[-1][0] if hedge_tiers else 120
+
         for hedge in list(self._pending_hedges):
             wid = hedge["window_id"]
             filled_side = hedge["filled_side"]
             filled_price = hedge["filled_price"]
             filled_size = hedge["filled_size"]
-            if now - hedge["time"] < self.config.hedge_completion_delay:
+            elapsed = now - hedge["time"]
+
+            # Determine which tier applies based on elapsed time
+            active_tier = None
+            for tier_secs, tier_cost in hedge_tiers:
+                if elapsed >= tier_secs:
+                    active_tier = (tier_secs, tier_cost)
+            
+            # Not yet reached first tier — skip for now
+            if active_tier is None:
                 continue
-            self._pending_hedges.remove(hedge)
+
+            # Check if already paired
             sides = self.window_fill_sides.get(wid, {})
             other_side = "DOWN" if filled_side == "UP" else "UP"
             if other_side in sides and len(sides[other_side]) > 0:
+                self._pending_hedges.remove(hedge)
                 continue
+
             market = self._market_cache.get(wid)
             if not market:
+                # Past last tier with no market data — give up
+                if elapsed > last_tier_secs:
+                    self._pending_hedges.remove(hedge)
                 continue
+
             other_token = market["token_up"] if other_side == "UP" else market["token_down"]
             spread = book_reader.get_spread(other_token)
             if not spread:
-                self.hedges_skipped += 1
+                if elapsed > last_tier_secs:
+                    self._pending_hedges.remove(hedge)
+                    self.hedges_skipped += 1
                 continue
+
             other_ask = spread["ask"]
             fee_filled = self.fee_calc._interp_fee_per_share(filled_price)
             fee_other = self.fee_calc._interp_fee_per_share(other_ask)
             total_cost = filled_price + other_ask + fee_filled + fee_other
             profit_per_share = 1.0 - total_cost
+            tier_secs, tier_max_cost = active_tier
 
-            # V15.1-13: Two-tier hedge price check:
-            # 1) Hard cap: combined cost must not exceed hedge_max_combined_cost
-            # 2) Profit floor: must earn at least hedge_min_profit_per_share
-            # This replaces the old dynamic_threshold approach with a clearer model:
-            # "If I filled UP at 47c, max I'll pay for DOWN is (98c - 47c - fees) = ~49c"
-            max_other_price = self.config.hedge_max_combined_cost - filled_price - fee_filled - fee_other
+            # Check against the active tier's max combined cost
+            max_other_price = tier_max_cost - filled_price - fee_filled - fee_other
             if other_ask > max_other_price:
+                # If we haven't exhausted all tiers, keep waiting for next tier
+                if elapsed < last_tier_secs:
+                    self.logger.debug(
+                        "  HEDGE WAIT T{} | {} | {} ask ${:.2f} > max ${:.2f} | "
+                        "elapsed {:.0f}s < next tier".format(
+                            hedge_tiers.index(active_tier) + 1, wid,
+                            other_side, other_ask, max_other_price, elapsed))
+                    continue
+                # Past last tier — give up
                 self.logger.info(
-                    "  HEDGE PRICE CAP | {} | {} @ ${:.2f} | {} ask ${:.2f} > max ${:.2f} | "
-                    "Combined ${:.3f} > cap ${:.3f}".format(
+                    "  HEDGE PRICE CAP (ALL TIERS) | {} | {} @ ${:.2f} | {} ask ${:.2f} > max ${:.2f} | "
+                    "Combined ${:.3f} > T3 cap ${:.3f} | elapsed {:.0f}s".format(
                         wid, filled_side, filled_price, other_side, other_ask,
-                        max_other_price, total_cost, self.config.hedge_max_combined_cost))
+                        max_other_price, total_cost, tier_max_cost, elapsed))
+                self._pending_hedges.remove(hedge)
                 self.hedges_skipped += 1
                 continue
+
             if profit_per_share < self.config.hedge_min_profit_per_share:
+                if elapsed < last_tier_secs:
+                    continue
                 self.logger.info(
                     "  HEDGE LOW PROFIT | {} | {} @ ${:.2f} | {} ask ${:.2f} | "
                     "Pair ${:.3f} | Profit ${:.4f} < min ${:.3f}".format(
                         wid, filled_side, filled_price, other_side, other_ask,
                         total_cost, profit_per_share, self.config.hedge_min_profit_per_share))
+                self._pending_hedges.remove(hedge)
                 self.hedges_skipped += 1
                 continue
+
             size = filled_size
+            tier_label = "T{}".format(hedge_tiers.index(active_tier) + 1)
             profit_str = "${:+.3f}/sh".format(profit_per_share)
             self.logger.info(
-                "\n  HEDGE COMPLETE | {} | {} @ ${:.2f} | Buy {} @ ${:.2f} | "
-                "Pair: ${:.3f} | {} | {:.0f} shares".format(
-                    wid, filled_side, filled_price, other_side, other_ask,
-                    total_cost, profit_str, size))
+                "\n  HEDGE COMPLETE [{}] | {} | {} @ ${:.2f} | Buy {} @ ${:.2f} | "
+                "Pair: ${:.3f} | {} | {:.0f} shares | {:.0f}s elapsed".format(
+                    tier_label, wid, filled_side, filled_price, other_side, other_ask,
+                    total_cost, profit_str, size, elapsed))
             result = self.place_order(
                 other_token, "BUY", other_ask, size,
                 wid, "HEDGE-{}".format(other_side), "mm", is_taker=True)
             if result:
                 completed += 1
                 self.hedges_completed += 1
+            self._pending_hedges.remove(hedge)
         return completed
 
     def process_momentum_exits(self, book_reader):

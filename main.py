@@ -206,12 +206,19 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     config.blind_redeem_enabled = True   # Try redeem even before resolution confirmed
     config.immediate_pair_completion = False  # Not needed with Option C skip
     # V15.1-13: Hedge completion — auto-buy other side after one side fills.
-    # Read from CC config, with sensible defaults.
+    # V15.1-23: Tiered hedge pricing — progressively wider max cost as time passes.
     config.hedge_completion_enabled = bool(cc_config.get("hedgeEnabled", True))
-    config.hedge_completion_delay = float(cc_config.get("hedgeDelay", 3.0))
-    config.hedge_max_combined_cost = float(cc_config.get("hedgeMaxCost", 0.98))
     config.hedge_min_profit_per_share = float(cc_config.get("hedgeMinProfit", 0.005))
     config.hedge_max_loss_per_share = 0.02    # Legacy fallback threshold
+    # Tiered hedge: list of (seconds_after_fill, max_combined_cost)
+    config.hedge_tiers = [
+        (float(cc_config.get("hedgeTier1Secs", 30)), float(cc_config.get("hedgeTier1Cost", 1.03))),
+        (float(cc_config.get("hedgeTier2Secs", 60)), float(cc_config.get("hedgeTier2Cost", 1.05))),
+        (float(cc_config.get("hedgeTier3Secs", 120)), float(cc_config.get("hedgeTier3Cost", 1.08))),
+    ]
+    # Keep legacy fields for backward compat (use tier 1 as default)
+    config.hedge_completion_delay = config.hedge_tiers[0][0]
+    config.hedge_max_combined_cost = config.hedge_tiers[0][1]
 
     # V15.1-14: Momentum exit — sell one-sided fill if price rises >X%
     config.momentum_exit_enabled = bool(cc_config.get("momentumExitEnabled", True))
@@ -219,12 +226,17 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     config.momentum_exit_max_wait_secs = float(cc_config.get("momentumExitMaxWait", 120.0))
     config.momentum_exit_min_hold_secs = 10.0  # Fixed at 10s
 
+    # Pause control: CC can pause new order placement each cycle
+    config.pause_orders = bool(cc_config.get("pauseOrders", False))
+
     print(f"  Hedge: {'ON' if config.hedge_completion_enabled else 'OFF'} "
-          f"(delay={config.hedge_completion_delay}s, maxCost=${config.hedge_max_combined_cost:.2f}, "
+          f"(tiers: {', '.join(f'${t[1]:.2f}@{t[0]:.0f}s' for t in config.hedge_tiers)}, "
           f"minProfit=${config.hedge_min_profit_per_share:.3f})")
     print(f"  Momentum Exit: {'ON' if config.momentum_exit_enabled else 'OFF'} "
           f"(threshold={config.momentum_exit_threshold:.1%}, "
           f"maxWait={config.momentum_exit_max_wait_secs:.0f}s)")
+    if config.pause_orders:
+        print(f"  ⚠️  PAUSE ORDERS: enabled from CC — no new orders will be placed")
 
     # V15.1-19: Pre-entry filters for orphan reduction
     config.momentum_gate_threshold = float(cc_config.get("momentumGate", 0.003))
@@ -741,6 +753,29 @@ class PolyMakerBot(PolymarketBot):
             cycle += 1
             cc.increment_cycle()
             try:
+                # V15.1-24: Hot-reload config from CC every cycle.
+                # Reads pauseOrders, tiered hedge, and other tunable params.
+                if cycle % 5 == 0 and cc._is_ready():
+                    fresh_config = cc.get_config()
+                    if fresh_config:
+                        # Update only hot-reloadable params (not assets/bankroll)
+                        self.config.pause_orders = bool(fresh_config.get("pauseOrders", False))
+                        self.config.hedge_completion_enabled = bool(fresh_config.get("hedgeEnabled", True))
+                        self.config.hedge_min_profit_per_share = float(fresh_config.get("hedgeMinProfit", 0.005))
+                        self.config.hedge_tiers = [
+                            (float(fresh_config.get("hedgeTier1Secs", 30)), float(fresh_config.get("hedgeTier1Cost", 1.03))),
+                            (float(fresh_config.get("hedgeTier2Secs", 60)), float(fresh_config.get("hedgeTier2Cost", 1.05))),
+                            (float(fresh_config.get("hedgeTier3Secs", 120)), float(fresh_config.get("hedgeTier3Cost", 1.08))),
+                        ]
+                        self.config.momentum_exit_enabled = bool(fresh_config.get("momentumExitEnabled", True))
+                        self.config.momentum_exit_threshold = float(fresh_config.get("momentumExitThreshold", 0.03))
+                        self.config.momentum_exit_max_wait_secs = float(fresh_config.get("momentumExitMaxWait", 120.0))
+                        self.config.momentum_gate_threshold = float(fresh_config.get("momentumGate", 0.003))
+                        self.config.min_book_depth = float(fresh_config.get("minBookDepth", 5.0))
+                        self.config.max_spread_asymmetry = float(fresh_config.get("maxSpreadAsymmetry", 0.02))
+                        if self.config.pause_orders and cycle % 10 == 0:
+                            self.logger.info("  \u26a0\ufe0f  PAUSED from CC \u2014 no new orders this cycle")
+
                 self.engine.check_daily_reset()
                 self.engine.sync_exchange_balance()
                 self.engine.reset_cycle_counters()
@@ -983,6 +1018,25 @@ class PolyMakerBot(PolymarketBot):
                     if merged:
                         self.logger.info("  Sim-merged {} positions".format(merged))
 
+                # V15.1-24: Report active markets to CC for the Markets page
+                if cycle % 10 == 0 and cc._is_ready():
+                    try:
+                        market_report = []
+                        for wid, mkt in self.engine._market_cache.items():
+                            market_report.append({
+                                "tokenId": mkt.get("token_up", ""),
+                                "tokenIdDown": mkt.get("token_down", ""),
+                                "asset": mkt.get("asset", "?"),
+                                "window": mkt.get("window_duration", "15m"),
+                                "windowId": wid,
+                                "conditionId": mkt.get("condition_id", ""),
+                                "expiresAt": str(mkt.get("expiration", "")),
+                            })
+                        if market_report:
+                            cc.report_markets(market_report)
+                    except Exception as e:
+                        self.logger.debug("  Market report failed: {}".format(e))
+
                 if cycle % 5 == 0:
                     # V15.1-P4: Sync live on-chain positions to token_holdings.
                     # This ensures PnL calc uses real position data, not just
@@ -1042,6 +1096,10 @@ class PolyMakerBot(PolymarketBot):
                                     self.config.hard_loss_cooloff))
                             self._loss_stop_until = now + self.config.hard_loss_cooloff
                             trading_halted = True
+
+                # V15.1-24: CC pause control — skip new order placement
+                if getattr(self.config, 'pause_orders', False):
+                    trading_halted = True
 
                 # ═══════════════════════════════════════════════════════════
                 # V15.1-22: PRIORITIZED MARKET SELECTION
