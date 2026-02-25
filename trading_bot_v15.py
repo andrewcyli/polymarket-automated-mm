@@ -2525,16 +2525,30 @@ class TradingEngine:
                 sides = self.window_fill_sides.get(wid, {})
                 self.logger.info("  CLAIM QUEUED | {} | sides: {} | cost ${:.2f}".format(
                     wid, "+".join(sorted(sides.keys())) if sides else "?", fill_cost))
-            # V15.1-21: Only pop window_fill_sides if the window is paired
-            # (both sides filled) or has no fills. One-sided fills must be
-            # preserved for process_momentum_exits to act on them.
+            # V15.1-21/25: Only preserve window_fill_sides for momentum exit if:
+            # 1. The window is truly one-sided (only 1 side filled, not paired)
+            # 2. The window has NOT been merged (tokens still exist)
+            # 3. The window is NOT pending claim (merge already consumed tokens)
             sides = self.window_fill_sides.get(wid, {})
             is_one_sided = len(sides) == 1 and wid not in self.paired_windows
-            if not is_one_sided:
-                self.window_fill_sides.pop(wid, None)
+            was_merged = wid in self.expired_windows_pending_claim
+            if is_one_sided and not was_merged:
+                # Check actual token holdings — only preserve if tokens exist
+                side_fills = list(sides.values())[0] if sides else []
+                token_id = side_fills[0].get("token_id", "") if side_fills else ""
+                actual_held = self.token_holdings.get(token_id, {}).get("size", 0)
+                if actual_held >= 1.0:
+                    self.logger.info("  PRESERVING fill_sides for momentum exit | {} | sides: {} | held: {:.1f}".format(
+                        wid, "+".join(sorted(sides.keys())), actual_held))
+                else:
+                    self.logger.info("  CLEANUP fill_sides | {} | sides: {} | tokens already consumed (held={:.1f})".format(
+                        wid, "+".join(sorted(sides.keys())), actual_held))
+                    self.window_fill_sides.pop(wid, None)
+                    is_one_sided = False  # Allow cleanup below
             else:
-                self.logger.info("  PRESERVING fill_sides for momentum exit | {} | sides: {}".format(
-                    wid, "+".join(sorted(sides.keys()))))
+                if was_merged and is_one_sided:
+                    self.logger.info("  CLEANUP fill_sides | {} | window already merged".format(wid))
+                self.window_fill_sides.pop(wid, None)
             self._market_cache.pop(wid, None)
             # V15.1-15/21: Only release filled_windows if NOT one-sided
             # (one-sided fills need to stay locked for momentum exit)
@@ -3080,17 +3094,36 @@ class TradingEngine:
 
         This captures directional moves when the market trends in our favor
         instead of waiting indefinitely for the other side to fill.
+
+        V15.1-25 fixes:
+        - Skip windows that have been merged (tokens no longer exist)
+        - Check actual token_holdings before selling
+        - Adjust sell size to min(fill_size, actual_held)
+        - Retry with approval if CLOB rejects with 'not enough balance'
         """
         if not self.config.momentum_exit_enabled:
             return 0
         now = time.time()
         exits = 0
+        stale_wids = []  # Track windows to clean up
         for wid, sides in list(self.window_fill_sides.items()):
             # Only check windows with exactly one side filled (not paired)
             if wid in self.paired_windows:
                 continue
             if len(sides) != 1:
                 continue
+            # V15.1-25: Skip windows that have already been merged or claimed.
+            # After merge, the tokens are consumed — nothing left to sell.
+            if wid in self.expired_windows_pending_claim:
+                # Check if the merge already happened for this window
+                pending = self.expired_windows_pending_claim.get(wid, {})
+                tokens = pending.get("tokens", [])
+                # If there are tokens pending claim, the window was merged
+                if tokens:
+                    self.logger.info(
+                        "  MOM-EXIT SKIP | {} | Window already merged/pending claim".format(wid))
+                    stale_wids.append(wid)
+                    continue
             filled_side = list(sides.keys())[0]
             fills = sides[filled_side]
             if not fills:
@@ -3101,6 +3134,18 @@ class TradingEngine:
             fill_price = earliest_fill.get("price", 0)
             fill_size = sum(f.get("size", 0) for f in fills)
             fill_token = earliest_fill.get("token_id", "")
+            # V15.1-25: Check actual token holdings before attempting sell.
+            # Tokens may have been consumed by merge, claimed, or partially sold.
+            actual_held = self.token_holdings.get(fill_token, {}).get("size", 0)
+            if actual_held < 1.0:
+                # No tokens left — the position was already resolved (merged/claimed)
+                self.logger.info(
+                    "  MOM-EXIT SKIP | {} | {} | No tokens held (held={:.1f}, expected={:.1f})".format(
+                        wid, filled_side, actual_held, fill_size))
+                stale_wids.append(wid)
+                continue
+            # V15.1-25: Use actual held amount, not fill amount (may differ after partial merge)
+            sell_size = min(fill_size, actual_held)
             hold_secs = now - fill_time
             # Must hold for minimum time
             if hold_secs < self.config.momentum_exit_min_hold_secs:
@@ -3116,18 +3161,17 @@ class TradingEngine:
             price_change = (current_bid - fill_price) / fill_price if fill_price > 0 else 0
             if price_change >= self.config.momentum_exit_threshold:
                 # Price has risen enough — sell for profit
-                sell_profit = (current_bid - fill_price) * fill_size
-                fee_est = self.fee_calc._interp_fee_per_share(current_bid) * fill_size
+                sell_profit = (current_bid - fill_price) * sell_size
+                fee_est = self.fee_calc._interp_fee_per_share(current_bid) * sell_size
                 net_profit = sell_profit - fee_est
                 self.logger.info(
                     "\n  MOMENTUM EXIT | {} | {} {:.0f} @ ${:.2f} -> bid ${:.2f} | "
                     "Change: {:+.1%} | Gross ${:+.2f} | Net ${:+.2f} (after ~${:.2f} fees) | "
-                    "Held {:.0f}s".format(
-                        wid, filled_side, fill_size, fill_price, current_bid,
-                        price_change, sell_profit, net_profit, fee_est, hold_secs))
+                    "Held {:.0f}s{}".format(
+                        wid, filled_side, sell_size, fill_price, current_bid,
+                        price_change, sell_profit, net_profit, fee_est, hold_secs,
+                        " [adj from {:.0f}]".format(fill_size) if sell_size != fill_size else ""))
                 # V15.1-22: Cancel ALL remaining orders on this window.
-                # Collect opposite-side token IDs BEFORE cancelling so we can
-                # issue a batch cancel_market_orders as a safety net.
                 opposite_tokens = set()
                 for oid, oinfo in list(self.active_orders.items()):
                     if oinfo.get("window_id") == wid:
@@ -3139,10 +3183,6 @@ class TradingEngine:
                     "  MOM-EXIT CANCEL | {} | Cancelled {} orders | "
                     "Opposite tokens: {}".format(
                         wid, cancelled, list(opposite_tokens)))
-                # V15.1-22: Safety net — batch cancel on opposite-side token_ids.
-                # cancel_window_orders does individual cancel(oid) + batch cancel
-                # for the same window, but the opposite-side order may have been
-                # tracked under a slightly different state. Belt-and-suspenders:
                 if not self.config.dry_run and self.client and opposite_tokens:
                     for tid in opposite_tokens:
                         try:
@@ -3154,38 +3194,66 @@ class TradingEngine:
                             self.logger.warning(
                                 "  MOM-EXIT BATCH CANCEL FAIL | {} | {}".format(
                                     wid, str(e)[:100]))
-                # Place sell order as taker
+                # V15.1-25: Place sell order — retry once with approval if rejected
                 result = self.place_order(
-                    fill_token, "SELL", current_bid, fill_size,
+                    fill_token, "SELL", current_bid, sell_size,
                     wid, "MOM-EXIT", "mm", is_taker=True)
+                if not result and not self.config.dry_run and self.client:
+                    # Retry: the CLOB may need token approval for sells.
+                    # Try to set approval and retry once.
+                    try:
+                        self.logger.info(
+                            "  MOM-EXIT RETRY | {} | Attempting CLOB approval + retry".format(wid))
+                        self.client.set_allowances()
+                        import time as _time
+                        _time.sleep(2)  # Brief wait for approval to propagate
+                        result = self.place_order(
+                            fill_token, "SELL", current_bid, sell_size,
+                            wid, "MOM-EXIT-RETRY", "mm", is_taker=True)
+                    except Exception as e:
+                        self.logger.warning(
+                            "  MOM-EXIT APPROVAL FAIL | {} | {}".format(
+                                wid, str(e)[:100]))
                 if result:
                     exits += 1
-                    # Remove from fill tracking since we've exited
                     self.window_fill_sides.pop(wid, None)
                     self.window_fill_cost.pop(wid, None)
                     self.window_fill_tokens.pop(wid, None)
-                    # V15.1-19: Mark window as permanently closed after momentum exit
-                    # Keep in filled_windows AND add to closed_windows to block re-entry
                     self.closed_windows.add(wid)
-                    # V15.1-20: Release held_windows — capital recovered via CLOB sell
                     self.held_windows.discard(wid)
                     self.window_entry_count.pop(wid, None)
-                    # Update capital tracking
-                    cost = fill_price * fill_size
+                    cost = fill_price * sell_size
                     self.capital_in_positions = max(0, self.capital_in_positions - cost)
                     self._update_total_capital()
                 else:
-                    # Sell failed — log but still mark window as closed to prevent
-                    # re-entry. The position remains but no new orders will be placed.
                     self.logger.warning(
                         "  MOM-EXIT SELL FAILED | {} | Sell order rejected, "
-                        "position still held".format(wid))
-                    self.closed_windows.add(wid)
+                        "position still held (held={:.1f})".format(wid, actual_held))
+                    # V15.1-25: Don't permanently close on first failure — allow retry
+                    # next cycle. Only close after 3 consecutive failures.
+                    fail_key = "_mom_exit_fail_count"
+                    if not hasattr(self, fail_key):
+                        setattr(self, fail_key, {})
+                    fail_counts = getattr(self, fail_key)
+                    fail_counts[wid] = fail_counts.get(wid, 0) + 1
+                    if fail_counts[wid] >= 3:
+                        self.logger.warning(
+                            "  MOM-EXIT ABANDONED | {} | {} consecutive failures, "
+                            "closing window".format(wid, fail_counts[wid]))
+                        self.closed_windows.add(wid)
+                        stale_wids.append(wid)
+                        fail_counts.pop(wid, None)
             else:
                 self.logger.debug(
                     "  MOM CHECK | {} | {} @ ${:.2f} | bid ${:.2f} | {:+.1%} < {:.1%} | {:.0f}s".format(
                         wid, filled_side, fill_price, current_bid,
                         price_change, self.config.momentum_exit_threshold, hold_secs))
+        # V15.1-25: Clean up stale window_fill_sides for merged/claimed windows
+        for wid in stale_wids:
+            self.window_fill_sides.pop(wid, None)
+            self.window_fill_cost.pop(wid, None)
+            self.held_windows.discard(wid)
+            self.filled_windows.discard(wid)
         return exits
 
     def cancel_window_orders(self, window_id, strategy_filter=None):
