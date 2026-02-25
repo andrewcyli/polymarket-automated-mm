@@ -334,11 +334,22 @@ class BotConfig:
     momentum_exit_max_wait_secs: float = 120.0 # Max wait for hedge before checking momentum
 
     # V15.1-19: Pre-entry filters for orphan reduction
-    momentum_gate_threshold: float = 0.005   # Skip MM if |momentum| > 0.5%
+    momentum_gate_threshold: float = 0.002   # V15.1-29: Lowered from 0.5% to 0.2% to catch moves earlier
     momentum_gate_lookback: int = 5          # Lookback minutes for momentum gate
     momentum_gate_max_consec: int = 3         # After N consecutive blocks, relax threshold
+    # V15.1-29 Strategy 4: Asset-specific momentum scaling factors
+    # More volatile assets (SOL, XRP) get a higher multiplier so the effective
+    # threshold is proportional to their typical volatility.
+    momentum_gate_asset_scale: dict = field(default_factory=lambda: {
+        "btc": 1.0,   # BTC is the baseline
+        "eth": 1.2,   # ETH slightly more volatile
+        "sol": 1.8,   # SOL significantly more volatile
+        "xrp": 1.8,   # XRP significantly more volatile
+    })
     min_book_depth: float = 5.0              # Min $ depth within 2c of target price
     max_spread_asymmetry: float = 0.02       # Max spread difference between UP/DN
+    # V15.1-29: Midpoint directional filter — skip if UP midpoint deviates from 0.50
+    midpoint_skew_limit: float = 0.03         # Skip if |midpoint - 0.50| > this (0.03 = skip at 0.47/0.53)
     # V15.1-19: Session blackout windows (list of [start_hour_utc, end_hour_utc] pairs)
     trading_blackout_windows: list = field(default_factory=list)
 
@@ -3298,12 +3309,19 @@ class TradingEngine:
                     fill_token, "SELL", current_bid, sell_size,
                     wid, "MOM-EXIT", "mm", is_taker=True)
                 if not result and not self.config.dry_run and self.client:
-                    # Retry: the CLOB may need token approval for sells.
-                    # Try to set approval and retry once.
+                    # V15.1-29 Strategy 3: Fix approval retry — ClobClient has
+                    # update_balance_allowance(), not set_allowances().
+                    # Use CONDITIONAL asset type for CT token sells.
                     try:
                         self.logger.info(
                             "  MOM-EXIT RETRY | {} | Attempting CLOB approval + retry".format(wid))
-                        self.client.set_allowances()
+                        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                        self.client.update_balance_allowance(
+                            BalanceAllowanceParams(
+                                asset_type=AssetType.CONDITIONAL,
+                                token_id=fill_token,
+                            )
+                        )
                         import time as _time
                         _time.sleep(2)  # Brief wait for approval to propagate
                         result = self.place_order(
@@ -3961,6 +3979,45 @@ class MarketMakingStrategy:
         self._total_estimated_reward = 0.0
         self._gate_block_count = {}  # {asset: consecutive_block_count} — for momentum gate bypass
 
+    def _cancel_unpaired_on_momentum(self, asset, momentum):
+        """V15.1-29: Cancel active orders for windows of the same asset where
+        only one side (or no side) has filled. This prevents late fills from
+        creating orphan positions during directional moves."""
+        cancelled_windows = 0
+        for wid in list(self.engine.orders_by_window.keys()):
+            # Only target windows for the same asset
+            if not wid.startswith(asset + "-"):
+                continue
+            # Check fill state for this window
+            sides = self.engine.window_fill_sides.get(wid, {})
+            has_up = "UP" in sides
+            has_down = "DOWN" in sides
+            # Skip fully paired windows — both sides filled, merge will handle
+            if has_up and has_down:
+                continue
+            # Skip windows with no active orders
+            active_oids = [oid for oid in self.engine.orders_by_window.get(wid, [])
+                           if oid in self.engine.active_orders]
+            if not active_oids:
+                continue
+            # Cancel active orders for this unpaired window
+            n_cancelled = self.engine.cancel_window_orders(wid, strategy_filter="mm")
+            if n_cancelled > 0:
+                fill_str = "UP-only" if has_up else ("DOWN-only" if has_down else "no fills")
+                self.logger.info(
+                    "  MOM-GATE CANCEL | {} | {} | Mom: {:+.3f}% | "
+                    "Cancelled {} orders to prevent orphan".format(
+                        wid, fill_str, momentum * 100, n_cancelled))
+                cancelled_windows += 1
+                # Track analytics
+                if "gate_cancels" not in self.engine.hedge_analytics:
+                    self.engine.hedge_analytics["gate_cancels"] = 0
+                self.engine.hedge_analytics["gate_cancels"] += n_cancelled
+        if cancelled_windows > 0:
+            self.logger.info(
+                "  MOM-GATE CANCEL SUMMARY | {} | {} windows cleaned | "
+                "Mom: {:+.3f}%".format(asset, cancelled_windows, momentum * 100))
+
     def execute(self, market):
         asset = market["asset"]
         window_id = market["window_id"]
@@ -4063,12 +4120,15 @@ class MarketMakingStrategy:
         if (self.config.momentum_gate_threshold > 0 and momentum is not None):
             consec = self._gate_block_count.get(asset, 0)
             max_consec = self.config.momentum_gate_max_consec
-            effective_threshold = self.config.momentum_gate_threshold
+            # V15.1-29 Strategy 4: Asset-specific scaling — more volatile assets
+            # get a higher threshold so they aren't blocked too aggressively.
+            asset_scale = self.config.momentum_gate_asset_scale.get(asset, 1.0)
+            effective_threshold = self.config.momentum_gate_threshold * asset_scale
             bypassed = False
             if max_consec > 0 and consec >= max_consec:
                 # Relax threshold: double it for each consecutive bypass period
                 multiplier = 1 + (consec // max_consec)
-                effective_threshold = self.config.momentum_gate_threshold * (1 + multiplier * 0.5)
+                effective_threshold = self.config.momentum_gate_threshold * asset_scale * (1 + multiplier * 0.5)
                 bypassed = True
             if abs(momentum) > effective_threshold:
                 self._gate_block_count[asset] = consec + 1
@@ -4078,6 +4138,11 @@ class MarketMakingStrategy:
                         window_id, momentum * 100, effective_threshold * 100, bypass_str))
                 # V15.1-25: Track gate block analytics
                 self.engine.hedge_analytics["gate_blocks"] += 1
+                # V15.1-29 Strategy 1: Proactive cancel — when momentum gate fires,
+                # cancel active orders for same-asset windows that are NOT fully paired.
+                # This prevents the "lagging side" from filling after directional momentum
+                # is detected, which would create orphan positions.
+                self._cancel_unpaired_on_momentum(asset, momentum)
                 return
             else:
                 if bypassed:
@@ -4101,6 +4166,24 @@ class MarketMakingStrategy:
                         window_id, spread, dn_spread, spread_delta,
                         self.config.max_spread_asymmetry))
                 return
+        # V15.1-29 Strategy 2: Bid/ask midpoint directional filter
+        # When the UP token midpoint deviates significantly from 0.50, the market
+        # is pricing in a directional outcome. If mid > 0.53, UP is favored (DOWN
+        # fills easily but likely loses). If mid < 0.47, DOWN is favored (UP fills
+        # easily but likely loses). In both cases, skip to avoid one-sided fills
+        # that create orphan positions.
+        midpoint_skew_limit = getattr(self.config, 'midpoint_skew_limit', 0.03)
+        if midpoint_skew_limit > 0 and abs(midpoint - 0.50) > midpoint_skew_limit:
+            direction = "UP-favored" if midpoint > 0.50 else "DOWN-favored"
+            self.logger.info(
+                "  MIDPOINT FILTER | {} | Mid: {:.3f} | {} | "
+                "Skew {:.3f} > limit {:.3f} | Skipping to avoid orphan".format(
+                    window_id, midpoint, direction,
+                    abs(midpoint - 0.50), midpoint_skew_limit))
+            if "midpoint_skips" not in self.engine.hedge_analytics:
+                self.engine.hedge_analytics["midpoint_skips"] = 0
+            self.engine.hedge_analytics["midpoint_skips"] += 1
+            return
         # V15.1-12: Relaxed directional filter — CL-DN/CL-UP now only block
         # at STRONG confidence (>80%). At 60-80% (CL- prefix), the skew already
         # adjusts prices to favor the predicted side, which is sufficient protection.
@@ -4637,11 +4720,87 @@ class PolymarketBot:
             self.engine.cancel_all()
         except Exception:
             pass
+        # V15.1-29 Strategy 5: Orphan recovery at shutdown
+        # Sell one-sided (orphan) positions at market bid to avoid holding
+        # through resolution with only one side of a pair.
+        try:
+            self._shutdown_orphan_recovery()
+        except Exception as e:
+            self.logger.warning("  SHUTDOWN ORPHAN RECOVERY ERROR | {}".format(str(e)[:200]))
         self._print_summary("FINAL")
         self._print_claim_summary()
         self._print_v15_1_summary()
         self.logger.info("All orders cancelled. Exiting.")
         os._exit(0)
+
+    def _shutdown_orphan_recovery(self):
+        """V15.1-29: At shutdown, attempt to sell any one-sided (orphan) positions
+        at market bid. This prevents holding directional risk through resolution."""
+        orphans_found = 0
+        orphans_sold = 0
+        for wid, sides in list(self.engine.window_fill_sides.items()):
+            has_up = "UP" in sides and len(sides["UP"]) > 0
+            has_down = "DOWN" in sides and len(sides["DOWN"]) > 0
+            # Skip fully paired windows — merge will handle
+            if has_up and has_down:
+                continue
+            # Skip windows with no fills
+            if not has_up and not has_down:
+                continue
+            orphans_found += 1
+            filled_side = "UP" if has_up else "DOWN"
+            fills = sides[filled_side]
+            total_shares = sum(f.get("size", f.get("shares", 0)) for f in fills)
+            if total_shares < 1.0:
+                continue
+            # Get the token for the filled side
+            tokens = self.engine.window_fill_tokens.get(wid, {})
+            fill_token = tokens.get(filled_side)
+            if not fill_token:
+                market = self.engine._market_cache.get(wid)
+                if market:
+                    fill_token = market["token_up"] if filled_side == "UP" else market["token_down"]
+            if not fill_token:
+                self.logger.info(
+                    "  SHUTDOWN ORPHAN | {} | {} {:.1f} shares | No token found, skipping".format(
+                        wid, filled_side, total_shares))
+                continue
+            # Get current bid for the filled side
+            spread = self.book_reader.get_spread(fill_token)
+            if not spread or spread["bid"] <= 0.02:
+                self.logger.info(
+                    "  SHUTDOWN ORPHAN | {} | {} {:.1f} shares | No bid, skipping".format(
+                        wid, filled_side, total_shares))
+                continue
+            current_bid = spread["bid"]
+            avg_cost = sum(f.get("price", 0) * f.get("size", f.get("shares", 0))
+                          for f in fills) / total_shares if total_shares > 0 else 0
+            pnl = (current_bid - avg_cost) * total_shares
+            self.logger.info(
+                "  SHUTDOWN ORPHAN SELL | {} | {} {:.1f} shares @ bid ${:.2f} | "
+                "Avg cost ${:.3f} | Est P&L ${:+.2f}".format(
+                    wid, filled_side, total_shares, current_bid, avg_cost, pnl))
+            try:
+                result = self.engine.place_order(
+                    fill_token, "SELL", current_bid, total_shares,
+                    wid, "SHUTDOWN-ORPHAN", "mm", is_taker=True)
+                if result:
+                    orphans_sold += 1
+                    self.logger.info(
+                        "  SHUTDOWN ORPHAN SOLD | {} | {} {:.1f} shares".format(
+                            wid, filled_side, total_shares))
+                else:
+                    self.logger.warning(
+                        "  SHUTDOWN ORPHAN SELL FAILED | {} | Order rejected".format(wid))
+            except Exception as e:
+                self.logger.warning(
+                    "  SHUTDOWN ORPHAN SELL ERROR | {} | {}".format(wid, str(e)[:100]))
+        if orphans_found > 0:
+            self.logger.info(
+                "  SHUTDOWN ORPHAN SUMMARY | Found {} orphans | Sold {}".format(
+                    orphans_found, orphans_sold))
+        else:
+            self.logger.info("  SHUTDOWN | No orphan positions to recover")
 
     def _process_immediate_pair_completions(self):
         if not self.config.immediate_pair_completion:
