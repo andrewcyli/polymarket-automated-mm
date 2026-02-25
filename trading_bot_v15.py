@@ -2435,6 +2435,8 @@ class TradingEngine:
             "exit_hold_times": [],       # Hold time in seconds for each momentum exit
             "gate_blocks": 0,           # Total momentum gate blocks
             "gate_bypasses": 0,         # Total momentum gate bypasses
+            "orphan_recoveries": 0,     # V15.1-28: Orphans recovered via re-pairing
+            "orphan_sells": 0,          # V15.1-28: Orphans sold at market (fallback)
             "per_asset": {},            # Per-asset breakdown {asset: {hedges, exits, merges, abandoned}}
         }
         self.estimated_rewards_total = 0.0
@@ -3334,47 +3336,126 @@ class TradingEngine:
                             "merges": 0, "abandoned": 0
                         }
                     self.hedge_analytics["per_asset"][asset]["exits"] += 1
-                    # V15.1-27: Orphan detection — check if opposite side has tokens
-                    # from a late fill (order filled after cancel). If so, sell them.
+                    # V15.1-28: Orphan recovery — check if opposite side has tokens
+                    # from a late fill (order filled after cancel). Instead of selling
+                    # at a loss, try to BUY the missing side to re-pair for merge.
                     meta = self.window_metadata.get(wid, {})
                     opp_key = "token_down" if filled_side == "UP" else "token_up"
                     opp_token = meta.get(opp_key, "")
+                    # The missing side is the one we just sold via momentum exit
+                    missing_key = "token_up" if filled_side == "UP" else "token_down"
+                    missing_token = meta.get(missing_key, "")
                     if opp_token:
                         opp_held = self.token_holdings.get(opp_token, {}).get("size", 0)
                         if opp_held >= 1.0:
+                            # Orphan detected — decide: re-pair or sell
+                            opp_side_label = opp_key.replace("token_", "").upper()
+                            missing_side_label = missing_key.replace("token_", "").upper()
+                            # Check remaining time in window
+                            market_data = self._market_cache.get(wid)
+                            if market_data:
+                                window_end = market_data.get("end_time", 0)
+                            else:
+                                window_end = meta.get("end_time", 0)
+                            time_left = max(0, window_end - now)
+                            # Estimate orphan cost (use ask price as proxy if fill price unknown)
                             opp_spread = book_reader.get_spread(opp_token)
                             opp_bid = opp_spread["bid"] if opp_spread else 0
-                            if opp_bid > 0:
+                            # Check if we can re-pair profitably
+                            missing_spread = book_reader.get_spread(missing_token) if missing_token else None
+                            missing_ask = missing_spread["ask"] if missing_spread else 0
+                            # Max price for missing side: $1.00 - orphan_cost - min_margin
+                            # Use opp_bid as proxy for orphan cost (conservative)
+                            min_margin = 0.02  # $0.02 minimum profit per pair
+                            max_recovery_price = round(1.0 - opp_bid - min_margin, 2) if opp_bid > 0 else 0
+                            can_repair = (
+                                time_left >= 60  # At least 60s remaining
+                                and missing_token  # We know the missing token
+                                and missing_ask > 0  # There's liquidity
+                                and missing_ask <= max_recovery_price  # Profitable pair
+                            )
+                            if can_repair:
+                                # RE-PAIR: Buy the missing side to complete the pair
+                                recovery_price = min(missing_ask, max_recovery_price)
                                 self.logger.warning(
-                                    "  MOM-EXIT ORPHAN | {} | Opposite {} has {:.1f} tokens "
-                                    "(late fill?) | Selling @ bid ${:.2f}".format(
-                                        wid, opp_key.replace("token_", "").upper(),
-                                        opp_held, opp_bid))
-                                opp_result = self.place_order(
-                                    opp_token, "SELL", opp_bid, opp_held,
-                                    wid, "MOM-EXIT-ORPHAN", "mm", is_taker=True)
-                                if opp_result:
-                                    opp_cost = opp_held * opp_bid
-                                    self.capital_in_positions = max(0,
-                                        self.capital_in_positions - opp_cost)
+                                    "  ORPHAN RECOVERY | {} | {} has {:.1f} orphan tokens | "
+                                    "Buying {} @ ${:.2f} (ask ${:.2f}, max ${:.2f}) | "
+                                    "{:.0f}s remaining".format(
+                                        wid, opp_side_label, opp_held,
+                                        missing_side_label, recovery_price,
+                                        missing_ask, max_recovery_price, time_left))
+                                recovery_result = self.place_order(
+                                    missing_token, "BUY", recovery_price, opp_held,
+                                    wid, "ORPHAN-RECOVER", "mm", is_taker=True)
+                                if recovery_result:
+                                    # Re-open the window for merge pipeline
+                                    self.closed_windows.discard(wid)
+                                    self.held_windows.add(wid)
+                                    # Re-register fill sides so merge can find it
+                                    if wid not in self.window_fill_sides:
+                                        self.window_fill_sides[wid] = {}
+                                    self.window_fill_sides[wid][opp_side_label] = [{
+                                        "token_id": opp_token,
+                                        "price": opp_bid,  # best estimate
+                                        "size": opp_held,
+                                        "time": now,
+                                    }]
+                                    # The recovery buy will be tracked via normal fill detection
+                                    # and will add the missing side to window_fill_sides,
+                                    # triggering paired_windows and merge.
+                                    recovery_cost = recovery_price * opp_held
+                                    self.capital_in_positions += recovery_cost
                                     self._update_total_capital()
+                                    # Track analytics
+                                    self.hedge_analytics["orphan_recoveries"] += 1
                                     self.logger.info(
-                                        "  MOM-EXIT ORPHAN SOLD | {} | {} {:.1f} @ ${:.2f} "
-                                        "= ${:.2f}".format(
-                                            wid, opp_key.replace("token_", "").upper(),
-                                            opp_held, opp_bid, opp_cost))
+                                        "  ORPHAN RECOVERY PLACED | {} | BUY {} {:.1f} @ ${:.2f} "
+                                        "= ${:.2f} | Window re-opened for merge".format(
+                                            wid, missing_side_label, opp_held,
+                                            recovery_price, recovery_cost))
                                 else:
                                     self.logger.warning(
-                                        "  MOM-EXIT ORPHAN SELL FAILED | {} | {} {:.1f} "
-                                        "still held".format(
-                                            wid, opp_key.replace("token_", "").upper(),
-                                            opp_held))
-                            else:
-                                self.logger.warning(
-                                    "  MOM-EXIT ORPHAN | {} | Opposite {} has {:.1f} tokens "
-                                    "but no bid available".format(
-                                        wid, opp_key.replace("token_", "").upper(),
-                                        opp_held))
+                                        "  ORPHAN RECOVERY FAILED | {} | BUY {} rejected | "
+                                        "Falling back to sell {} at bid ${:.2f}".format(
+                                            wid, missing_side_label,
+                                            opp_side_label, opp_bid))
+                                    # Fall back to sell
+                                    can_repair = False
+                            if not can_repair:
+                                # SELL: Not enough time or can't re-pair profitably
+                                if opp_bid > 0:
+                                    reason = "no time" if time_left < 60 else (
+                                        "ask ${:.2f} > max ${:.2f}".format(missing_ask, max_recovery_price)
+                                        if missing_ask > max_recovery_price else "no liquidity")
+                                    self.logger.warning(
+                                        "  ORPHAN SELL | {} | {} {:.1f} tokens | "
+                                        "Selling @ bid ${:.2f} ({}) | {:.0f}s left".format(
+                                            wid, opp_side_label, opp_held,
+                                            opp_bid, reason, time_left))
+                                    opp_result = self.place_order(
+                                        opp_token, "SELL", opp_bid, opp_held,
+                                        wid, "ORPHAN-SELL", "mm", is_taker=True)
+                                    if opp_result:
+                                        opp_cost = opp_held * opp_bid
+                                        self.capital_in_positions = max(0,
+                                            self.capital_in_positions - opp_cost)
+                                        self._update_total_capital()
+                                        self.hedge_analytics["orphan_sells"] += 1
+                                        self.logger.info(
+                                            "  ORPHAN SOLD | {} | {} {:.1f} @ ${:.2f} "
+                                            "= ${:.2f}".format(
+                                                wid, opp_side_label,
+                                                opp_held, opp_bid, opp_cost))
+                                    else:
+                                        self.logger.warning(
+                                            "  ORPHAN SELL FAILED | {} | {} {:.1f} "
+                                            "still held".format(
+                                                wid, opp_side_label, opp_held))
+                                else:
+                                    self.logger.warning(
+                                        "  ORPHAN DETECTED | {} | {} {:.1f} tokens | "
+                                        "No bid available, holding".format(
+                                            wid, opp_side_label, opp_held))
                 else:
                     self.logger.warning(
                         "  MOM-EXIT SELL FAILED | {} | Sell order rejected, "

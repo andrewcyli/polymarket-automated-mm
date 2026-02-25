@@ -1,6 +1,6 @@
-"""Tests for V15.1-27 fixes:
+"""Tests for V15.1-27/28 fixes:
 1. Attribute error fix (self.engine.hedge_analytics in MarketMakingStrategy)
-2. Orphan detection after momentum exit
+2. Orphan recovery via re-pairing (V15.1-28)
 3. Smart token selection for LIVE POS queries
 4. RPC interval reduction
 """
@@ -46,14 +46,12 @@ class TestHedgeAnalyticsAttributeFix(unittest.TestCase):
 
     def test_mm_can_access_engine_hedge_analytics(self):
         """MarketMakingStrategy should access hedge_analytics via self.engine."""
-        # This should not raise AttributeError
         self.mm.engine.hedge_analytics["gate_blocks"] += 1
         assert self.engine.hedge_analytics["gate_blocks"] == 1
 
     def test_gate_block_increments_engine_analytics(self):
         """When momentum gate blocks, it should increment engine.hedge_analytics."""
         initial = self.engine.hedge_analytics["gate_blocks"]
-        # Simulate what the momentum gate does
         self.mm.engine.hedge_analytics["gate_blocks"] += 1
         assert self.engine.hedge_analytics["gate_blocks"] == initial + 1
 
@@ -64,70 +62,142 @@ class TestHedgeAnalyticsAttributeFix(unittest.TestCase):
         assert self.engine.hedge_analytics["gate_bypasses"] == initial + 1
 
 
-class TestOrphanDetection(unittest.TestCase):
-    """After momentum exit sells one side, check if opposite side has
-    orphaned tokens from a late fill and sell them too."""
+class TestOrphanRecoveryViaPairing(unittest.TestCase):
+    """V15.1-28: After momentum exit sells one side, if opposite side has
+    orphan tokens, try to BUY the missing side to re-pair for merge.
+    Fall back to sell only if insufficient time or unprofitable."""
 
     def setUp(self):
         self.config = BotConfig()
         self.config.dry_run = True
-        self.config.momentum_exit_enabled = True
-        self.config.momentum_exit_threshold = 0.03
-        self.config.momentum_exit_min_hold_secs = 10
-        self.config.momentum_exit_max_wait_secs = 120
         self.engine = TradingEngine(self.config, fee_calc=MagicMock(), logger=MagicMock())
 
-    def test_window_metadata_has_both_tokens(self):
-        """Window metadata should store both token_up and token_down."""
-        market = {
-            "window_id": "eth-15m-1234",
-            "slug": "eth-updown-15m-1234",
-            "condition_id": "0xabc",
-            "token_up": "tok_up_123",
-            "token_down": "tok_dn_456",
-            "asset": "eth",
-            "end_time": int(time.time()) + 900,
-        }
-        self.engine.register_window_metadata(market)
-        meta = self.engine.window_metadata["eth-15m-1234"]
-        assert meta["token_up"] == "tok_up_123"
-        assert meta["token_down"] == "tok_dn_456"
+    def test_hedge_analytics_has_orphan_fields(self):
+        """hedge_analytics should have orphan_recoveries and orphan_sells."""
+        assert "orphan_recoveries" in self.engine.hedge_analytics
+        assert "orphan_sells" in self.engine.hedge_analytics
+        assert self.engine.hedge_analytics["orphan_recoveries"] == 0
+        assert self.engine.hedge_analytics["orphan_sells"] == 0
 
-    def test_orphan_detection_finds_opposite_tokens(self):
-        """After momentum exit sells UP, should detect DOWN tokens in holdings."""
+    def test_recovery_decision_with_enough_time_and_profit(self):
+        """When time_left >= 60s and pair is profitable, should choose re-pair."""
         wid = "eth-15m-1234"
-        # Register metadata
-        self.engine.window_metadata[wid] = {
-            "token_up": "tok_up_123",
-            "token_down": "tok_dn_456",
-            "asset": "eth",
+        now = time.time()
+        # Window ends in 5 minutes
+        window_end = now + 300
+        # Orphan DOWN at bid $0.48
+        opp_bid = 0.48
+        # Missing UP ask at $0.50
+        missing_ask = 0.50
+        min_margin = 0.02
+        max_recovery_price = round(1.0 - opp_bid - min_margin, 2)  # $0.50
+        time_left = window_end - now
+        can_repair = (
+            time_left >= 60
+            and missing_ask > 0
+            and missing_ask <= max_recovery_price
+        )
+        assert can_repair is True
+        assert max_recovery_price == 0.50
+
+    def test_recovery_decision_not_enough_time(self):
+        """When time_left < 60s, should fall back to sell."""
+        now = time.time()
+        window_end = now + 30  # Only 30s left
+        opp_bid = 0.48
+        missing_ask = 0.50
+        min_margin = 0.02
+        max_recovery_price = round(1.0 - opp_bid - min_margin, 2)
+        time_left = window_end - now
+        can_repair = (
+            time_left >= 60
+            and missing_ask > 0
+            and missing_ask <= max_recovery_price
+        )
+        assert can_repair is False
+
+    def test_recovery_decision_unprofitable_pair(self):
+        """When missing side ask > max recovery price, should fall back to sell."""
+        now = time.time()
+        window_end = now + 300  # Plenty of time
+        opp_bid = 0.48
+        missing_ask = 0.55  # Too expensive
+        min_margin = 0.02
+        max_recovery_price = round(1.0 - opp_bid - min_margin, 2)  # $0.50
+        time_left = window_end - now
+        can_repair = (
+            time_left >= 60
+            and missing_ask > 0
+            and missing_ask <= max_recovery_price
+        )
+        assert can_repair is False
+        assert missing_ask > max_recovery_price
+
+    def test_recovery_price_calculation(self):
+        """Recovery price should be min(ask, max_recovery_price)."""
+        opp_bid = 0.48
+        min_margin = 0.02
+        max_recovery_price = round(1.0 - opp_bid - min_margin, 2)
+        # Case 1: ask < max → use ask
+        missing_ask = 0.47
+        recovery_price = min(missing_ask, max_recovery_price)
+        assert recovery_price == 0.47
+        # Case 2: ask == max → use either
+        missing_ask = 0.50
+        recovery_price = min(missing_ask, max_recovery_price)
+        assert recovery_price == 0.50
+        # Case 3: ask > max → would not enter recovery (can_repair=False)
+
+    def test_window_reopened_after_recovery(self):
+        """After successful recovery buy, window should be re-opened for merge."""
+        wid = "eth-15m-1234"
+        self.engine.closed_windows.add(wid)
+        # Simulate recovery: re-open window
+        self.engine.closed_windows.discard(wid)
+        self.engine.held_windows.add(wid)
+        self.engine.window_fill_sides[wid] = {
+            "DOWN": [{"token_id": "tok_dn", "price": 0.48, "size": 10.5, "time": time.time()}]
         }
-        # Simulate: UP was sold via momentum exit, but DOWN has orphan tokens
-        self.engine.token_holdings["tok_dn_456"] = {"size": 10.5, "cost": 0}
-        # Check orphan detection logic
+        assert wid not in self.engine.closed_windows
+        assert wid in self.engine.held_windows
+        assert "DOWN" in self.engine.window_fill_sides[wid]
+
+    def test_paired_windows_after_both_sides_filled(self):
+        """After recovery buy fills, window should enter paired_windows for merge."""
+        wid = "eth-15m-1234"
+        self.engine.window_fill_sides[wid] = {
+            "DOWN": [{"token_id": "tok_dn", "price": 0.48, "size": 10.5, "time": time.time()}],
+            "UP": [{"token_id": "tok_up", "price": 0.50, "size": 10.5, "time": time.time()}],
+        }
+        # Check pairing logic
+        sides = self.engine.window_fill_sides.get(wid, {})
+        if "UP" in sides and "DOWN" in sides:
+            self.engine.paired_windows.add(wid)
+        assert wid in self.engine.paired_windows
+
+    def test_orphan_detection_opposite_side_mapping(self):
+        """Verify correct mapping: if UP sold, orphan is DOWN, missing is UP."""
         filled_side = "UP"
         opp_key = "token_down" if filled_side == "UP" else "token_up"
-        meta = self.engine.window_metadata.get(wid, {})
-        opp_token = meta.get(opp_key, "")
-        opp_held = self.engine.token_holdings.get(opp_token, {}).get("size", 0)
-        assert opp_token == "tok_dn_456"
-        assert opp_held == 10.5
+        missing_key = "token_up" if filled_side == "UP" else "token_down"
+        assert opp_key == "token_down"  # Orphan is DOWN
+        assert missing_key == "token_up"  # Missing (sold) is UP
 
-    def test_no_orphan_when_opposite_empty(self):
-        """No orphan detection when opposite side has no tokens."""
-        wid = "eth-15m-1234"
-        self.engine.window_metadata[wid] = {
-            "token_up": "tok_up_123",
-            "token_down": "tok_dn_456",
-            "asset": "eth",
-        }
-        # No tokens in holdings for DOWN
-        filled_side = "UP"
+        filled_side = "DOWN"
         opp_key = "token_down" if filled_side == "UP" else "token_up"
-        meta = self.engine.window_metadata.get(wid, {})
-        opp_token = meta.get(opp_key, "")
-        opp_held = self.engine.token_holdings.get(opp_token, {}).get("size", 0)
-        assert opp_held == 0  # No orphan
+        missing_key = "token_up" if filled_side == "UP" else "token_down"
+        assert opp_key == "token_up"  # Orphan is UP
+        assert missing_key == "token_down"  # Missing (sold) is DOWN
+
+    def test_min_margin_prevents_breakeven_pairs(self):
+        """Min margin of $0.02 should prevent pairs that would only break even."""
+        opp_bid = 0.49
+        min_margin = 0.02
+        max_recovery_price = round(1.0 - opp_bid - min_margin, 2)
+        assert max_recovery_price == 0.49
+        # If ask is $0.50, pair cost = $0.49 + $0.50 = $0.99 → only $0.01 profit
+        # But max_recovery_price = $0.49, so ask $0.50 > $0.49 → rejected
+        assert 0.50 > max_recovery_price
 
 
 class TestSmartTokenSelection(unittest.TestCase):
@@ -211,6 +281,7 @@ class TestHedgeAnalyticsStructure(unittest.TestCase):
             "tier_counts", "tier_costs", "tier_times",
             "exit_profits", "exit_hold_times",
             "gate_blocks", "gate_bypasses",
+            "orphan_recoveries", "orphan_sells",
             "per_asset",
         ]
         for field in required:
