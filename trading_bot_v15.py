@@ -343,7 +343,7 @@ class BotConfig:
     trading_blackout_windows: list = field(default_factory=list)
 
     rpc_gas_cache_ttl: float = 30.0
-    rpc_min_call_interval: float = 1.5
+    rpc_min_call_interval: float = 0.5  # V15.1-27: Reduced from 1.5s (smart token selection means fewer calls)
 
     check_wallet_balance: bool = True
     wallet_balance_cache_ttl: float = 10.0
@@ -1396,9 +1396,10 @@ class AutoMerger:
         return raw[:32]
 
     def query_live_positions(self, market_cache):
-        """Query on-chain CTF balanceOf for all tokens in market_cache.
-        Returns dict {token_id: {"size": float, "cost": 0}} matching
-        the token_holdings format so _find_mergeable can use it directly.
+        """Query on-chain CTF balanceOf for tokens we care about.
+        V15.1-27: Only queries tokens for windows with fills, positions,
+        or pending claims — not ALL discovered tokens. This reduces RPC
+        calls from 160+ to ~20, cutting cycle time by 3-4 minutes.
         Falls back to engine.token_holdings if RPC is unavailable."""
         if not self.w3 or not self.ctf_contract:
             if self.engine:
@@ -1412,15 +1413,35 @@ class AutoMerger:
         wallet_addr = Web3.to_checksum_address(wallet)
         live = {}
         token_ids = set()
-        # Also check expired_windows_pending_claim and window_metadata
-        combined_cache = dict(market_cache)
+        # V15.1-27: Smart token selection — only query tokens we actually need:
+        # 1. Tokens with known holdings (from fills/hedges)
+        # 2. Tokens in windows pending claim/merge
+        # 3. Tokens in windows with active fills
+        # This avoids querying 160+ tokens when only ~20 matter.
+        relevant_wids = set()
         if self.engine:
-            for wid, info in self.engine.expired_windows_pending_claim.items():
-                if wid not in combined_cache:
-                    combined_cache[wid] = info
-            for wid, meta in self.engine.window_metadata.items():
-                if wid not in combined_cache:
-                    combined_cache[wid] = meta
+            # Windows with fills
+            relevant_wids.update(self.engine.window_fill_sides.keys())
+            # Windows pending claim
+            relevant_wids.update(self.engine.expired_windows_pending_claim.keys())
+            # Windows with held positions
+            relevant_wids.update(self.engine.held_windows)
+            # Paired windows (have both sides)
+            relevant_wids.update(self.engine.paired_windows)
+            # Also include tokens already in holdings (catch orphans)
+            for tid in self.engine.token_holdings:
+                if self.engine.token_holdings[tid].get("size", 0) >= 1.0:
+                    token_ids.add(tid)
+        # Build combined cache for relevant windows only
+        combined_cache = {}
+        for wid in relevant_wids:
+            if wid in market_cache:
+                combined_cache[wid] = market_cache[wid]
+            elif self.engine:
+                if wid in self.engine.expired_windows_pending_claim:
+                    combined_cache[wid] = self.engine.expired_windows_pending_claim[wid]
+                elif wid in self.engine.window_metadata:
+                    combined_cache[wid] = self.engine.window_metadata[wid]
         for wid, market in combined_cache.items():
             for key in ("token_up", "token_down"):
                 tid = market.get(key, "")
@@ -3313,6 +3334,47 @@ class TradingEngine:
                             "merges": 0, "abandoned": 0
                         }
                     self.hedge_analytics["per_asset"][asset]["exits"] += 1
+                    # V15.1-27: Orphan detection — check if opposite side has tokens
+                    # from a late fill (order filled after cancel). If so, sell them.
+                    meta = self.window_metadata.get(wid, {})
+                    opp_key = "token_down" if filled_side == "UP" else "token_up"
+                    opp_token = meta.get(opp_key, "")
+                    if opp_token:
+                        opp_held = self.token_holdings.get(opp_token, {}).get("size", 0)
+                        if opp_held >= 1.0:
+                            opp_spread = book_reader.get_spread(opp_token)
+                            opp_bid = opp_spread["bid"] if opp_spread else 0
+                            if opp_bid > 0:
+                                self.logger.warning(
+                                    "  MOM-EXIT ORPHAN | {} | Opposite {} has {:.1f} tokens "
+                                    "(late fill?) | Selling @ bid ${:.2f}".format(
+                                        wid, opp_key.replace("token_", "").upper(),
+                                        opp_held, opp_bid))
+                                opp_result = self.place_order(
+                                    opp_token, "SELL", opp_bid, opp_held,
+                                    wid, "MOM-EXIT-ORPHAN", "mm", is_taker=True)
+                                if opp_result:
+                                    opp_cost = opp_held * opp_bid
+                                    self.capital_in_positions = max(0,
+                                        self.capital_in_positions - opp_cost)
+                                    self._update_total_capital()
+                                    self.logger.info(
+                                        "  MOM-EXIT ORPHAN SOLD | {} | {} {:.1f} @ ${:.2f} "
+                                        "= ${:.2f}".format(
+                                            wid, opp_key.replace("token_", "").upper(),
+                                            opp_held, opp_bid, opp_cost))
+                                else:
+                                    self.logger.warning(
+                                        "  MOM-EXIT ORPHAN SELL FAILED | {} | {} {:.1f} "
+                                        "still held".format(
+                                            wid, opp_key.replace("token_", "").upper(),
+                                            opp_held))
+                            else:
+                                self.logger.warning(
+                                    "  MOM-EXIT ORPHAN | {} | Opposite {} has {:.1f} tokens "
+                                    "but no bid available".format(
+                                        wid, opp_key.replace("token_", "").upper(),
+                                        opp_held))
                 else:
                     self.logger.warning(
                         "  MOM-EXIT SELL FAILED | {} | Sell order rejected, "
@@ -3934,7 +3996,7 @@ class MarketMakingStrategy:
                     "  MOMENTUM GATE | {} | Mom: {:+.3f}% > {:.3f}%{} | Skipping MM".format(
                         window_id, momentum * 100, effective_threshold * 100, bypass_str))
                 # V15.1-25: Track gate block analytics
-                self.hedge_analytics["gate_blocks"] += 1
+                self.engine.hedge_analytics["gate_blocks"] += 1
                 return
             else:
                 if bypassed:
@@ -3944,7 +4006,7 @@ class MarketMakingStrategy:
                             window_id, momentum * 100, effective_threshold * 100,
                             self.config.momentum_gate_threshold * 100, consec))
                     # V15.1-25: Track gate bypass analytics
-                    self.hedge_analytics["gate_bypasses"] += 1
+                    self.engine.hedge_analytics["gate_bypasses"] += 1
                 # Reset counter on pass
                 self._gate_block_count[asset] = 0
         # V15.1-19 Filter C: Spread Symmetry — skip if UP/DN spreads diverge too much
