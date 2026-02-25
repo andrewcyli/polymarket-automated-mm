@@ -242,14 +242,15 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
         print(f"  ⚠️  PAUSE ORDERS: enabled from CC — no new orders will be placed")
 
     # V15.1-19: Pre-entry filters for orphan reduction
-    config.momentum_gate_threshold = float(cc_config.get("momentumGate", 0.003))
+    config.momentum_gate_threshold = float(cc_config.get("momentumGate", 0.005))
+    config.momentum_gate_max_consec = int(cc_config.get("momentumGateMaxConsec", 3))
     config.min_book_depth = float(cc_config.get("minBookDepth", 5.0))
     config.max_spread_asymmetry = float(cc_config.get("maxSpreadAsymmetry", 0.02))
     # Session blackout windows: list of [start_hour_utc, end_hour_utc] pairs
     blackout_raw = cc_config.get("tradingBlackoutWindows", [])
     config.trading_blackout_windows = blackout_raw if isinstance(blackout_raw, list) else []
 
-    print(f"  Pre-entry filters: MomGate={config.momentum_gate_threshold:.3f} | "
+    print(f"  Pre-entry filters: MomGate={config.momentum_gate_threshold:.3f} (bypass@{config.momentum_gate_max_consec}) | "
           f"MinDepth=${config.min_book_depth:.0f} | MaxSpreadAsym={config.max_spread_asymmetry:.3f}")
     if config.trading_blackout_windows:
         print(f"  Blackout windows: {config.trading_blackout_windows}")
@@ -773,7 +774,8 @@ class PolyMakerBot(PolymarketBot):
                         self.config.momentum_exit_enabled = bool(fresh_config.get("momentumExitEnabled", True))
                         self.config.momentum_exit_threshold = float(fresh_config.get("momentumExitThreshold", 0.03))
                         self.config.momentum_exit_max_wait_secs = float(fresh_config.get("momentumExitMaxWait", 120.0))
-                        self.config.momentum_gate_threshold = float(fresh_config.get("momentumGate", 0.003))
+                        self.config.momentum_gate_threshold = float(fresh_config.get("momentumGate", 0.005))
+                        self.config.momentum_gate_max_consec = int(fresh_config.get("momentumGateMaxConsec", 3))
                         self.config.min_book_depth = float(fresh_config.get("minBookDepth", 5.0))
                         self.config.max_spread_asymmetry = float(fresh_config.get("maxSpreadAsymmetry", 0.02))
                         if self.config.pause_orders and cycle % 10 == 0:

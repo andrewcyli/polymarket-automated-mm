@@ -334,8 +334,9 @@ class BotConfig:
     momentum_exit_max_wait_secs: float = 120.0 # Max wait for hedge before checking momentum
 
     # V15.1-19: Pre-entry filters for orphan reduction
-    momentum_gate_threshold: float = 0.003   # Skip MM if |momentum| > 0.3%
+    momentum_gate_threshold: float = 0.005   # Skip MM if |momentum| > 0.5%
     momentum_gate_lookback: int = 5          # Lookback minutes for momentum gate
+    momentum_gate_max_consec: int = 3         # After N consecutive blocks, relax threshold
     min_book_depth: float = 5.0              # Min $ depth within 2c of target price
     max_spread_asymmetry: float = 0.02       # Max spread difference between UP/DN
     # V15.1-19: Session blackout windows (list of [start_hour_utc, end_hour_utc] pairs)
@@ -3623,6 +3624,7 @@ class MarketMakingStrategy:
         self._window_first_placed = {}  # {window_id: timestamp} — when orders were first placed
         self._cycle_reward_estimates = []
         self._total_estimated_reward = 0.0
+        self._gate_block_count = {}  # {asset: consecutive_block_count} — for momentum gate bypass
 
     def execute(self, market):
         asset = market["asset"]
@@ -3722,12 +3724,33 @@ class MarketMakingStrategy:
         if not self.config.mm_enabled:
             return
         # V15.1-19 Filter A: Momentum Gate — skip if short-term momentum too strong
-        if (self.config.momentum_gate_threshold > 0 and momentum is not None
-                and abs(momentum) > self.config.momentum_gate_threshold):
-            self.logger.info(
-                "  MOMENTUM GATE | {} | Mom: {:+.3f}% > {:.3f}% | Skipping MM".format(
-                    window_id, momentum * 100, self.config.momentum_gate_threshold * 100))
-            return
+        # V15.1-P54: Bypass timer — after N consecutive blocks per asset, relax threshold
+        if (self.config.momentum_gate_threshold > 0 and momentum is not None):
+            consec = self._gate_block_count.get(asset, 0)
+            max_consec = self.config.momentum_gate_max_consec
+            effective_threshold = self.config.momentum_gate_threshold
+            bypassed = False
+            if max_consec > 0 and consec >= max_consec:
+                # Relax threshold: double it for each consecutive bypass period
+                multiplier = 1 + (consec // max_consec)
+                effective_threshold = self.config.momentum_gate_threshold * (1 + multiplier * 0.5)
+                bypassed = True
+            if abs(momentum) > effective_threshold:
+                self._gate_block_count[asset] = consec + 1
+                bypass_str = " (bypass={}, eff={:.3f}%)".format(consec + 1, effective_threshold * 100) if consec > 0 else ""
+                self.logger.info(
+                    "  MOMENTUM GATE | {} | Mom: {:+.3f}% > {:.3f}%{} | Skipping MM".format(
+                        window_id, momentum * 100, effective_threshold * 100, bypass_str))
+                return
+            else:
+                if bypassed:
+                    self.logger.info(
+                        "  MOMENTUM GATE BYPASS | {} | Mom: {:+.3f}% <= {:.3f}% (relaxed from {:.3f}%) | "
+                        "Consecutive blocks: {} | Allowing MM".format(
+                            window_id, momentum * 100, effective_threshold * 100,
+                            self.config.momentum_gate_threshold * 100, consec))
+                # Reset counter on pass
+                self._gate_block_count[asset] = 0
         # V15.1-19 Filter C: Spread Symmetry — skip if UP/DN spreads diverge too much
         if (self.config.max_spread_asymmetry > 0 and spread_down):
             dn_spread = spread_down.get("spread", 0)
