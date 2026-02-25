@@ -313,6 +313,11 @@ class BotConfig:
     hedge_max_combined_cost: float = 0.98     # V15.1-13: Max UP+DOWN+fees before rejecting hedge
     hedge_min_profit_per_share: float = 0.005 # V15.1-13: Min profit/share after fees to accept hedge
 
+    # V15.2-T4: Last Resort Sell — sell the filled side at market bid when all buy-tiers exhausted
+    hedge_t4_sell_pct: float = 5.0       # Trigger when <5% of window time remaining
+    hedge_t4_max_loss: float = 0.03      # Max loss per share allowed ($0.03 = 3c)
+    hedge_t4_enabled: bool = True        # Enable/disable T4 sell tier
+
     auto_claim_enabled: bool = True
     claim_delay_seconds: float = 30.0
     claim_check_interval: float = 15.0
@@ -1589,7 +1594,7 @@ class AutoMerger:
                     if asset not in self.engine.hedge_analytics["per_asset"]:
                         self.engine.hedge_analytics["per_asset"][asset] = {
                             "one_sided": 0, "hedges": 0, "exits": 0,
-                            "merges": 0, "abandoned": 0
+                            "merges": 0, "abandoned": 0, "t4_sells": 0
                         }
                     self.engine.hedge_analytics["per_asset"][asset]["merges"] += 1
             else:
@@ -2439,16 +2444,17 @@ class TradingEngine:
             "resolved_by_exit": 0,      # Completed via momentum exit sell
             "resolved_by_merge": 0,     # Completed via merge (both sides filled naturally)
             "resolved_abandoned": 0,    # Abandoned (expired without resolution)
-            "tier_counts": {"t1": 0, "t2": 0, "t3": 0},  # Hedge completions per tier
-            "tier_costs": {"t1": [], "t2": [], "t3": []},  # Combined cost per hedge per tier
-            "tier_times": {"t1": [], "t2": [], "t3": []},  # Seconds to complete per tier
+            "resolved_by_t4_sell": 0,   # V15.2-T4: Resolved via last-resort sell of filled side
+            "tier_counts": {"t1": 0, "t2": 0, "t3": 0, "t4": 0},  # Hedge completions per tier
+            "tier_costs": {"t1": [], "t2": [], "t3": [], "t4": []},  # Combined cost per hedge per tier
+            "tier_times": {"t1": [], "t2": [], "t3": [], "t4": []},  # Seconds to complete per tier
             "exit_profits": [],          # Profit per momentum exit (sell_price - buy_cost)
             "exit_hold_times": [],       # Hold time in seconds for each momentum exit
             "gate_blocks": 0,           # Total momentum gate blocks
             "gate_bypasses": 0,         # Total momentum gate bypasses
             "orphan_recoveries": 0,     # V15.1-28: Orphans recovered via re-pairing
             "orphan_sells": 0,          # V15.1-28: Orphans sold at market (fallback)
-            "per_asset": {},            # Per-asset breakdown {asset: {hedges, exits, merges, abandoned}}
+            "per_asset": {},            # Per-asset breakdown {asset: {hedges, exits, merges, abandoned, t4_sells}}
         }
         self.estimated_rewards_total = 0.0
         self.reward_snapshots = []
@@ -3008,7 +3014,7 @@ class TradingEngine:
                                 if asset not in self.hedge_analytics["per_asset"]:
                                     self.hedge_analytics["per_asset"][asset] = {
                                         "one_sided": 0, "hedges": 0, "exits": 0,
-                                        "merges": 0, "abandoned": 0
+                                        "merges": 0, "abandoned": 0, "t4_sells": 0
                                     }
                                 self.hedge_analytics["per_asset"][asset]["one_sided"] += 1
                         filled += 1
@@ -3098,7 +3104,7 @@ class TradingEngine:
                     if asset not in self.hedge_analytics["per_asset"]:
                         self.hedge_analytics["per_asset"][asset] = {
                             "one_sided": 0, "hedges": 0, "exits": 0,
-                            "merges": 0, "abandoned": 0
+                            "merges": 0, "abandoned": 0, "t4_sells": 0
                         }
                     self.hedge_analytics["per_asset"][asset]["abandoned"] += 1
                 continue
@@ -3123,7 +3129,102 @@ class TradingEngine:
                             other_side, other_ask, max_other_price,
                             pct_remaining, int(time_remaining)))
                     continue
-                # Past last tier or window expired — give up
+                # ── V15.2-T4: Last Resort Sell ──────────────────────────────
+                # All buy-tiers exhausted. Instead of abandoning, try to SELL
+                # the filled side at market bid to recover capital with minimal loss.
+                t4_pct = getattr(self.config, 'hedge_t4_sell_pct', 5.0)
+                t4_max_loss = getattr(self.config, 'hedge_t4_max_loss', 0.03)
+                t4_enabled = getattr(self.config, 'hedge_t4_enabled', True)
+                if t4_enabled and pct_remaining < t4_pct and time_remaining > 0:
+                    filled_token = hedge.get("filled_token", "")
+                    if filled_token:
+                        filled_spread = book_reader.get_spread(filled_token)
+                        if filled_spread:
+                            sell_bid = filled_spread["bid"]
+                            loss_per_share = filled_price - sell_bid
+                            # Check actual token holdings before selling
+                            actual_held = self.token_holdings.get(filled_token, {}).get("size", 0)
+                            sell_size = min(filled_size, actual_held) if actual_held >= 1.0 else 0
+                            if sell_size >= 1.0 and loss_per_share <= t4_max_loss:
+                                fee_sell = self.fee_calc._interp_fee_per_share(sell_bid)
+                                net_loss = loss_per_share + fee_sell
+                                self.logger.info(
+                                    "\n  T4 LAST RESORT SELL | {} | {} {:.0f} @ ${:.2f} -> bid ${:.2f} | "
+                                    "Loss ${:.3f}/sh (fee ${:.3f}) | Net ${:.3f}/sh | {:.0f}% rem ({:.0f}s left)".format(
+                                        wid, filled_side, sell_size, filled_price, sell_bid,
+                                        loss_per_share, fee_sell, net_loss, pct_remaining, time_remaining))
+                                # Cancel any remaining orders on this window first
+                                cancelled = self.cancel_window_orders(wid)
+                                if cancelled:
+                                    self.logger.info(
+                                        "  T4 CANCEL | {} | Cancelled {} orders".format(wid, cancelled))
+                                result = self.place_order(
+                                    filled_token, "SELL", sell_bid, sell_size,
+                                    wid, "T4-SELL", "mm", is_taker=True)
+                                # Retry with approval if rejected (same pattern as momentum exit)
+                                if not result and not self.config.dry_run and self.client:
+                                    try:
+                                        self.logger.info(
+                                            "  T4 RETRY | {} | Attempting CLOB approval + retry".format(wid))
+                                        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                                        self.client.update_balance_allowance(
+                                            BalanceAllowanceParams(
+                                                asset_type=AssetType.CONDITIONAL,
+                                                token_id=filled_token,
+                                            )
+                                        )
+                                        import time as _time
+                                        _time.sleep(2)
+                                        result = self.place_order(
+                                            filled_token, "SELL", sell_bid, sell_size,
+                                            wid, "T4-SELL-RETRY", "mm", is_taker=True)
+                                    except Exception as e:
+                                        self.logger.warning(
+                                            "  T4 APPROVAL FAIL | {} | {}".format(wid, str(e)[:100]))
+                                if result:
+                                    self._pending_hedges.remove(hedge)
+                                    completed += 1
+                                    # Clean up window state (same as momentum exit)
+                                    self.window_fill_sides.pop(wid, None)
+                                    self.window_fill_cost.pop(wid, None)
+                                    self.window_fill_tokens.pop(wid, None)
+                                    self.closed_windows.add(wid)
+                                    self.held_windows.discard(wid)
+                                    self.window_entry_count.pop(wid, None)
+                                    cost = filled_price * sell_size
+                                    self.capital_in_positions = max(0, self.capital_in_positions - cost)
+                                    self._update_total_capital()
+                                    # Track T4 analytics
+                                    elapsed_t4 = time.time() - hedge["time"]
+                                    self.hedge_analytics["resolved_by_t4_sell"] += 1
+                                    self.hedge_analytics["tier_counts"]["t4"] += 1
+                                    self.hedge_analytics["tier_costs"]["t4"].append(loss_per_share)
+                                    self.hedge_analytics["tier_times"]["t4"].append(elapsed_t4)
+                                    asset = wid.split("-")[0] if "-" in wid else "unknown"
+                                    if asset not in self.hedge_analytics["per_asset"]:
+                                        self.hedge_analytics["per_asset"][asset] = {
+                                            "one_sided": 0, "hedges": 0, "exits": 0,
+                                            "merges": 0, "abandoned": 0, "t4_sells": 0
+                                        }
+                                    pa = self.hedge_analytics["per_asset"][asset]
+                                    pa["t4_sells"] = pa.get("t4_sells", 0) + 1
+                                    self.logger.info(
+                                        "  T4 SOLD | {} | {} {:.0f} @ ${:.2f} | Loss ${:.3f}/sh".format(
+                                            wid, filled_side, sell_size, sell_bid, net_loss))
+                                    continue
+                                else:
+                                    self.logger.warning(
+                                        "  T4 SELL FAILED | {} | Sell rejected, falling back to abandon".format(wid))
+                            elif sell_size < 1.0:
+                                self.logger.info(
+                                    "  T4 SKIP | {} | No tokens held (held={:.1f})".format(
+                                        wid, actual_held))
+                            else:
+                                self.logger.info(
+                                    "  T4 LOSS CAP | {} | Loss ${:.3f}/sh > max ${:.3f} | Abandoning".format(
+                                        wid, loss_per_share, t4_max_loss))
+                # ── End T4 ──────────────────────────────────────────────────
+                # If T4 didn't fire or failed, fall through to abandon
                 self.logger.info(
                     "  HEDGE PRICE CAP (ALL TIERS) | {} | {} @ ${:.2f} | {} ask ${:.2f} > max ${:.2f} | "
                     "Combined ${:.3f} > T3 cap ${:.3f} | {:.0f}% rem".format(
@@ -3131,13 +3232,12 @@ class TradingEngine:
                         max_other_price, total_cost, tier_max_cost, pct_remaining))
                 self._pending_hedges.remove(hedge)
                 self.hedges_skipped += 1
-                # V15.1-25: Track abandoned hedge (price cap)
                 self.hedge_analytics["resolved_abandoned"] += 1
                 asset = wid.split("-")[0] if "-" in wid else "unknown"
                 if asset not in self.hedge_analytics["per_asset"]:
                     self.hedge_analytics["per_asset"][asset] = {
                         "one_sided": 0, "hedges": 0, "exits": 0,
-                        "merges": 0, "abandoned": 0
+                        "merges": 0, "abandoned": 0, "t4_sells": 0
                     }
                 self.hedge_analytics["per_asset"][asset]["abandoned"] += 1
                 continue
@@ -3145,6 +3245,75 @@ class TradingEngine:
             if profit_per_share < self.config.hedge_min_profit_per_share:
                 if not is_last_tier and time_remaining > 0:
                     continue
+                # ── V15.2-T4: Also try T4 sell on low-profit exhaustion ─────
+                t4_pct = getattr(self.config, 'hedge_t4_sell_pct', 5.0)
+                t4_max_loss = getattr(self.config, 'hedge_t4_max_loss', 0.03)
+                t4_enabled = getattr(self.config, 'hedge_t4_enabled', True)
+                if t4_enabled and pct_remaining < t4_pct and time_remaining > 0:
+                    filled_token = hedge.get("filled_token", "")
+                    if filled_token:
+                        filled_spread = book_reader.get_spread(filled_token)
+                        if filled_spread:
+                            sell_bid = filled_spread["bid"]
+                            loss_per_share = filled_price - sell_bid
+                            actual_held = self.token_holdings.get(filled_token, {}).get("size", 0)
+                            sell_size = min(filled_size, actual_held) if actual_held >= 1.0 else 0
+                            if sell_size >= 1.0 and loss_per_share <= t4_max_loss:
+                                fee_sell = self.fee_calc._interp_fee_per_share(sell_bid)
+                                net_loss = loss_per_share + fee_sell
+                                self.logger.info(
+                                    "\n  T4 LAST RESORT SELL (LOW PROFIT) | {} | {} {:.0f} @ ${:.2f} -> bid ${:.2f} | "
+                                    "Loss ${:.3f}/sh | {:.0f}% rem".format(
+                                        wid, filled_side, sell_size, filled_price, sell_bid,
+                                        loss_per_share, pct_remaining))
+                                cancelled = self.cancel_window_orders(wid)
+                                result = self.place_order(
+                                    filled_token, "SELL", sell_bid, sell_size,
+                                    wid, "T4-SELL", "mm", is_taker=True)
+                                if not result and not self.config.dry_run and self.client:
+                                    try:
+                                        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                                        self.client.update_balance_allowance(
+                                            BalanceAllowanceParams(
+                                                asset_type=AssetType.CONDITIONAL,
+                                                token_id=filled_token,
+                                            )
+                                        )
+                                        import time as _time
+                                        _time.sleep(2)
+                                        result = self.place_order(
+                                            filled_token, "SELL", sell_bid, sell_size,
+                                            wid, "T4-SELL-RETRY", "mm", is_taker=True)
+                                    except Exception as e:
+                                        self.logger.warning(
+                                            "  T4 APPROVAL FAIL | {} | {}".format(wid, str(e)[:100]))
+                                if result:
+                                    self._pending_hedges.remove(hedge)
+                                    completed += 1
+                                    self.window_fill_sides.pop(wid, None)
+                                    self.window_fill_cost.pop(wid, None)
+                                    self.window_fill_tokens.pop(wid, None)
+                                    self.closed_windows.add(wid)
+                                    self.held_windows.discard(wid)
+                                    self.window_entry_count.pop(wid, None)
+                                    cost = filled_price * sell_size
+                                    self.capital_in_positions = max(0, self.capital_in_positions - cost)
+                                    self._update_total_capital()
+                                    elapsed_t4 = time.time() - hedge["time"]
+                                    self.hedge_analytics["resolved_by_t4_sell"] += 1
+                                    self.hedge_analytics["tier_counts"]["t4"] += 1
+                                    self.hedge_analytics["tier_costs"]["t4"].append(loss_per_share)
+                                    self.hedge_analytics["tier_times"]["t4"].append(elapsed_t4)
+                                    asset = wid.split("-")[0] if "-" in wid else "unknown"
+                                    if asset not in self.hedge_analytics["per_asset"]:
+                                        self.hedge_analytics["per_asset"][asset] = {
+                                            "one_sided": 0, "hedges": 0, "exits": 0,
+                                            "merges": 0, "abandoned": 0, "t4_sells": 0
+                                        }
+                                    pa = self.hedge_analytics["per_asset"][asset]
+                                    pa["t4_sells"] = pa.get("t4_sells", 0) + 1
+                                    continue
+                # ── End T4 (low profit path) ────────────────────────────────
                 self.logger.info(
                     "  HEDGE LOW PROFIT | {} | {} @ ${:.2f} | {} ask ${:.2f} | "
                     "Pair ${:.3f} | Profit ${:.4f} < min ${:.3f}".format(
@@ -3152,13 +3321,12 @@ class TradingEngine:
                         total_cost, profit_per_share, self.config.hedge_min_profit_per_share))
                 self._pending_hedges.remove(hedge)
                 self.hedges_skipped += 1
-                # V15.1-25: Track abandoned hedge (low profit)
                 self.hedge_analytics["resolved_abandoned"] += 1
                 asset = wid.split("-")[0] if "-" in wid else "unknown"
                 if asset not in self.hedge_analytics["per_asset"]:
                     self.hedge_analytics["per_asset"][asset] = {
                         "one_sided": 0, "hedges": 0, "exits": 0,
-                        "merges": 0, "abandoned": 0
+                        "merges": 0, "abandoned": 0, "t4_sells": 0
                     }
                 self.hedge_analytics["per_asset"][asset]["abandoned"] += 1
                 continue
@@ -3188,7 +3356,7 @@ class TradingEngine:
                 if asset not in self.hedge_analytics["per_asset"]:
                     self.hedge_analytics["per_asset"][asset] = {
                         "one_sided": 0, "hedges": 0, "exits": 0,
-                        "merges": 0, "abandoned": 0
+                        "merges": 0, "abandoned": 0, "t4_sells": 0
                     }
                 self.hedge_analytics["per_asset"][asset]["hedges"] += 1
             self._pending_hedges.remove(hedge)
@@ -3351,7 +3519,7 @@ class TradingEngine:
                     if asset not in self.hedge_analytics["per_asset"]:
                         self.hedge_analytics["per_asset"][asset] = {
                             "one_sided": 0, "hedges": 0, "exits": 0,
-                            "merges": 0, "abandoned": 0
+                            "merges": 0, "abandoned": 0, "t4_sells": 0
                         }
                     self.hedge_analytics["per_asset"][asset]["exits"] += 1
                     # V15.1-28: Orphan recovery — check if opposite side has tokens
@@ -3634,6 +3802,7 @@ class TradingEngine:
             "resolved_by_exit": ha["resolved_by_exit"],
             "resolved_by_merge": ha["resolved_by_merge"],
             "resolved_abandoned": ha["resolved_abandoned"],
+            "resolved_by_t4_sell": ha["resolved_by_t4_sell"],
             "gate_blocks": ha["gate_blocks"],
             "gate_bypasses": ha["gate_bypasses"],
             "tier_counts": ha["tier_counts"],
@@ -3645,13 +3814,13 @@ class TradingEngine:
             "exit_avg_hold_time": (sum(ha["exit_hold_times"]) / len(ha["exit_hold_times"])) if ha["exit_hold_times"] else 0,
             "per_asset": ha["per_asset"],
         }
-        for tier in ["t1", "t2", "t3"]:
+        for tier in ["t1", "t2", "t3", "t4"]:
             costs = ha["tier_costs"][tier]
             times = ha["tier_times"][tier]
             summary["tier_avg_cost"][tier] = (sum(costs) / len(costs)) if costs else 0
             summary["tier_avg_time"][tier] = (sum(times) / len(times)) if times else 0
-        # Resolution rate
-        total_resolved = ha["resolved_by_hedge"] + ha["resolved_by_exit"] + ha["resolved_by_merge"]
+        # Resolution rate (T4 sells count as resolved — capital recovered)
+        total_resolved = ha["resolved_by_hedge"] + ha["resolved_by_exit"] + ha["resolved_by_merge"] + ha["resolved_by_t4_sell"]
         total_one_sided = ha["one_sided_fills"] or 1
         summary["resolution_rate"] = total_resolved / total_one_sided
         summary["hedge_vs_exit_ratio"] = (
@@ -3979,45 +4148,6 @@ class MarketMakingStrategy:
         self._total_estimated_reward = 0.0
         self._gate_block_count = {}  # {asset: consecutive_block_count} — for momentum gate bypass
 
-    def _cancel_unpaired_on_momentum(self, asset, momentum):
-        """V15.1-29: Cancel active orders for windows of the same asset where
-        only one side (or no side) has filled. This prevents late fills from
-        creating orphan positions during directional moves."""
-        cancelled_windows = 0
-        for wid in list(self.engine.orders_by_window.keys()):
-            # Only target windows for the same asset
-            if not wid.startswith(asset + "-"):
-                continue
-            # Check fill state for this window
-            sides = self.engine.window_fill_sides.get(wid, {})
-            has_up = "UP" in sides
-            has_down = "DOWN" in sides
-            # Skip fully paired windows — both sides filled, merge will handle
-            if has_up and has_down:
-                continue
-            # Skip windows with no active orders
-            active_oids = [oid for oid in self.engine.orders_by_window.get(wid, [])
-                           if oid in self.engine.active_orders]
-            if not active_oids:
-                continue
-            # Cancel active orders for this unpaired window
-            n_cancelled = self.engine.cancel_window_orders(wid, strategy_filter="mm")
-            if n_cancelled > 0:
-                fill_str = "UP-only" if has_up else ("DOWN-only" if has_down else "no fills")
-                self.logger.info(
-                    "  MOM-GATE CANCEL | {} | {} | Mom: {:+.3f}% | "
-                    "Cancelled {} orders to prevent orphan".format(
-                        wid, fill_str, momentum * 100, n_cancelled))
-                cancelled_windows += 1
-                # Track analytics
-                if "gate_cancels" not in self.engine.hedge_analytics:
-                    self.engine.hedge_analytics["gate_cancels"] = 0
-                self.engine.hedge_analytics["gate_cancels"] += n_cancelled
-        if cancelled_windows > 0:
-            self.logger.info(
-                "  MOM-GATE CANCEL SUMMARY | {} | {} windows cleaned | "
-                "Mom: {:+.3f}%".format(asset, cancelled_windows, momentum * 100))
-
     def execute(self, market):
         asset = market["asset"]
         window_id = market["window_id"]
@@ -4138,11 +4268,6 @@ class MarketMakingStrategy:
                         window_id, momentum * 100, effective_threshold * 100, bypass_str))
                 # V15.1-25: Track gate block analytics
                 self.engine.hedge_analytics["gate_blocks"] += 1
-                # V15.1-29 Strategy 1: Proactive cancel — when momentum gate fires,
-                # cancel active orders for same-asset windows that are NOT fully paired.
-                # This prevents the "lagging side" from filling after directional momentum
-                # is detected, which would create orphan positions.
-                self._cancel_unpaired_on_momentum(asset, momentum)
                 return
             else:
                 if bypassed:

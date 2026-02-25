@@ -223,6 +223,11 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     config.hedge_completion_delay = 30  # Legacy fallback
     config.hedge_max_combined_cost = config.hedge_tiers[0][1]
 
+    # V15.2-T4: Last Resort Sell — sell filled side at market bid when all buy-tiers exhausted
+    config.hedge_t4_enabled = bool(cc_config.get("hedgeT4Enabled", True))
+    config.hedge_t4_sell_pct = float(cc_config.get("hedgeTier4Pct", 5.0))
+    config.hedge_t4_max_loss = float(cc_config.get("hedgeTier4MaxLoss", 0.03))
+
     # V15.1-14: Momentum exit — sell one-sided fill if price rises >X%
     config.momentum_exit_enabled = bool(cc_config.get("momentumExitEnabled", True))
     config.momentum_exit_threshold = float(cc_config.get("momentumExitThreshold", 0.03))
@@ -235,6 +240,8 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     print(f"  Hedge: {'ON' if config.hedge_completion_enabled else 'OFF'} "
           f"(tiers: {', '.join(f'${t[1]:.2f}@<{t[0]:.0f}%rem' for t in config.hedge_tiers)}, "
           f"minProfit=${config.hedge_min_profit_per_share:.3f})")
+    print(f"  T4 Last Resort: {'ON' if config.hedge_t4_enabled else 'OFF'} "
+          f"(trigger=<{config.hedge_t4_sell_pct:.0f}%rem, maxLoss=${config.hedge_t4_max_loss:.3f}/sh)")
     print(f"  Momentum Exit: {'ON' if config.momentum_exit_enabled else 'OFF'} "
           f"(threshold={config.momentum_exit_threshold:.1%}, "
           f"maxWait={config.momentum_exit_max_wait_secs:.0f}s)")
@@ -790,6 +797,10 @@ class PolyMakerBot(PolymarketBot):
                                 (float(fresh_config.get("hedgeTier2Pct", 33)), float(fresh_config.get("hedgeTier2Cost", 1.05))),
                                 (float(fresh_config.get("hedgeTier3Pct", 13)), float(fresh_config.get("hedgeTier3Cost", 1.08))),
                             ], key=lambda t: t[0], reverse=True)
+                            # V15.2-T4: Last Resort Sell config
+                            self.config.hedge_t4_enabled = bool(fresh_config.get("hedgeT4Enabled", True))
+                            self.config.hedge_t4_sell_pct = float(fresh_config.get("hedgeTier4Pct", 5.0))
+                            self.config.hedge_t4_max_loss = float(fresh_config.get("hedgeTier4MaxLoss", 0.03))
                             self.config.momentum_exit_enabled = bool(fresh_config.get("momentumExitEnabled", True))
                             self.config.momentum_exit_threshold = float(fresh_config.get("momentumExitThreshold", 0.03))
                             self.config.momentum_exit_max_wait_secs = float(fresh_config.get("momentumExitMaxWait", 120.0))
