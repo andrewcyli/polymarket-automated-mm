@@ -242,16 +242,25 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
         print(f"  ⚠️  PAUSE ORDERS: enabled from CC — no new orders will be placed")
 
     # V15.1-19: Pre-entry filters for orphan reduction
-    config.momentum_gate_threshold = float(cc_config.get("momentumGate", 0.005))
+    config.momentum_gate_threshold = float(cc_config.get("momentumGate", 0.002))
     config.momentum_gate_max_consec = int(cc_config.get("momentumGateMaxConsec", 3))
     config.min_book_depth = float(cc_config.get("minBookDepth", 5.0))
     config.max_spread_asymmetry = float(cc_config.get("maxSpreadAsymmetry", 0.02))
+    # V15.1-29: Enhanced pre-entry filters
+    config.midpoint_skew_limit = float(cc_config.get("midpointSkewLimit", 0.03))
+    config.momentum_gate_asset_scale = {
+        "BTC": float(cc_config.get("momentumGateScaleBtc", 1.0)),
+        "ETH": float(cc_config.get("momentumGateScaleEth", 1.2)),
+        "SOL": float(cc_config.get("momentumGateScaleSol", 1.8)),
+        "XRP": float(cc_config.get("momentumGateScaleXrp", 1.8)),
+    }
     # Session blackout windows: list of [start_hour_utc, end_hour_utc] pairs
     blackout_raw = cc_config.get("tradingBlackoutWindows", [])
     config.trading_blackout_windows = blackout_raw if isinstance(blackout_raw, list) else []
 
     print(f"  Pre-entry filters: MomGate={config.momentum_gate_threshold:.3f} (bypass@{config.momentum_gate_max_consec}) | "
-          f"MinDepth=${config.min_book_depth:.0f} | MaxSpreadAsym={config.max_spread_asymmetry:.3f}")
+          f"MidSkew={config.midpoint_skew_limit:.2f} | MinDepth=${config.min_book_depth:.0f} | MaxSpreadAsym={config.max_spread_asymmetry:.3f}")
+    print(f"  Gate asset scale: " + " | ".join(f"{a}={s:.1f}x" for a, s in config.momentum_gate_asset_scale.items()))
     if config.trading_blackout_windows:
         print(f"  Blackout windows: {config.trading_blackout_windows}")
 
