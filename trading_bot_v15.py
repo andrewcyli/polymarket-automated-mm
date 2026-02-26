@@ -1584,6 +1584,10 @@ class AutoMerger:
                     remaining_fill = self.engine.window_fill_cost.get(wid, 0)
                     if remaining_fill <= 0:
                         self.engine.held_windows.discard(wid)
+                # V15.2: Clear fill_tokens so cleanup_expired_windows
+                # doesn't queue this window for claim (prevents double-counting)
+                if self.engine:
+                    self.engine.window_fill_tokens.pop(wid, None)
                 self.logger.info(
                     "  MERGED OK | {} | {:.1f} shares -> ~${:.2f} USDC returned".format(
                         wid, mergeable, mergeable))
@@ -1661,6 +1665,9 @@ class AutoMerger:
                         self.engine.window_fill_cost[wid] = new_fill
                     else:
                         self.engine.window_fill_cost.pop(wid, None)
+            # V15.2: Clear fill_tokens to prevent double claim
+            if self.engine:
+                self.engine.window_fill_tokens.pop(wid, None)
             self.logger.info(
                 "  MERGED (sim) | {} | {:.1f} shares -> ~${:.2f} returned".format(
                     wid, mergeable, mergeable))
@@ -2404,6 +2411,7 @@ class TradingEngine:
         self.asset_exposure = {}
         self.daily_pnl = 0.0
         self.total_orders_placed = 0
+        self.total_orders_filled = 0
         self.total_orders_cancelled = 0
         self.sniper_trades = 0
         self.arb_trades = 0
@@ -2917,6 +2925,7 @@ class TradingEngine:
         return None
 
     def record_fill(self, token_id, side, price, size, fee=0):
+        self.total_orders_filled += 1
         if side == "BUY":
             if token_id not in self.token_holdings:
                 self.token_holdings[token_id] = {"size": 0, "cost": 0}
@@ -3854,6 +3863,7 @@ class TradingEngine:
         return {
             "active_orders": len(self.active_orders),
             "total_placed": self.total_orders_placed,
+            "total_filled": self.total_orders_filled,
             "total_cancelled": self.total_orders_cancelled,
             "total_exposure": self.total_exposure,
             "windows_active": len(self.window_exposure),

@@ -563,10 +563,13 @@ class PolyMakerBot(PolymarketBot):
         pos_value = getattr(self, '_position_value', None)
         if pos_value is None:
             pos_value = self.engine.get_position_value()
+        # V15.2: Pair/orphan tracking for CC dashboard
+        hedge_summary = stats.get("hedge_analytics", {})
+        realized_pnl = stats.get("session_realized_pnl", 0)
         cc.update_run(
             total_cycles=cc.cycle_count,
             total_orders=stats.get("total_placed", 0),
-            total_fills=stats.get("total_placed", 0),
+            total_fills=stats.get("total_filled", 0),
             total_pnl=total_pnl,
             peak_pnl=self._peak_pnl,
             max_drawdown=self._max_drawdown,
@@ -581,6 +584,9 @@ class PolyMakerBot(PolymarketBot):
             total_claimed_usd=claim_stats.get("total_claimed_usd", 0),
             claims_pending=claim_stats.get("pending_claims", 0),
             hedge_analytics=stats.get("hedge_analytics"),
+            realized_pnl=realized_pnl,
+            paired_windows=stats.get("paired_windows", 0),
+            one_sided_fills=hedge_summary.get("one_sided_fills", 0),
         )
 
     def _push_final_metrics(self, status="completed"):
@@ -606,11 +612,14 @@ class PolyMakerBot(PolymarketBot):
 
         merge_stats = self.auto_merger.get_stats()
         claim_stats = self.claim_manager.get_claim_stats()
+        # V15.2: Pair/orphan tracking for CC dashboard
+        hedge_summary = stats.get("hedge_analytics", {})
+        realized_pnl = stats.get("session_realized_pnl", 0)
         cc.stop_run(
             status=status,
             total_cycles=cc.cycle_count,
             total_orders=stats.get("total_placed", 0),
-            total_fills=stats.get("total_placed", 0),
+            total_fills=stats.get("total_filled", 0),
             total_pnl=total_pnl,
             peak_pnl=self._peak_pnl,
             max_drawdown=self._max_drawdown,
@@ -624,6 +633,9 @@ class PolyMakerBot(PolymarketBot):
             total_claimed_usd=claim_stats.get("total_claimed_usd", 0),
             claims_pending=claim_stats.get("pending_claims", 0),
             hedge_analytics=stats.get("hedge_analytics"),
+            realized_pnl=realized_pnl,
+            paired_windows=stats.get("paired_windows", 0),
+            one_sided_fills=hedge_summary.get("one_sided_fills", 0),
         )
 
     def run(self):
