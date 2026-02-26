@@ -379,6 +379,9 @@ class WSFillDetector:
                 info = self.engine._recently_cancelled.pop(order_id, None)
                 if info:
                     recovered = True
+                    # V15.4-FIX: Remove from _bot_cancelled_orders since WS confirmed fill
+                    if hasattr(self.engine, '_bot_cancelled_orders'):
+                        self.engine._bot_cancelled_orders.discard(order_id)
                     self.logger.info(
                         f"  FILL [WS-RECOVERED] | Order {order_id[:12]}... "
                         f"filled after cancel — recovering from buffer"
@@ -450,14 +453,20 @@ class WSFillDetector:
                 if "UP" in sides and "DOWN" in sides:
                     self.engine.paired_windows.add(wid)
                 elif self.engine.config.hedge_completion_enabled:
-                    self.engine._pending_hedges.append({
-                        "window_id": wid,
-                        "filled_side": side_label,
-                        "filled_price": fill_price,
-                        "filled_size": fill_size,
-                        "filled_token": fill_token,
-                        "time": time.time(),
-                    })
+                    # V15.4-FIX: Dedup — only add hedge if window not already pending
+                    already_pending = any(
+                        h["window_id"] == wid and h["filled_side"] == side_label
+                        for h in self.engine._pending_hedges
+                    )
+                    if not already_pending:
+                        self.engine._pending_hedges.append({
+                            "window_id": wid,
+                            "filled_side": side_label,
+                            "filled_price": fill_price,
+                            "filled_size": fill_size,
+                            "filled_token": fill_token,
+                            "time": time.time(),
+                        })
 
             # Mark as processed
             self._processed_order_ids.add(order_id)
@@ -652,13 +661,19 @@ class WSFillDetector:
                     if "UP" in sides and "DOWN" in sides:
                         self.engine.paired_windows.add(wid)
                     elif self.engine.config.hedge_completion_enabled:
-                        self.engine._pending_hedges.append({
-                            "window_id": wid, "filled_side": side_label,
-                            "filled_price": fill_price,
-                            "filled_size": fill_size,
-                            "filled_token": fill_token,
-                            "time": time.time(),
-                        })
+                        # V15.4-FIX: Dedup — only add hedge if window not already pending
+                        already_pending = any(
+                            h["window_id"] == wid and h["filled_side"] == side_label
+                            for h in self.engine._pending_hedges
+                        )
+                        if not already_pending:
+                            self.engine._pending_hedges.append({
+                                "window_id": wid, "filled_side": side_label,
+                                "filled_price": fill_price,
+                                "filled_size": fill_size,
+                                "filled_token": fill_token,
+                                "time": time.time(),
+                            })
 
                 self._processed_order_ids.add(oid)
                 self._trim_processed_ids()
@@ -684,6 +699,16 @@ class WSFillDetector:
                 with self._lock:
                     if oid in self._ws_cancelled_orders:
                         continue
+                # V15.4-FIX: Skip orders that were explicitly cancelled by the bot.
+                # These are NOT fills — they were cancelled via cancel_window_orders(),
+                # prune_stale_orders(), or cleanup_expired_windows().
+                # Without this check, REST reconcile treats them as fills because
+                # they're not in open_ids (cancelled) and not in _ws_cancelled_orders
+                # (WS event may be delayed or lost).
+                if hasattr(self.engine, '_bot_cancelled_orders') and oid in self.engine._bot_cancelled_orders:
+                    self.logger.debug(
+                        f"  REST-RECONCILE SKIP (bot-cancelled) | {oid[:12]}...")
+                    continue
 
                 info = self.engine._recently_cancelled.pop(oid, None)
                 if not info:
@@ -728,13 +753,19 @@ class WSFillDetector:
                     if "UP" in sides and "DOWN" in sides:
                         self.engine.paired_windows.add(wid)
                     elif self.engine.config.hedge_completion_enabled:
-                        self.engine._pending_hedges.append({
-                            "window_id": wid, "filled_side": side_label,
-                            "filled_price": fill_price,
-                            "filled_size": fill_size,
-                            "filled_token": fill_token,
-                            "time": time.time(),
-                        })
+                        # V15.4-FIX: Dedup — only add hedge if window not already pending
+                        already_pending = any(
+                            h["window_id"] == wid and h["filled_side"] == side_label
+                            for h in self.engine._pending_hedges
+                        )
+                        if not already_pending:
+                            self.engine._pending_hedges.append({
+                                "window_id": wid, "filled_side": side_label,
+                                "filled_price": fill_price,
+                                "filled_size": fill_size,
+                                "filled_token": fill_token,
+                                "time": time.time(),
+                            })
 
                 self._processed_order_ids.add(oid)
                 self._trim_processed_ids()

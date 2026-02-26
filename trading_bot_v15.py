@@ -314,8 +314,8 @@ class BotConfig:
     hedge_min_profit_per_share: float = 0.005 # V15.1-13: Min profit/share after fees to accept hedge
 
     # V15.2-T4: Last Resort Sell — sell the filled side at market bid when all buy-tiers exhausted
-    hedge_t4_sell_pct: float = 5.0       # Trigger when <5% of window time remaining
-    hedge_t4_max_loss: float = 0.03      # Max loss per share allowed ($0.03 = 3c)
+    hedge_t4_sell_pct: float = 15.0      # V15.4-FIX: Trigger when <15% remaining (was 5%)
+    hedge_t4_max_loss: float = 0.02      # V15.4-FIX: Max loss per share ($0.02 = 2c, was 3c)
     hedge_t4_enabled: bool = True        # Enable/disable T4 sell tier
 
     auto_claim_enabled: bool = True
@@ -2494,6 +2494,7 @@ class TradingEngine:
         # longer in active_orders. This buffer preserves the order metadata
         # so the fill can still be processed correctly.
         self._recently_cancelled = {}  # {order_id: {**order_info, "cancelled_at": float}}
+        self._bot_cancelled_orders = set()  # V15.4-FIX: Track orders explicitly cancelled by bot
         self._recently_cancelled_ttl = 900  # V15.1-21: 15 min to catch late fills (was 120s)
 
         if not config.dry_run and HAS_CLOB:
@@ -2549,6 +2550,7 @@ class TradingEngine:
                 wid = info.get("window_id", "")
                 self._recently_cancelled[oid] = {
                     **info, "cancelled_at": time.time()}
+                self._bot_cancelled_orders.add(oid)  # V15.4-FIX
                 del self.active_orders[oid]
                 if wid in self.orders_by_window:
                     self.orders_by_window[wid] = [
@@ -2568,6 +2570,7 @@ class TradingEngine:
                 if oid in self.active_orders:
                     self._recently_cancelled[oid] = {
                         **self.active_orders[oid], "cancelled_at": time.time()}
+                    self._bot_cancelled_orders.add(oid)  # V15.4-FIX
                     del self.active_orders[oid]
                     self.total_orders_cancelled += 1
                 if self.sim_engine and oid in self.sim_engine.pending_orders:
@@ -3182,10 +3185,12 @@ class TradingEngine:
                 # ── V15.2-T4: Last Resort Sell ──────────────────────────────
                 # All buy-tiers exhausted. Instead of abandoning, try to SELL
                 # the filled side at market bid to recover capital with minimal loss.
-                t4_pct = getattr(self.config, 'hedge_t4_sell_pct', 5.0)
-                t4_max_loss = getattr(self.config, 'hedge_t4_max_loss', 0.03)
+                t4_pct = getattr(self.config, 'hedge_t4_sell_pct', 15.0)  # V15.4-FIX: raised from 5→15%
+                t4_max_loss = getattr(self.config, 'hedge_t4_max_loss', 0.02)
                 t4_enabled = getattr(self.config, 'hedge_t4_enabled', True)
-                if t4_enabled and pct_remaining < t4_pct and time_remaining > 0:
+                # V15.4-FIX: Removed time_remaining > 0 condition.
+                # T4 must fire even after window expires because we still hold tokens.
+                if t4_enabled and (pct_remaining < t4_pct or time_remaining <= 0):
                     filled_token = hedge.get("filled_token", "")
                     if filled_token:
                         filled_spread = book_reader.get_spread(filled_token)
@@ -3296,10 +3301,12 @@ class TradingEngine:
                 if not is_last_tier and time_remaining > 0:
                     continue
                 # ── V15.2-T4: Also try T4 sell on low-profit exhaustion ─────
-                t4_pct = getattr(self.config, 'hedge_t4_sell_pct', 5.0)
-                t4_max_loss = getattr(self.config, 'hedge_t4_max_loss', 0.03)
+                t4_pct = getattr(self.config, 'hedge_t4_sell_pct', 15.0)  # V15.4-FIX: raised from 5→15%
+                t4_max_loss = getattr(self.config, 'hedge_t4_max_loss', 0.02)
                 t4_enabled = getattr(self.config, 'hedge_t4_enabled', True)
-                if t4_enabled and pct_remaining < t4_pct and time_remaining > 0:
+                # V15.4-FIX: Removed time_remaining > 0 condition.
+                # T4 must fire even after window expires because we still hold tokens.
+                if t4_enabled and (pct_remaining < t4_pct or time_remaining <= 0):
                     filled_token = hedge.get("filled_token", "")
                     if filled_token:
                         filled_spread = book_reader.get_spread(filled_token)
@@ -3730,6 +3737,9 @@ class TradingEngine:
         oids = self.orders_by_window.get(window_id, [])
         cancelled = 0
         remaining = []
+        # V15.4-FIX: Initialize _bot_cancelled_orders if not present
+        if not hasattr(self, '_bot_cancelled_orders'):
+            self._bot_cancelled_orders = set()
         for oid in list(oids):
             info = self.active_orders.get(oid)
             if info and strategy_filter and info.get("strategy") != strategy_filter:
@@ -3740,6 +3750,7 @@ class TradingEngine:
                     self._recently_cancelled[oid] = {
                         **self.active_orders[oid], "cancelled_at": time.time()}
                     del self.active_orders[oid]
+                    self._bot_cancelled_orders.add(oid)  # V15.4-FIX
                     cancelled += 1
                 if self.sim_engine and oid in self.sim_engine.pending_orders:
                     del self.sim_engine.pending_orders[oid]
@@ -3754,6 +3765,7 @@ class TradingEngine:
                     self.client.cancel(oid)
                     if oid in self.active_orders:
                         del self.active_orders[oid]
+                    self._bot_cancelled_orders.add(oid)  # V15.4-FIX
                     cancelled += 1
                 except Exception:
                     # Cancel failed — order may still be live; remove from buffer
