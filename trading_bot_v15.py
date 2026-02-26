@@ -1599,6 +1599,9 @@ class AutoMerger:
                 self.logger.info(
                     "  MERGED OK | {} | {:.1f} shares -> ~${:.2f} USDC returned".format(
                         wid, mergeable, mergeable))
+                # V15.5-FIX2: Mark window as closed after merge to prevent phantom hedges
+                if self.engine:
+                    self.engine.closed_windows.add(wid)
                 # V15.1-25: Track merge analytics
                 if self.engine:
                     self.engine.hedge_analytics["resolved_by_merge"] += 1
@@ -3312,6 +3315,18 @@ class TradingEngine:
                                     "  T4 LOSS CAP | {} | Loss ${:.3f}/sh > max ${:.3f} | Abandoning".format(
                                         wid, loss_per_share, t4_max_loss))
                 # ── End T4 ──────────────────────────────────────────────────
+                # V15.5-FIX2: If T4 didn't fire because pct_remaining is still
+                # above threshold but time remains, keep waiting for T4 trigger.
+                # Only abandon if T4 was attempted and failed, or time is up.
+                t4_enabled_check = getattr(self.config, 'hedge_t4_enabled', True)
+                t4_pct_check = getattr(self.config, 'hedge_t4_sell_pct', 33.0)
+                if t4_enabled_check and is_last_tier and pct_remaining >= t4_pct_check and time_remaining > 0:
+                    self.logger.info(
+                        "  HEDGE WAIT T4 | {} | {} ask ${:.2f} > max ${:.2f} | "
+                        "{:.0f}% rem > {:.0f}% T4 trigger | Waiting for T4 ({:.0f}s left)".format(
+                            wid, other_side, other_ask, max_other_price,
+                            pct_remaining, t4_pct_check, time_remaining))
+                    continue
                 # If T4 didn't fire or failed, fall through to abandon
                 self.logger.info(
                     "  HEDGE PRICE CAP (ALL TIERS) | {} | {} @ ${:.2f} | {} ask ${:.2f} > max ${:.2f} | "
@@ -5222,6 +5237,8 @@ class PolymarketBot:
                 slug=info.get("slug", ""), tokens=info.get("tokens", []),
                 token_up=info.get("token_up", ""), token_down=info.get("token_down", ""))
             del self.engine.expired_windows_pending_claim[wid]
+            # V15.5-FIX2: Mark window as closed when claim is scheduled
+            self.engine.closed_windows.add(wid)
 
     # V15-6 + V15.1-6: Score/sort uses maker_edge for priority
     def _score_and_sort_markets(self, markets):

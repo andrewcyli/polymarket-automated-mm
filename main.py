@@ -566,7 +566,7 @@ class PolyMakerBot(PolymarketBot):
         # V15.2: Pair/orphan tracking for CC dashboard
         hedge_summary = stats.get("hedge_analytics", {})
         realized_pnl = stats.get("session_realized_pnl", 0)
-        cc.update_run(
+        success = cc.update_run(
             total_cycles=cc.cycle_count,
             total_orders=stats.get("total_placed", 0),
             total_fills=stats.get("total_filled", 0),
@@ -588,6 +588,8 @@ class PolyMakerBot(PolymarketBot):
             paired_windows=stats.get("paired_windows", 0),
             one_sided_fills=hedge_summary.get("one_sided_fills", 0),
         )
+        if not success:
+            self.logger.warning("  CC PUSH FAILED | update_run returned False | C{}".format(cc.cycle_count))
 
     def _push_final_metrics(self, status="completed"):
         """Push final metrics when run ends."""
@@ -615,7 +617,11 @@ class PolyMakerBot(PolymarketBot):
         # V15.2: Pair/orphan tracking for CC dashboard
         hedge_summary = stats.get("hedge_analytics", {})
         realized_pnl = stats.get("session_realized_pnl", 0)
-        cc.stop_run(
+        self.logger.info("  CC FINAL PUSH | Sending stop_run to CC (status={}, C{}, M:{}, Cl:{})".format(
+            status, cc.cycle_count,
+            merge_stats.get("merges_completed", 0),
+            claim_stats.get("claimed_total", 0)))
+        result = cc.stop_run(
             status=status,
             total_cycles=cc.cycle_count,
             total_orders=stats.get("total_placed", 0),
@@ -637,6 +643,10 @@ class PolyMakerBot(PolymarketBot):
             paired_windows=stats.get("paired_windows", 0),
             one_sided_fills=hedge_summary.get("one_sided_fills", 0),
         )
+        if result:
+            self.logger.info("  CC FINAL PUSH OK | Run #{} stopped successfully".format(self._cc_run_id))
+        else:
+            self.logger.warning("  CC FINAL PUSH FAILED | stop_run returned None for run #{}".format(self._cc_run_id))
 
     def run(self):
         """Override run() to add CC run lifecycle and session logging."""
