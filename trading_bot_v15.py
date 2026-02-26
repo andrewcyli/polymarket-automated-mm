@@ -268,7 +268,7 @@ class BotConfig:
     stale_order_max_age: float = 120.0
 
     # V15.1-6: Don't place orders on windows too far out
-    max_order_horizon: float = 2700.0  # 45 minutes
+    max_order_horizon: float = 1200.0  # 20 minutes (V15.2: reduced from 45min to enter ~5min before open for 15m)
 
     # V15.1-22: Max time sessions to consider per timeframe (closest N)
     # e.g. 3 means only look at the 3 closest 5m sessions and 3 closest 15m sessions
@@ -3060,9 +3060,14 @@ class TradingEngine:
                 # Fallback: try metadata
                 meta = self.window_metadata.get(wid, {})
                 window_end = meta.get("end_time", 0)
-                window_duration = 900  # default 15m
+                # Parse interval from window_id (e.g. "xrp-15m-1772062200")
+                window_duration = 300 if "-5m-" in wid else 900
 
-            time_remaining = max(0, window_end - now)
+            # V15.2-FIX: window_end is the observation START (slug timestamp),
+            # not the market close. Actual market close = window_end + window_duration.
+            # All tier % calculations must use the actual market close time.
+            actual_market_close = window_end + window_duration
+            time_remaining = max(0, actual_market_close - now)
             pct_remaining = (time_remaining / window_duration * 100) if window_duration > 0 else 0
 
             # Determine which tier applies based on % remaining
@@ -3541,9 +3546,12 @@ class TradingEngine:
                             market_data = self._market_cache.get(wid)
                             if market_data:
                                 window_end = market_data.get("end_time", 0)
+                                window_interval = market_data.get("interval", 900)
                             else:
                                 window_end = meta.get("end_time", 0)
-                            time_left = max(0, window_end - now)
+                                window_interval = 300 if "-5m-" in wid else 900
+                            # V15.2-FIX: Use actual market close (end_time + interval)
+                            time_left = max(0, (window_end + window_interval) - now)
                             # Estimate orphan cost (use ask price as proxy if fill price unknown)
                             opp_spread = book_reader.get_spread(opp_token)
                             opp_bid = opp_spread["bid"] if opp_spread else 0

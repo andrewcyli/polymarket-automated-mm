@@ -234,6 +234,11 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     config.momentum_exit_max_wait_secs = float(cc_config.get("momentumExitMaxWait", 120.0))
     config.momentum_exit_min_hold_secs = 10.0  # Fixed at 10s
 
+    # V15.2: Max order horizon — how far before observation start to place orders
+    max_order_horizon = cc_config.get("maxOrderHorizon")
+    if max_order_horizon is not None and max_order_horizon > 0:
+        config.max_order_horizon = float(max_order_horizon)
+
     # Pause control: CC can pause new order placement each cycle
     config.pause_orders = bool(cc_config.get("pauseOrders", False))
 
@@ -801,6 +806,10 @@ class PolyMakerBot(PolymarketBot):
                             self.config.hedge_t4_enabled = bool(fresh_config.get("hedgeT4Enabled", True))
                             self.config.hedge_t4_sell_pct = float(fresh_config.get("hedgeTier4Pct", 5.0))
                             self.config.hedge_t4_max_loss = float(fresh_config.get("hedgeTier4MaxLoss", 0.03))
+                            # V15.2: Max order horizon
+                            moh = fresh_config.get("maxOrderHorizon")
+                            if moh is not None and moh > 0:
+                                self.config.max_order_horizon = float(moh)
                             self.config.momentum_exit_enabled = bool(fresh_config.get("momentumExitEnabled", True))
                             self.config.momentum_exit_threshold = float(fresh_config.get("momentumExitThreshold", 0.03))
                             self.config.momentum_exit_max_wait_secs = float(fresh_config.get("momentumExitMaxWait", 120.0))
