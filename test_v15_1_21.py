@@ -49,6 +49,8 @@ class TestMomentumExitCleanupRace:
         self.engine.window_fill_cost[wid] = 4.70
         self.engine.filled_windows.add(wid)
         self.engine.window_entry_count[wid] = 1
+        # V15.5: Must set token_holdings so cleanup sees actual held tokens
+        self.engine.token_holdings["tok_up"] = {"size": 10.0, "avg_price": 0.47}
 
         # Simulate window expiring (not in active_markets)
         active_markets = []  # No active markets = window expired

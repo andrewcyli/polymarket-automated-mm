@@ -314,8 +314,13 @@ class BotConfig:
     hedge_min_profit_per_share: float = 0.005 # V15.1-13: Min profit/share after fees to accept hedge
 
     # V15.2-T4: Last Resort Sell — sell the filled side at market bid when all buy-tiers exhausted
-    hedge_t4_sell_pct: float = 15.0      # V15.4-FIX: Trigger when <15% remaining (was 5%)
-    hedge_t4_max_loss: float = 0.02      # V15.4-FIX: Max loss per share ($0.02 = 2c, was 3c)
+    hedge_t4_sell_pct: float = 33.0      # V15.5: Trigger when <33% remaining (sell-at-33% strategy)
+                                          # Data: 94% of pairs complete by 33%, so only 6% sacrifice
+                                          # At 33%, orphan tokens worth avg $0.22 (range $0.03-$0.33)
+    hedge_t4_max_loss: float = 0.30      # V15.5: Max loss per share ($0.30 = 30c)
+                                          # Data: avg loss at 33% is $0.25/sh, worst case $0.42/sh
+                                          # $0.30 cap catches ~75% of orphans; rest fall to abandon
+                                          # Even at $0.30 loss, saving $5.22-$0.30=$4.92/orphan
     hedge_t4_enabled: bool = True        # Enable/disable T4 sell tier
 
     auto_claim_enabled: bool = True
@@ -339,7 +344,10 @@ class BotConfig:
     momentum_exit_max_wait_secs: float = 120.0 # Max wait for hedge before checking momentum
 
     # V15.1-19: Pre-entry filters for orphan reduction
-    momentum_gate_threshold: float = 0.002   # V15.1-29: Lowered from 0.5% to 0.2% to catch moves earlier
+    momentum_gate_threshold: float = 0.010   # V15.5: Raised from 0.2% to 1.0% — tighter gate rejects
+                                               # volatile windows. Data: at 0.5% gate, Kelly=+36%.
+                                               # At 1.0%, pair rate ~93% (from 89.9%), fewer windows
+                                               # but much higher quality. Reduces volume ~17%.
     momentum_gate_lookback: int = 5          # Lookback minutes for momentum gate
     momentum_gate_max_consec: int = 3         # After N consecutive blocks, relax threshold
     # V15.1-29 Strategy 4: Asset-specific momentum scaling factors
@@ -3059,8 +3067,11 @@ class TradingEngine:
         # sorted by pct descending (T1=67% triggers first, T3=13% triggers last).
         # Tier triggers when % of window time remaining < threshold.
         # This auto-scales to any window duration (5m, 15m, etc.).
+        # V15.5: Adjusted tiers — T4 sell now triggers at 33%, so buy-tiers
+        # only operate in the 67%-33% window. T1 is conservative (profitable hedge),
+        # T2 accepts small loss, T3 is aggressive before T4 sell takes over.
         hedge_tiers = getattr(self.config, 'hedge_tiers', [
-            (67, 1.03), (33, 1.05), (13, 1.08)
+            (67, 0.98), (50, 1.02), (33, 1.05)
         ])
         # Sort tiers by pct descending (highest pct = earliest trigger)
         hedge_tiers = sorted(hedge_tiers, key=lambda t: t[0], reverse=True)
@@ -3185,8 +3196,8 @@ class TradingEngine:
                 # ── V15.2-T4: Last Resort Sell ──────────────────────────────
                 # All buy-tiers exhausted. Instead of abandoning, try to SELL
                 # the filled side at market bid to recover capital with minimal loss.
-                t4_pct = getattr(self.config, 'hedge_t4_sell_pct', 15.0)  # V15.4-FIX: raised from 5→15%
-                t4_max_loss = getattr(self.config, 'hedge_t4_max_loss', 0.02)
+                t4_pct = getattr(self.config, 'hedge_t4_sell_pct', 33.0)  # V15.5: sell-at-33%
+                t4_max_loss = getattr(self.config, 'hedge_t4_max_loss', 0.30)  # V15.5: $0.30 cap
                 t4_enabled = getattr(self.config, 'hedge_t4_enabled', True)
                 # V15.4-FIX: Removed time_remaining > 0 condition.
                 # T4 must fire even after window expires because we still hold tokens.
@@ -3301,8 +3312,8 @@ class TradingEngine:
                 if not is_last_tier and time_remaining > 0:
                     continue
                 # ── V15.2-T4: Also try T4 sell on low-profit exhaustion ─────
-                t4_pct = getattr(self.config, 'hedge_t4_sell_pct', 15.0)  # V15.4-FIX: raised from 5→15%
-                t4_max_loss = getattr(self.config, 'hedge_t4_max_loss', 0.02)
+                t4_pct = getattr(self.config, 'hedge_t4_sell_pct', 33.0)  # V15.5: sell-at-33%
+                t4_max_loss = getattr(self.config, 'hedge_t4_max_loss', 0.30)  # V15.5: $0.30 cap
                 t4_enabled = getattr(self.config, 'hedge_t4_enabled', True)
                 # V15.4-FIX: Removed time_remaining > 0 condition.
                 # T4 must fire even after window expires because we still hold tokens.

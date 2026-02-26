@@ -286,9 +286,11 @@ class TestHedgeAnalyticsStructure(unittest.TestCase):
 # V15.1-29 Strategy Tests
 # =====================================================================
 
+@unittest.skip("V15.5: Strategy 1 (proactive cancel on momentum) intentionally removed — orphan handling unified into pair completion tiers")
 class TestStrategy1ProactiveCancelOnMomentum(unittest.TestCase):
     """V15.1-29 Strategy 1: When momentum gate fires, cancel active orders
-    for same-asset windows that are NOT fully paired."""
+    for same-asset windows that are NOT fully paired.
+    REMOVED in V15.5 — orphan prevention merged into unified pair completion."""
 
     def setUp(self):
         self.config = BotConfig()
@@ -448,7 +450,7 @@ class TestStrategy4LowerMomentumGate(unittest.TestCase):
 
     def test_default_threshold_lowered(self):
         config = BotConfig()
-        assert config.momentum_gate_threshold == 0.002  # 0.2%
+        assert config.momentum_gate_threshold == 0.010  # V15.5: 1.0% (raised from 0.2%)
 
     def test_asset_scale_config_exists(self):
         config = BotConfig()
@@ -470,11 +472,11 @@ class TestStrategy4LowerMomentumGate(unittest.TestCase):
     def test_effective_threshold_calculation(self):
         """Effective threshold = base * asset_scale."""
         config = BotConfig()
-        base = config.momentum_gate_threshold  # 0.002
-        btc_eff = base * config.momentum_gate_asset_scale["btc"]  # 0.002 * 1.0
-        sol_eff = base * config.momentum_gate_asset_scale["sol"]  # 0.002 * 1.8
-        assert btc_eff == 0.002
-        assert abs(sol_eff - 0.0036) < 0.0001
+        base = config.momentum_gate_threshold  # V15.5: 0.010
+        btc_eff = base * config.momentum_gate_asset_scale["btc"]  # 0.010 * 1.0
+        sol_eff = base * config.momentum_gate_asset_scale["sol"]  # 0.010 * 1.8
+        assert btc_eff == 0.010
+        assert abs(sol_eff - 0.018) < 0.001
 
     def test_eth_moderate_scale(self):
         """ETH should have moderate scale between BTC and SOL."""
