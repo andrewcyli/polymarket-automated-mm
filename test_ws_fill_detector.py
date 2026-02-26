@@ -40,6 +40,8 @@ class MockEngine:
         self.window_fill_tokens = {}
         self.window_fill_sides = {}
         self.paired_windows = set()
+        self.expired_windows_pending_claim = {}
+        self.closed_windows = set()
         self._pending_hedges = []
         self._is_up_token_cache = {}
         self._recently_cancelled = {}

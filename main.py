@@ -225,8 +225,8 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
 
     # V15.2-T4: Last Resort Sell — sell filled side at market bid when all buy-tiers exhausted
     config.hedge_t4_enabled = bool(cc_config.get("hedgeT4Enabled", True))
-    config.hedge_t4_sell_pct = float(cc_config.get("hedgeTier4Pct", 5.0))
-    config.hedge_t4_max_loss = float(cc_config.get("hedgeTier4MaxLoss", 0.03))
+    config.hedge_t4_sell_pct = float(cc_config.get("hedgeTier4Pct", 33.0))
+    config.hedge_t4_max_loss = float(cc_config.get("hedgeTier4MaxLoss", 0.30))
 
     # V15.1-14: Momentum exit — sell one-sided fill if price rises >X%
     config.momentum_exit_enabled = bool(cc_config.get("momentumExitEnabled", True))
@@ -254,7 +254,7 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
         print(f"  ⚠️  PAUSE ORDERS: enabled from CC — no new orders will be placed")
 
     # V15.1-19: Pre-entry filters for orphan reduction
-    config.momentum_gate_threshold = float(cc_config.get("momentumGate", 0.002))
+    config.momentum_gate_threshold = float(cc_config.get("momentumGate", 0.01))
     config.momentum_gate_max_consec = int(cc_config.get("momentumGateMaxConsec", 3))
     config.min_book_depth = float(cc_config.get("minBookDepth", 5.0))
     config.max_spread_asymmetry = float(cc_config.get("maxSpreadAsymmetry", 0.02))
@@ -816,8 +816,8 @@ class PolyMakerBot(PolymarketBot):
                             ], key=lambda t: t[0], reverse=True)
                             # V15.2-T4: Last Resort Sell config
                             self.config.hedge_t4_enabled = bool(fresh_config.get("hedgeT4Enabled", True))
-                            self.config.hedge_t4_sell_pct = float(fresh_config.get("hedgeTier4Pct", 5.0))
-                            self.config.hedge_t4_max_loss = float(fresh_config.get("hedgeTier4MaxLoss", 0.03))
+                            self.config.hedge_t4_sell_pct = float(fresh_config.get("hedgeTier4Pct", 33.0))
+                            self.config.hedge_t4_max_loss = float(fresh_config.get("hedgeTier4MaxLoss", 0.30))
                             # V15.2: Max order horizon
                             moh = fresh_config.get("maxOrderHorizon")
                             if moh is not None and moh > 0:
@@ -825,7 +825,7 @@ class PolyMakerBot(PolymarketBot):
                             self.config.momentum_exit_enabled = bool(fresh_config.get("momentumExitEnabled", True))
                             self.config.momentum_exit_threshold = float(fresh_config.get("momentumExitThreshold", 0.03))
                             self.config.momentum_exit_max_wait_secs = float(fresh_config.get("momentumExitMaxWait", 120.0))
-                            self.config.momentum_gate_threshold = float(fresh_config.get("momentumGate", 0.005))
+                            self.config.momentum_gate_threshold = float(fresh_config.get("momentumGate", 0.01))
                             self.config.momentum_gate_max_consec = int(fresh_config.get("momentumGateMaxConsec", 3))
                             self.config.min_book_depth = float(fresh_config.get("minBookDepth", 5.0))
                             self.config.max_spread_asymmetry = float(fresh_config.get("maxSpreadAsymmetry", 0.02))

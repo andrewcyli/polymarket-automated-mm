@@ -3021,31 +3021,42 @@ class TradingEngine:
                             if "UP" in sides and "DOWN" in sides:
                                 self.paired_windows.add(wid)
                             elif self.config.hedge_completion_enabled:
-                                # V15.3-FIX: Store token_up/token_down + end_time in hedge entry
-                                # so hedge tiers can work even after cleanup_expired_windows
-                                # removes the window from _market_cache.
-                                _hedge_market = self._market_cache.get(wid, {})
-                                _hedge_meta = self.window_metadata.get(wid, {})
-                                self._pending_hedges.append({
-                                    "window_id": wid, "filled_side": side_label,
-                                    "filled_price": fill_price,
-                                    "filled_size": fill_size,
-                                    "filled_token": fill_token,
-                                    "time": time.time(),
-                                    "token_up": _hedge_market.get("token_up", _hedge_meta.get("token_up", "")),
-                                    "token_down": _hedge_market.get("token_down", _hedge_meta.get("token_down", "")),
-                                    "end_time": _hedge_market.get("end_time", _hedge_meta.get("end_time", 0)),
-                                    "interval": _hedge_market.get("interval", 300 if "-5m-" in wid else 900),
-                                })
-                                # V15.1-25: Track one-sided fill for analytics
-                                self.hedge_analytics["one_sided_fills"] += 1
-                                asset = wid.split("-")[0] if "-" in wid else "unknown"
-                                if asset not in self.hedge_analytics["per_asset"]:
-                                    self.hedge_analytics["per_asset"][asset] = {
-                                        "one_sided": 0, "hedges": 0, "exits": 0,
-                                        "merges": 0, "abandoned": 0, "t4_sells": 0
-                                    }
-                                self.hedge_analytics["per_asset"][asset]["one_sided"] += 1
+                                # V15.5-FIX: Guard against phantom hedges on already-merged windows.
+                                # If a late fill arrives after cleanup_expired_windows already merged
+                                # and claimed the window, do NOT create a pending hedge — the tokens
+                                # are already resolved. Creating a hedge here would buy NEW tokens
+                                # that become orphans themselves.
+                                if wid in self.expired_windows_pending_claim or wid in self.closed_windows:
+                                    self.logger.info(
+                                        "  HEDGE SKIP (ALREADY RESOLVED) | {} | {} | "
+                                        "Window already merged/claimed, skipping phantom hedge".format(
+                                            wid, side_label))
+                                else:
+                                    # V15.3-FIX: Store token_up/token_down + end_time in hedge entry
+                                    # so hedge tiers can work even after cleanup_expired_windows
+                                    # removes the window from _market_cache.
+                                    _hedge_market = self._market_cache.get(wid, {})
+                                    _hedge_meta = self.window_metadata.get(wid, {})
+                                    self._pending_hedges.append({
+                                        "window_id": wid, "filled_side": side_label,
+                                        "filled_price": fill_price,
+                                        "filled_size": fill_size,
+                                        "filled_token": fill_token,
+                                        "time": time.time(),
+                                        "token_up": _hedge_market.get("token_up", _hedge_meta.get("token_up", "")),
+                                        "token_down": _hedge_market.get("token_down", _hedge_meta.get("token_down", "")),
+                                        "end_time": _hedge_market.get("end_time", _hedge_meta.get("end_time", 0)),
+                                        "interval": _hedge_market.get("interval", 300 if "-5m-" in wid else 900),
+                                    })
+                                    # V15.1-25: Track one-sided fill for analytics
+                                    self.hedge_analytics["one_sided_fills"] += 1
+                                    asset = wid.split("-")[0] if "-" in wid else "unknown"
+                                    if asset not in self.hedge_analytics["per_asset"]:
+                                        self.hedge_analytics["per_asset"][asset] = {
+                                            "one_sided": 0, "hedges": 0, "exits": 0,
+                                            "merges": 0, "abandoned": 0, "t4_sells": 0
+                                        }
+                                    self.hedge_analytics["per_asset"][asset]["one_sided"] += 1
                         filled += 1
                         tag = "REST-RECOVERED" if recovered else "REST"
                         self.logger.info("  FILL [{}] | {} {} {:.1f} @ ${:.2f} | {}".format(
@@ -3082,6 +3093,17 @@ class TradingEngine:
             filled_price = hedge["filled_price"]
             filled_size = hedge["filled_size"]
             elapsed = now - hedge["time"]
+
+            # V15.5-FIX: Guard against phantom hedges on already-resolved windows.
+            # If the window was already merged/claimed (e.g., both fills arrived but
+            # fill_sides was cleaned between them), remove the hedge immediately.
+            if wid in self.expired_windows_pending_claim or wid in self.closed_windows:
+                self.logger.info(
+                    "  HEDGE CANCEL (ALREADY RESOLVED) | {} | {} | "
+                    "Window merged/claimed, removing phantom hedge".format(
+                        wid, filled_side))
+                self._pending_hedges.remove(hedge)
+                continue
 
             # V15.3-FIX: Use hedge entry's stored data as PRIMARY source for timing
             # and token info. Falls back to _market_cache then window_metadata.
@@ -4460,11 +4482,17 @@ class MarketMakingStrategy:
                 return
             total_budget = self.config.mm_order_size * 2
             if final_pair_profit >= self.config.edge_premium_threshold:
-                total_budget *= self.config.edge_premium_size_mult
+                boosted = total_budget * self.config.edge_premium_size_mult
+                # V15.5-FIX: Cap premium edge at max_position_per_market to prevent
+                # budget overflow that causes one-sided fills when the second order
+                # exceeds the per-market cap.
+                max_budget = self.config.max_position_per_market
+                total_budget = min(boosted, max_budget)
                 self.logger.info(
-                    "  PREMIUM EDGE | {} | {:.1%} >= {:.1%} | Budget ${:.0f} -> ${:.0f}".format(
+                    "  PREMIUM EDGE | {} | {:.1%} >= {:.1%} | Budget ${:.0f} -> ${:.0f}{}".format(
                         window_id, final_pair_profit, self.config.edge_premium_threshold,
-                        self.config.mm_order_size * 2, total_budget))
+                        self.config.mm_order_size * 2, total_budget,
+                        " (capped at max_position)" if total_budget < boosted else ""))
             num_pairs = total_budget / cost_per_pair
             num_pairs = max(5.0, num_pairs)
             up_size = num_pairs
@@ -4542,7 +4570,8 @@ class MarketMakingStrategy:
                     total_budget_lv = self.config.mm_order_size * 2
                     lv_profit = 1.0 - lv_cost - fee_up - fee_down
                     if lv_profit >= self.config.edge_premium_threshold:
-                        total_budget_lv *= self.config.edge_premium_size_mult
+                        lv_boosted = total_budget_lv * self.config.edge_premium_size_mult
+                        total_budget_lv = min(lv_boosted, self.config.max_position_per_market)
                     lv_pairs = max(5.0, total_budget_lv / lv_cost)
                     up_size = lv_pairs
                     down_size = lv_pairs

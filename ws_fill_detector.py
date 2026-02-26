@@ -453,20 +453,29 @@ class WSFillDetector:
                 if "UP" in sides and "DOWN" in sides:
                     self.engine.paired_windows.add(wid)
                 elif self.engine.config.hedge_completion_enabled:
-                    # V15.4-FIX: Dedup — only add hedge if window not already pending
-                    already_pending = any(
-                        h["window_id"] == wid and h["filled_side"] == side_label
-                        for h in self.engine._pending_hedges
-                    )
-                    if not already_pending:
-                        self.engine._pending_hedges.append({
-                            "window_id": wid,
-                            "filled_side": side_label,
-                            "filled_price": fill_price,
-                            "filled_size": fill_size,
-                            "filled_token": fill_token,
-                            "time": time.time(),
-                        })
+                    # V15.5-FIX: Guard against phantom hedges on already-merged windows.
+                    # If a late fill arrives after cleanup_expired_windows already merged
+                    # and claimed the window, do NOT create a pending hedge.
+                    if wid in self.engine.expired_windows_pending_claim or wid in self.engine.closed_windows:
+                        self.logger.info(
+                            "  HEDGE SKIP (ALREADY RESOLVED) | {} | {} | "
+                            "Window already merged/claimed, skipping phantom hedge".format(
+                                wid, side_label))
+                    else:
+                        # V15.4-FIX: Dedup — only add hedge if window not already pending
+                        already_pending = any(
+                            h["window_id"] == wid and h["filled_side"] == side_label
+                            for h in self.engine._pending_hedges
+                        )
+                        if not already_pending:
+                            self.engine._pending_hedges.append({
+                                "window_id": wid,
+                                "filled_side": side_label,
+                                "filled_price": fill_price,
+                                "filled_size": fill_size,
+                                "filled_token": fill_token,
+                                "time": time.time(),
+                            })
 
             # Mark as processed
             self._processed_order_ids.add(order_id)
