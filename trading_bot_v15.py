@@ -3010,12 +3010,21 @@ class TradingEngine:
                             if "UP" in sides and "DOWN" in sides:
                                 self.paired_windows.add(wid)
                             elif self.config.hedge_completion_enabled:
+                                # V15.3-FIX: Store token_up/token_down + end_time in hedge entry
+                                # so hedge tiers can work even after cleanup_expired_windows
+                                # removes the window from _market_cache.
+                                _hedge_market = self._market_cache.get(wid, {})
+                                _hedge_meta = self.window_metadata.get(wid, {})
                                 self._pending_hedges.append({
                                     "window_id": wid, "filled_side": side_label,
                                     "filled_price": fill_price,
                                     "filled_size": fill_size,
                                     "filled_token": fill_token,
                                     "time": time.time(),
+                                    "token_up": _hedge_market.get("token_up", _hedge_meta.get("token_up", "")),
+                                    "token_down": _hedge_market.get("token_down", _hedge_meta.get("token_down", "")),
+                                    "end_time": _hedge_market.get("end_time", _hedge_meta.get("end_time", 0)),
+                                    "interval": _hedge_market.get("interval", 300 if "-5m-" in wid else 900),
                                 })
                                 # V15.1-25: Track one-sided fill for analytics
                                 self.hedge_analytics["one_sided_fills"] += 1
@@ -3060,28 +3069,32 @@ class TradingEngine:
             filled_size = hedge["filled_size"]
             elapsed = now - hedge["time"]
 
-            # Get window end_time and interval from market cache to compute % remaining
+            # V15.3-FIX: Use hedge entry's stored data as PRIMARY source for timing
+            # and token info. Falls back to _market_cache then window_metadata.
+            # This ensures hedge tiers work even after cleanup_expired_windows
+            # removes the window from _market_cache.
             market = self._market_cache.get(wid)
-            if market:
-                window_end = market.get("end_time", 0)
-                window_duration = market.get("interval", 900)  # 900s=15m, 300s=5m
-            else:
-                # Fallback: try metadata
-                meta = self.window_metadata.get(wid, {})
-                window_end = meta.get("end_time", 0)
-                # Parse interval from window_id (e.g. "xrp-15m-1772062200")
+            # Timing data: prefer hedge entry (always available), then market, then metadata
+            window_end = hedge.get("end_time", 0)
+            window_duration = hedge.get("interval", 0)
+            if not window_end:
+                if market:
+                    window_end = market.get("end_time", 0)
+                    window_duration = market.get("interval", 900)
+                else:
+                    meta = self.window_metadata.get(wid, {})
+                    window_end = meta.get("end_time", 0)
+                    window_duration = 300 if "-5m-" in wid else 900
+            if not window_duration:
                 window_duration = 300 if "-5m-" in wid else 900
 
             # V15.2-FIX: window_end is the observation START (slug timestamp),
             # not the market close. Actual market close = window_end + window_duration.
-            # All tier % calculations must use the actual market close time.
             actual_market_close = window_end + window_duration
             time_remaining = max(0, actual_market_close - now)
             pct_remaining = (time_remaining / window_duration * 100) if window_duration > 0 else 0
 
             # Determine which tier applies based on % remaining
-            # Tiers are sorted descending by pct. The first tier whose threshold
-            # is >= pct_remaining is the active one (most aggressive that applies).
             active_tier = None
             active_tier_idx = -1
             for idx, (tier_pct, tier_cost) in enumerate(hedge_tiers):
@@ -3100,13 +3113,35 @@ class TradingEngine:
                 self._pending_hedges.remove(hedge)
                 continue
 
-            if not market:
-                # Window expired with no market data — give up
+            # V15.3-FIX: Resolve other_token from hedge entry, market cache, or metadata
+            # (no longer gated on 'if not market' which caused all hedges to silently fail)
+            other_token = ""
+            if market:
+                other_token = market["token_up"] if other_side == "UP" else market["token_down"]
+            else:
+                # Use hedge entry's stored tokens (V15.3)
+                other_token = hedge.get("token_up", "") if other_side == "UP" else hedge.get("token_down", "")
+                if not other_token:
+                    # Last resort: window_metadata
+                    meta = self.window_metadata.get(wid, {})
+                    other_token = meta.get("token_up", "") if other_side == "UP" else meta.get("token_down", "")
+            if not other_token:
+                # No token data available — abandon if expired
                 if time_remaining <= 0:
                     self._pending_hedges.remove(hedge)
+                    self.hedges_skipped += 1
+                    self.hedge_analytics["resolved_abandoned"] += 1
+                    asset = wid.split("-")[0] if "-" in wid else "unknown"
+                    if asset not in self.hedge_analytics["per_asset"]:
+                        self.hedge_analytics["per_asset"][asset] = {
+                            "one_sided": 0, "hedges": 0, "exits": 0,
+                            "merges": 0, "abandoned": 0, "t4_sells": 0
+                        }
+                    self.hedge_analytics["per_asset"][asset]["abandoned"] += 1
+                    self.logger.warning(
+                        "  HEDGE ABANDON (NO TOKEN) | {} | No token data for {} side".format(
+                            wid, other_side))
                 continue
-
-            other_token = market["token_up"] if other_side == "UP" else market["token_down"]
             spread = book_reader.get_spread(other_token)
             if not spread:
                 if time_remaining <= 0:
@@ -3136,12 +3171,13 @@ class TradingEngine:
             if other_ask > max_other_price:
                 # If we haven't exhausted all tiers, keep waiting for next tier
                 if not is_last_tier and time_remaining > 0:
-                    self.logger.debug(
+                    self.logger.info(
                         "  HEDGE WAIT T{} | {} | {} ask ${:.2f} > max ${:.2f} | "
-                        "{:.0f}% remaining ({}s left)".format(
+                        "{:.0f}% remaining ({}s left) | src={}".format(
                             active_tier_idx + 1, wid,
                             other_side, other_ask, max_other_price,
-                            pct_remaining, int(time_remaining)))
+                            pct_remaining, int(time_remaining),
+                            "cache" if market else "hedge-entry"))
                     continue
                 # ── V15.2-T4: Last Resort Sell ──────────────────────────────
                 # All buy-tiers exhausted. Instead of abandoning, try to SELL
@@ -4884,10 +4920,17 @@ class PolymarketBot:
             if other_side in sides and len(sides[other_side]) > 0:
                 self.engine._pending_hedges.remove(hedge)
                 continue
+            # V15.3-FIX: Resolve other_token from market cache, hedge entry, or metadata
             market = self.engine._market_cache.get(wid)
-            if not market:
+            if market:
+                other_token = market["token_up"] if other_side == "UP" else market["token_down"]
+            else:
+                other_token = hedge.get("token_up", "") if other_side == "UP" else hedge.get("token_down", "")
+                if not other_token:
+                    meta = self.engine.window_metadata.get(wid, {})
+                    other_token = meta.get("token_up", "") if other_side == "UP" else meta.get("token_down", "")
+            if not other_token:
                 continue
-            other_token = market["token_up"] if other_side == "UP" else market["token_down"]
             spread = self.book_reader.get_spread(other_token)
             if not spread:
                 continue
@@ -4999,8 +5042,9 @@ class PolymarketBot:
         self.logger.info("  Capital in Pos:   ${:.2f}".format(stats["capital_in_positions"]))
         self.logger.info("  Available Cap:    ${:.2f}".format(stats["available_capital"]))
         self.logger.info("  Session Spent:    ${:.2f}".format(stats["session_spent"]))
-        self.logger.info("  Hedges:           {} completed / {} skipped".format(
-            stats["hedges_completed"], stats["hedges_skipped"]))
+        self.logger.info("  Hedges:           {} completed / {} skipped / {} pending".format(
+            stats["hedges_completed"], stats["hedges_skipped"],
+            len(self.engine._pending_hedges)))
         self.logger.info("  Paired Windows:   {}".format(stats["paired_windows"]))
         merge_stats = self.auto_merger.get_stats()
         self.logger.info("  Merges:           {} ok / {} fail | ${:.2f} returned".format(
