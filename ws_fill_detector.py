@@ -80,7 +80,7 @@ class WSFillDetector:
         self._ws_cancelled_orders: Dict[str, dict] = {}  # order_id -> cancel data
         # Periodic REST reconciliation counter
         self._cycle_count = 0
-        self._rest_reconcile_interval = 10  # Run REST reconciliation every N cycles
+        self._rest_reconcile_interval = 2  # V15.5-FIX3: Reduced from 10 to 2 cycles for faster fill detection
         self._last_rest_reconcile: float = 0
         # Track partial fills from cancellation events
         self._partial_fill_queue: deque = deque()

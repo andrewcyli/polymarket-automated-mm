@@ -2575,8 +2575,76 @@ class TradingEngine:
     def cleanup_expired_windows(self, active_markets, churn_manager=None):
         active_ids = {m["window_id"] for m in active_markets}
         expired = [w for w in self.known_windows if w not in active_ids]
+
+        # ── V15.5-FIX3: REST check before cancel ──────────────────────────
+        # Before cancelling orders on expired windows, check the exchange via
+        # REST API to see if any orders have already filled. This catches fills
+        # that Polymarket processed but whose WS notification hasn't arrived yet
+        # (96% of fills are WS-RECOVERED due to 4-90s WS latency).
+        exchange_open_ids = None
+        if not self.config.dry_run and self.client and expired:
+            try:
+                open_orders = self.client.get_orders()
+                if isinstance(open_orders, list):
+                    exchange_open_ids = {o.get("id", o.get("orderID", "")) for o in open_orders}
+            except Exception as e:
+                self.logger.warning("  REST PRE-CANCEL CHECK FAILED | {}".format(str(e)[:100]))
+
         for wid in expired:
             oids = self.orders_by_window.pop(wid, [])
+
+            # V15.5-FIX3: Check each order against REST before cancelling.
+            # If an order is NOT on the exchange AND was NOT already processed,
+            # it was filled — process it as a fill instead of cancelling.
+            if exchange_open_ids is not None:
+                for oid in list(oids):
+                    if oid.startswith("DRY-"):
+                        continue
+                    if oid not in self.active_orders:
+                        continue
+                    if oid in exchange_open_ids:
+                        continue  # Still open on exchange, will be cancelled below
+                    # Order NOT on exchange = filled! Process it before cancel.
+                    info = self.active_orders.pop(oid, None)
+                    if not info:
+                        continue
+                    fill_price = info.get("price", 0)
+                    fill_size = info.get("size", 0)
+                    fill_side = info.get("side", "BUY")
+                    fill_token = info.get("token_id", "")
+                    self.record_fill(fill_token, fill_side, fill_price, fill_size)
+                    if fill_side == "BUY":
+                        cost = fill_price * fill_size
+                        self.window_fill_cost[wid] = self.window_fill_cost.get(wid, 0) + cost
+                        self.filled_windows.add(wid)
+                        self.window_entry_count[wid] = self.window_entry_count.get(wid, 0) + 1
+                        if wid not in self.window_fill_tokens:
+                            self.window_fill_tokens[wid] = []
+                        self.window_fill_tokens[wid].append({
+                            "token_id": fill_token, "size": fill_size,
+                            "price": fill_price,
+                            "is_up": self._is_up_token_cache.get(fill_token),
+                            "time": time.time(),
+                        })
+                        is_up = self._is_up_token_cache.get(fill_token)
+                        side_label = "UP" if is_up else "DOWN"
+                        if wid not in self.window_fill_sides:
+                            self.window_fill_sides[wid] = {}
+                        if side_label not in self.window_fill_sides[wid]:
+                            self.window_fill_sides[wid][side_label] = []
+                        self.window_fill_sides[wid][side_label].append({
+                            "token_id": fill_token, "price": fill_price,
+                            "size": fill_size, "time": time.time(),
+                        })
+                        sides = self.window_fill_sides.get(wid, {})
+                        if "UP" in sides and "DOWN" in sides:
+                            self.paired_windows.add(wid)
+                        self.logger.info(
+                            "  FILL [REST-PRE-CANCEL] | {} {} {:.1f} @ ${:.2f} | {}".format(
+                                side_label, fill_token[:12] + "...",
+                                fill_size, fill_price, wid))
+                    oids.remove(oid)  # Don't cancel this order — it's already filled
+
             for oid in oids:
                 if oid in self.active_orders:
                     self._recently_cancelled[oid] = {
@@ -5337,25 +5405,29 @@ class PolymarketBot:
             self.logger.warning("  !! Free RPC will rate-limit. Set POLYGON_RPC_URL to Alchemy/Infura.")
         self.logger.info("=" * 70)
 
-        # V15.1-5: Bankroll auto-detect with more retries
-        if self.config.auto_detect_bankroll and self.balance_checker and not self.config.dry_run:
+        # V15.5-FIX3: ALWAYS detect wallet balance for loss gate,
+        # even when auto_detect_bankroll is False (CC is bankroll authority).
+        if self.balance_checker and not self.config.dry_run:
             wallet_bal = None
             for _attempt in range(5):
                 self.balance_checker._cache_time = 0  # force fresh read
                 wallet_bal = self.balance_checker.get_balance()
                 if wallet_bal is not None:
                     break
-                self.logger.info("  Bankroll detect attempt {} failed, retrying...".format(_attempt + 1))
+                self.logger.info("  Wallet detect attempt {} failed, retrying...".format(_attempt + 1))
                 time.sleep(3)
             if wallet_bal is not None and wallet_bal > 0:
-                old_bankroll = self.config.kelly_bankroll
-                self.config.kelly_bankroll = wallet_bal
+                # Always set starting_wallet_balance for the loss gate
                 self.engine.starting_wallet_balance = wallet_bal
-                self.logger.info("  Bankroll: ${:.2f} (was ${:.2f})".format(
-                    wallet_bal, old_bankroll))
+                self.logger.info("  Wallet balance: ${:.2f} (loss gate baseline)".format(wallet_bal))
+                if self.config.auto_detect_bankroll:
+                    # Only override CC bankroll if auto_detect is ON
+                    old_bankroll = self.config.kelly_bankroll
+                    self.config.kelly_bankroll = wallet_bal
+                    self.logger.info("  Bankroll: ${:.2f} (was ${:.2f})".format(
+                        wallet_bal, old_bankroll))
             else:
-                self.logger.warning("  Bankroll auto-detect FAILED. Using KELLY_BANKROLL=${:.0f}".format(
-                    self.config.kelly_bankroll))
+                self.logger.warning("  Wallet detect FAILED. Loss gate will be DISABLED.")
 
         # V15.1-1: ALWAYS scale exposure with bankroll (whether auto-detect succeeded or not)
         self.config.max_total_exposure = self.config.kelly_bankroll * 0.80

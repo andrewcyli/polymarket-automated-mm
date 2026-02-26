@@ -214,8 +214,8 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     # pct_remaining is the % of window time left — tier triggers when remaining < threshold
     config.hedge_tiers = [
         (float(cc_config.get("hedgeTier1Pct", 67)), float(cc_config.get("hedgeTier1Cost", 1.03))),
-        (float(cc_config.get("hedgeTier2Pct", 33)), float(cc_config.get("hedgeTier2Cost", 1.05))),
-        (float(cc_config.get("hedgeTier3Pct", 13)), float(cc_config.get("hedgeTier3Cost", 1.08))),
+        (float(cc_config.get("hedgeTier2Pct", 50)), float(cc_config.get("hedgeTier2Cost", 1.10))),
+        (float(cc_config.get("hedgeTier3Pct", 33)), float(cc_config.get("hedgeTier3Cost", 1.20))),
     ]
     # Sort tiers by pct descending (T1=67% triggers first, T3=13% triggers last)
     config.hedge_tiers = sorted(config.hedge_tiers, key=lambda t: t[0], reverse=True)
@@ -821,8 +821,8 @@ class PolyMakerBot(PolymarketBot):
                             self.config.hedge_min_profit_per_share = float(fresh_config.get("hedgeMinProfit", 0.005))
                             self.config.hedge_tiers = sorted([
                                 (float(fresh_config.get("hedgeTier1Pct", 67)), float(fresh_config.get("hedgeTier1Cost", 1.03))),
-                                (float(fresh_config.get("hedgeTier2Pct", 33)), float(fresh_config.get("hedgeTier2Cost", 1.05))),
-                                (float(fresh_config.get("hedgeTier3Pct", 13)), float(fresh_config.get("hedgeTier3Cost", 1.08))),
+                                (float(fresh_config.get("hedgeTier2Pct", 50)), float(fresh_config.get("hedgeTier2Cost", 1.10))),
+                                (float(fresh_config.get("hedgeTier3Pct", 33)), float(fresh_config.get("hedgeTier3Cost", 1.20))),
                             ], key=lambda t: t[0], reverse=True)
                             # V15.2-T4: Last Resort Sell config
                             self.config.hedge_t4_enabled = bool(fresh_config.get("hedgeT4Enabled", True))
