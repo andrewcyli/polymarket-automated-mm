@@ -343,6 +343,25 @@ class BotConfig:
     momentum_exit_min_hold_secs: float = 10.0  # Min hold time before checking
     momentum_exit_max_wait_secs: float = 120.0 # Max wait for hedge before checking momentum
 
+    # V15.6: VPIN toxicity filter — pause when order flow is one-sided
+    vpin_enabled: bool = True
+    vpin_lookback_secs: float = 60.0       # Window to measure buy/sell volume
+    vpin_threshold: float = 0.70           # |buy_vol - sell_vol| / total_vol > this = toxic
+    vpin_min_trades: int = 5               # Need at least N trades to compute VPIN
+    vpin_spread_multiplier: float = 1.5    # Widen spread by this when VPIN is elevated (0.4-0.7)
+    vpin_block_multiplier: float = 2.0     # Widen spread by this when VPIN > threshold (>0.7)
+
+    # V15.6: Dynamic spread — scale mm_base_spread with realized volatility
+    dynamic_spread_enabled: bool = True
+    dynamic_spread_vol_floor: float = 1.0   # Multiplier at LOW vol (no change)
+    dynamic_spread_vol_medium: float = 1.3  # Multiplier at MEDIUM vol
+    dynamic_spread_vol_high: float = 1.8    # Multiplier at HIGH vol
+    dynamic_spread_vol_extreme: float = 2.5 # Multiplier at EXTREME vol (belt-and-suspenders with circuit breaker)
+
+    # V15.6: Extended pre-exit — timeframe-aware exit timing
+    pre_exit_time_5m: float = 60.0         # 60s before end for 5-min windows
+    pre_exit_time_15m: float = 120.0       # 120s before end for 15-min windows
+
     # V15.1-19: Pre-entry filters for orphan reduction
     momentum_gate_threshold: float = 0.010   # V15.5: Raised from 0.2% to 1.0% — tighter gate rejects
                                                # volatile windows. Data: at 0.5% gate, Kelly=+36%.
@@ -654,6 +673,126 @@ class VolatilityTracker:
                 level, vol = self._compute_vol(asset)
                 stats[asset] = {"level": level, "vol_sum": vol, "asset": asset}
         return stats
+
+
+# -----------------------------------------------------------------
+# V15.6: VPIN Toxicity Tracker
+# -----------------------------------------------------------------
+
+class VPINTracker:
+    """
+    Volume-Synchronized Probability of Informed Trading (VPIN).
+    
+    Measures the imbalance between buy-initiated and sell-initiated volume
+    from the WebSocket trade stream. High VPIN indicates informed traders
+    are active (adverse selection risk), signaling the bot to widen spreads
+    or pause quoting.
+    
+    Uses the Lee-Ready tick rule: trades above midpoint are buy-initiated,
+    trades below are sell-initiated. Trades at midpoint use the "side" field
+    from the WebSocket event.
+    """
+
+    def __init__(self, config, state_store=None, logger=None):
+        self.config = config
+        self.state_store = state_store
+        self.logger = logger
+        # Per-token VPIN cache: {token_id: (vpin_value, timestamp)}
+        self._cache = {}
+        self._cache_ttl = 5.0  # Recompute every 5s max
+        # Analytics
+        self._total_checks = 0
+        self._blocks = 0
+        self._widens = 0
+
+    def compute_vpin(self, token_id):
+        """
+        Compute VPIN for a token using recent trades from WebSocket.
+        Returns (vpin_value, num_trades) where vpin_value is in [0, 1].
+        0 = perfectly balanced, 1 = completely one-sided.
+        Returns (None, 0) if insufficient data.
+        """
+        now = time.time()
+        # Check cache
+        if token_id in self._cache:
+            cached_vpin, cached_trades, cached_ts = self._cache[token_id]
+            if now - cached_ts < self._cache_ttl:
+                return cached_vpin, cached_trades
+
+        if not self.state_store:
+            return None, 0
+
+        trades = self.state_store.get_recent_trades(
+            token_id, max_age=self.config.vpin_lookback_secs)
+
+        if len(trades) < self.config.vpin_min_trades:
+            return None, 0
+
+        buy_vol = 0.0
+        sell_vol = 0.0
+        for t in trades:
+            size = float(t.get("size", 0))
+            side = t.get("side", "").upper()
+            if side == "BUY":
+                buy_vol += size
+            elif side == "SELL":
+                sell_vol += size
+            else:
+                # Unknown side — split evenly (conservative)
+                buy_vol += size / 2
+                sell_vol += size / 2
+
+        total_vol = buy_vol + sell_vol
+        if total_vol <= 0:
+            return None, 0
+
+        vpin = abs(buy_vol - sell_vol) / total_vol
+        self._cache[token_id] = (vpin, len(trades), now)
+        return vpin, len(trades)
+
+    def get_spread_multiplier(self, token_up, token_down):
+        """
+        Get the spread multiplier based on VPIN of both tokens.
+        Returns (multiplier, vpin_level_str, max_vpin_value).
+        
+        multiplier:
+          1.0  = normal (VPIN < 0.40 or insufficient data)
+          vpin_spread_multiplier = elevated (0.40 <= VPIN < threshold)
+          vpin_block_multiplier  = toxic (VPIN >= threshold)
+        """
+        if not self.config.vpin_enabled:
+            return 1.0, "OFF", 0.0
+
+        self._total_checks += 1
+        vpin_up, n_up = self.compute_vpin(token_up)
+        vpin_dn, n_dn = self.compute_vpin(token_down)
+
+        # Use the higher VPIN of the two tokens
+        max_vpin = 0.0
+        if vpin_up is not None:
+            max_vpin = max(max_vpin, vpin_up)
+        if vpin_dn is not None:
+            max_vpin = max(max_vpin, vpin_dn)
+
+        if max_vpin <= 0.0 and vpin_up is None and vpin_dn is None:
+            return 1.0, "NO_DATA", 0.0
+
+        if max_vpin >= self.config.vpin_threshold:
+            self._blocks += 1
+            return self.config.vpin_block_multiplier, "TOXIC", max_vpin
+        elif max_vpin >= 0.40:
+            self._widens += 1
+            return self.config.vpin_spread_multiplier, "ELEVATED", max_vpin
+        else:
+            return 1.0, "NORMAL", max_vpin
+
+    def get_stats(self):
+        return {
+            "total_checks": self._total_checks,
+            "blocks": self._blocks,
+            "widens": self._widens,
+            "block_rate": self._blocks / max(1, self._total_checks),
+        }
 
 
 # -----------------------------------------------------------------
@@ -2363,7 +2502,16 @@ class AutoClaimManager:
         for market in markets:
             wid = market["window_id"]
             time_left = market["end_time"] - now
-            if time_left > self.config.pre_exit_time_seconds or time_left < 5:
+            # V15.6: Timeframe-aware pre-exit timing
+            # 5m windows: exit 60s before end (was 30s)
+            # 15m windows: exit 120s before end (was 30s)
+            # Adverse selection peaks in the final minute; earlier exit protects held positions
+            tf = market.get("timeframe", "5m")
+            if tf == "15m":
+                pre_exit_window = getattr(self.config, 'pre_exit_time_15m', self.config.pre_exit_time_seconds)
+            else:
+                pre_exit_window = getattr(self.config, 'pre_exit_time_5m', self.config.pre_exit_time_seconds)
+            if time_left > pre_exit_window or time_left < 5:
                 continue
             token_up = market["token_up"]
             token_down = market["token_down"]
@@ -3994,6 +4142,10 @@ class TradingEngine:
             "exit_avg_profit": (sum(ha["exit_profits"]) / len(ha["exit_profits"])) if ha["exit_profits"] else 0,
             "exit_avg_hold_time": (sum(ha["exit_hold_times"]) / len(ha["exit_hold_times"])) if ha["exit_hold_times"] else 0,
             "per_asset": ha["per_asset"],
+            # V15.6: VPIN toxicity stats
+            "vpin_blocks": ha.get("vpin_blocks", 0),
+            "vpin_widens": ha.get("vpin_widens", 0),
+            "midpoint_skips": ha.get("midpoint_skips", 0),
         }
         for tier in ["t1", "t2", "t3", "t4"]:
             costs = ha["tier_costs"][tier]
@@ -4313,7 +4465,7 @@ class SimulatedFillEngine:
 
 class MarketMakingStrategy:
     def __init__(self, config, engine, book_reader, price_feed, kelly, fee_calc,
-                 logger, reward_optimizer, vol_tracker, churn_manager):
+                 logger, reward_optimizer, vol_tracker, churn_manager, vpin_tracker=None):
         self.config = config
         self.engine = engine
         self.book_reader = book_reader
@@ -4324,6 +4476,7 @@ class MarketMakingStrategy:
         self.reward_optimizer = reward_optimizer
         self.vol_tracker = vol_tracker
         self.churn_manager = churn_manager
+        self.vpin_tracker = vpin_tracker  # V15.6: VPIN toxicity tracker
         self.last_refresh = {}
         self._window_first_placed = {}  # {window_id: timestamp} — when orders were first placed
         self._cycle_reward_estimates = []
@@ -4491,6 +4644,45 @@ class MarketMakingStrategy:
                 self.engine.hedge_analytics["midpoint_skips"] = 0
             self.engine.hedge_analytics["midpoint_skips"] += 1
             return
+        # V15.6: VPIN toxicity filter — widen spread or block when order flow is one-sided
+        vpin_spread_mult = 1.0
+        vpin_level_str = "OFF"
+        vpin_value = 0.0
+        if self.vpin_tracker:
+            vpin_spread_mult, vpin_level_str, vpin_value = self.vpin_tracker.get_spread_multiplier(
+                market["token_up"], market["token_down"])
+            if vpin_level_str == "TOXIC":
+                self.logger.info(
+                    "  VPIN TOXIC | {} | VPIN: {:.2f} > {:.2f} | Spread x{:.1f} | "
+                    "Order flow too one-sided".format(
+                        window_id, vpin_value, self.config.vpin_threshold,
+                        vpin_spread_mult))
+                # Track VPIN blocks in analytics
+                if "vpin_blocks" not in self.engine.hedge_analytics:
+                    self.engine.hedge_analytics["vpin_blocks"] = 0
+                self.engine.hedge_analytics["vpin_blocks"] += 1
+            elif vpin_level_str == "ELEVATED":
+                self.logger.info(
+                    "  VPIN ELEVATED | {} | VPIN: {:.2f} | Spread x{:.1f}".format(
+                        window_id, vpin_value, vpin_spread_mult))
+                if "vpin_widens" not in self.engine.hedge_analytics:
+                    self.engine.hedge_analytics["vpin_widens"] = 0
+                self.engine.hedge_analytics["vpin_widens"] += 1
+
+        # V15.6: Dynamic spread — scale base spread with realized volatility
+        dynamic_base_spread = self.config.mm_base_spread
+        if self.config.dynamic_spread_enabled:
+            if vol_level == "EXTREME":
+                dynamic_base_spread = self.config.mm_base_spread * self.config.dynamic_spread_vol_extreme
+            elif vol_level == "HIGH":
+                dynamic_base_spread = self.config.mm_base_spread * self.config.dynamic_spread_vol_high
+            elif vol_level == "MEDIUM":
+                dynamic_base_spread = self.config.mm_base_spread * self.config.dynamic_spread_vol_medium
+            else:
+                dynamic_base_spread = self.config.mm_base_spread * self.config.dynamic_spread_vol_floor
+        # Apply VPIN multiplier on top of volatility-adjusted spread
+        dynamic_base_spread *= vpin_spread_mult
+
         # V15.1-12: Relaxed directional filter — CL-DN/CL-UP now only block
         # at STRONG confidence (>80%). At 60-80% (CL- prefix), the skew already
         # adjusts prices to favor the predicted side, which is sufficient protection.
@@ -4505,11 +4697,11 @@ class MarketMakingStrategy:
         else:
             optimal_d = None
         if optimal_d is None:
-            optimal_d = self.config.mm_base_spread
+            optimal_d = dynamic_base_spread  # V15.6: Use dynamic spread instead of fixed
             if vol_level == "HIGH":
-                optimal_d = self.config.mm_base_spread * 1.5
+                optimal_d = dynamic_base_spread * 1.5
             elif vol_level == "MEDIUM":
-                optimal_d = self.config.mm_base_spread * 1.2
+                optimal_d = dynamic_base_spread * 1.2
             buy_up = midpoint - optimal_d
             buy_down = (1.0 - midpoint) - optimal_d
             if buy_up > 0.02 and buy_down > 0.02:
@@ -4534,15 +4726,14 @@ class MarketMakingStrategy:
                         pair_cost = new_pair_cost
                         pair_profit = 1.0 - new_pair_cost
                         reward_score = self.reward_optimizer.reward_score(spread, optimal_d)
-        # Fix 3: Enforce optimal_d >= mm_base_spread (CC mmSpreadMin)
+        # Fix 3: Enforce optimal_d >= dynamic_base_spread (V15.6: vol+VPIN adjusted)
         # This ensures the bot never places orders closer to midpoint than the
-        # configured minimum spread, regardless of what the reward optimizer suggests.
-        # Scales automatically when mmSpreadMin is changed in CC.
-        if optimal_d < self.config.mm_base_spread:
+        # dynamically adjusted minimum spread (base * vol_mult * vpin_mult).
+        if optimal_d < dynamic_base_spread:
             self.logger.debug(
-                "  SPREAD FLOOR | {} | d={:.3f} < min {:.3f}, using min".format(
-                    window_id, optimal_d, self.config.mm_base_spread))
-            optimal_d = self.config.mm_base_spread
+                "  SPREAD FLOOR | {} | d={:.3f} < min {:.3f} (base {:.3f} x vol x vpin), using min".format(
+                    window_id, optimal_d, dynamic_base_spread, self.config.mm_base_spread))
+            optimal_d = dynamic_base_spread
         buy_up_price = round(midpoint - optimal_d + skew, 2)
         buy_down_price = round((1.0 - midpoint) - optimal_d - skew, 2)
         if buy_up_price <= 0.02 or buy_down_price <= 0.02:
@@ -4583,10 +4774,10 @@ class MarketMakingStrategy:
             guaranteed_profit = num_pairs * final_pair_profit
             self.logger.info(
                 "  PAIR OK | {} | d={:.3f} | UP:{:.2f} + DN:{:.2f} = {:.3f} | "
-                "Profit: ${:.3f}/pair x {:.0f} = ${:.2f} guaranteed | Reward: {:.1%} | Vol: {}".format(
+                "Profit: ${:.3f}/pair x {:.0f} = ${:.2f} guaranteed | Reward: {:.1%} | Vol: {} | VPIN: {} ({:.2f})".format(
                     window_id, optimal_d, buy_up_price, buy_down_price,
                     final_pair_cost, final_pair_profit, num_pairs, guaranteed_profit,
-                    reward_score, vol_level))
+                    reward_score, vol_level, vpin_level_str, vpin_value))
         else:
             up_size = max(5.0, self.config.mm_order_size / buy_up_price) if buy_up_price > 0.02 else 0
             down_size = max(5.0, self.config.mm_order_size / buy_down_price) if buy_down_price > 0.02 else 0

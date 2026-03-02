@@ -24,7 +24,7 @@ load_dotenv()
 
 # Import v15 bot components
 from trading_bot_v15 import (
-    PolymarketBot, BotConfig, setup_logging, LOG_DIR
+    PolymarketBot, BotConfig, setup_logging, LOG_DIR, VPINTracker
 )
 
 # Import Command Center client
@@ -270,9 +270,31 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     blackout_raw = cc_config.get("tradingBlackoutWindows", [])
     config.trading_blackout_windows = blackout_raw if isinstance(blackout_raw, list) else []
 
+    # V15.6: VPIN toxicity filter
+    config.vpin_enabled = bool(cc_config.get("vpinEnabled", True))
+    config.vpin_lookback_secs = float(cc_config.get("vpinLookbackSecs", 60.0))
+    config.vpin_threshold = float(cc_config.get("vpinThreshold", 0.70))
+    config.vpin_min_trades = int(cc_config.get("vpinMinTrades", 5))
+    config.vpin_spread_multiplier = float(cc_config.get("vpinSpreadMultiplier", 1.5))
+    config.vpin_block_multiplier = float(cc_config.get("vpinBlockMultiplier", 2.0))
+
+    # V15.6: Dynamic spread
+    config.dynamic_spread_enabled = bool(cc_config.get("dynamicSpreadEnabled", True))
+    config.dynamic_spread_vol_floor = float(cc_config.get("dynamicSpreadVolFloor", 1.0))
+    config.dynamic_spread_vol_medium = float(cc_config.get("dynamicSpreadVolMedium", 1.3))
+    config.dynamic_spread_vol_high = float(cc_config.get("dynamicSpreadVolHigh", 1.8))
+    config.dynamic_spread_vol_extreme = float(cc_config.get("dynamicSpreadVolExtreme", 2.5))
+
+    # V15.6: Extended pre-exit timing
+    config.pre_exit_time_5m = float(cc_config.get("preExitTime5m", 60.0))
+    config.pre_exit_time_15m = float(cc_config.get("preExitTime15m", 120.0))
+
     print(f"  Pre-entry filters: MomGate={config.momentum_gate_threshold:.3f} (bypass@{config.momentum_gate_max_consec}) | "
           f"MidSkew={config.midpoint_skew_limit:.2f} | MinDepth=${config.min_book_depth:.0f} | MaxSpreadAsym={config.max_spread_asymmetry:.3f}")
     print(f"  Gate asset scale: " + " | ".join(f"{a}={s:.1f}x" for a, s in config.momentum_gate_asset_scale.items()))
+    print(f"  V15.6: VPIN={'ON' if config.vpin_enabled else 'OFF'} (thresh={config.vpin_threshold:.0%}, lookback={config.vpin_lookback_secs:.0f}s) | "
+          f"DynSpread={'ON' if config.dynamic_spread_enabled else 'OFF'} (L/M/H/X={config.dynamic_spread_vol_floor:.1f}/{config.dynamic_spread_vol_medium:.1f}/{config.dynamic_spread_vol_high:.1f}/{config.dynamic_spread_vol_extreme:.1f}) | "
+          f"PreExit 5m={config.pre_exit_time_5m:.0f}s 15m={config.pre_exit_time_15m:.0f}s")
     if config.trading_blackout_windows:
         print(f"  Blackout windows: {config.trading_blackout_windows}")
 
@@ -442,6 +464,12 @@ class PolyMakerBot(PolymarketBot):
                         derived.api_key, derived.api_secret, derived.api_passphrase
                     )
                 self.logger.info("  WebSocket manager initialized (market+user+rtds)")
+                # V15.6: VPIN toxicity tracker — uses WS trade stream
+                self.vpin_tracker = VPINTracker(
+                    self.config, state_store=self.ws_manager.state_store, logger=self.logger)
+                self.mm_strategy.vpin_tracker = self.vpin_tracker
+                self.logger.info("  VPIN tracker initialized (threshold={:.0%}, lookback={}s)".format(
+                    self.config.vpin_threshold, self.config.vpin_lookback_secs))
                 # Phase 2: WS-based fill detection
                 self.ws_fill_detector = WSFillDetector(
                     ws_manager=self.ws_manager,
@@ -839,6 +867,22 @@ class PolyMakerBot(PolymarketBot):
                             self.config.momentum_gate_max_consec = int(fresh_config.get("momentumGateMaxConsec", 3))
                             self.config.min_book_depth = float(fresh_config.get("minBookDepth", 5.0))
                             self.config.max_spread_asymmetry = float(fresh_config.get("maxSpreadAsymmetry", 0.02))
+                            # V15.6: VPIN hot-reload
+                            self.config.vpin_enabled = bool(fresh_config.get("vpinEnabled", True))
+                            self.config.vpin_lookback_secs = float(fresh_config.get("vpinLookbackSecs", 60.0))
+                            self.config.vpin_threshold = float(fresh_config.get("vpinThreshold", 0.70))
+                            self.config.vpin_min_trades = int(fresh_config.get("vpinMinTrades", 5))
+                            self.config.vpin_spread_multiplier = float(fresh_config.get("vpinSpreadMultiplier", 1.5))
+                            self.config.vpin_block_multiplier = float(fresh_config.get("vpinBlockMultiplier", 2.0))
+                            # V15.6: Dynamic spread hot-reload
+                            self.config.dynamic_spread_enabled = bool(fresh_config.get("dynamicSpreadEnabled", True))
+                            self.config.dynamic_spread_vol_floor = float(fresh_config.get("dynamicSpreadVolFloor", 1.0))
+                            self.config.dynamic_spread_vol_medium = float(fresh_config.get("dynamicSpreadVolMedium", 1.3))
+                            self.config.dynamic_spread_vol_high = float(fresh_config.get("dynamicSpreadVolHigh", 1.8))
+                            self.config.dynamic_spread_vol_extreme = float(fresh_config.get("dynamicSpreadVolExtreme", 2.5))
+                            # V15.6: Pre-exit timing hot-reload
+                            self.config.pre_exit_time_5m = float(fresh_config.get("preExitTime5m", 60.0))
+                            self.config.pre_exit_time_15m = float(fresh_config.get("preExitTime15m", 120.0))
 
                 self.engine.check_daily_reset()
                 self.engine.sync_exchange_balance()
