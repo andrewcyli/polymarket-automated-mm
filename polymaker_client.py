@@ -230,6 +230,10 @@ class PolyMakerClient:
             "realized_pnl": "realizedPnl",
             "paired_windows": "pairedWindows",
             "one_sided_fills": "oneSidedFills",
+            "wallet_delta": "walletDelta",
+            "portfolio_pnl": "portfolioPnl",
+            "held_value": "heldValue",
+            "capital_in_positions": "capitalInPositions",
         }
         data: Dict[str, Any] = {"runId": rid}
         for k, v in metrics.items():
@@ -285,6 +289,10 @@ class PolyMakerClient:
             "realized_pnl": "realizedPnl",
             "paired_windows": "pairedWindows",
             "one_sided_fills": "oneSidedFills",
+            "wallet_delta": "walletDelta",
+            "portfolio_pnl": "portfolioPnl",
+            "held_value": "heldValue",
+            "capital_in_positions": "capitalInPositions",
         }
         data: Dict[str, Any] = {"runId": rid, "status": status}
         if error_message:

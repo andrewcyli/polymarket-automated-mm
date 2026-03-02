@@ -265,6 +265,13 @@ class BotConfig:
     hard_loss_stop_pct: float = 0.20
     hard_loss_cooloff: int = 600
 
+    # V15.7: Portfolio-based P&L and bankroll tracking
+    # portfolio_pnl = wallet_delta + held_position_value
+    # Use portfolio P&L (not just realized) for loss stop decisions
+    portfolio_loss_stop_enabled: bool = True
+    portfolio_loss_stop_pct: float = 0.15     # Stop when portfolio P&L < -15% of bankroll
+    portfolio_loss_cooloff: int = 900         # 15 min cooloff after portfolio loss stop
+
     stale_order_max_age: float = 120.0
 
     # V15.1-6: Don't place orders on windows too far out
@@ -2986,9 +2993,10 @@ class TradingEngine:
         return total
 
     def get_live_pnl(self):
-        """V15.1-20: Return dict with wallet_delta (primary) and total_pnl (estimated).
+        """V15.7: Return dict with wallet_delta, portfolio_pnl, and total_pnl.
         wallet_delta = current_wallet - starting_wallet (hard fact, no estimation)
-        total_pnl = wallet_delta + position_value + capital_deployed (includes estimates)
+        portfolio_pnl = wallet_delta + held_position_value (wallet + positions)
+        total_pnl = wallet_delta + position_value + capital_deployed (includes open orders)
         """
         if self.starting_wallet_balance is None or not self.balance_checker:
             return None
@@ -2996,16 +3004,24 @@ class TradingEngine:
         if current is None:
             return None
         wallet_delta = current - self.starting_wallet_balance
-        # V15.1-20: Position value is an estimate — orphan tokens may be worth $0
+        # V15.7: Position value is an estimate — orphan tokens may be worth $0
         # but get_position_value marks them at market price. Use conservatively.
         held_value = self.get_position_value()
+        # V15.7: Portfolio P&L = wallet change + position value
+        # This is the TRUE P&L: money in wallet + money locked in tokens
+        portfolio_pnl = wallet_delta + held_value
+        # Total P&L also includes capital in open orders (not yet filled)
         total_pnl = wallet_delta + self.capital_deployed + held_value
         return {
             "wallet_delta": wallet_delta,
+            "portfolio_pnl": portfolio_pnl,  # V15.7: PRIMARY P&L metric
             "total_pnl": total_pnl,
             "held_value": held_value,
             "capital_deployed": self.capital_deployed,
             "wallet_now": current,
+            "wallet_start": self.starting_wallet_balance,
+            "capital_in_positions": self.capital_in_positions,
+            "session_realized_pnl": self.session_realized_returns - self.session_realized_cost,
         }
 
     # V15.1-4: Verbose order rejection logging
@@ -3014,6 +3030,19 @@ class TradingEngine:
         if self.daily_pnl < -self.config.max_daily_loss:
             self.logger.info("    REJECT {} | {} | daily loss limit".format(label, window_id))
             return None
+        # V15.7: Portfolio-based loss stop — check portfolio P&L (wallet + positions)
+        if self.config.portfolio_loss_stop_enabled and side == "BUY":
+            pnl_data = self.get_live_pnl()
+            if pnl_data and isinstance(pnl_data, dict):
+                port_pnl = pnl_data.get("portfolio_pnl", 0)
+                bankroll = self.config.kelly_bankroll
+                loss_limit = bankroll * self.config.portfolio_loss_stop_pct
+                if port_pnl < -loss_limit:
+                    self.logger.info(
+                        "    REJECT {} | {} | PORTFOLIO LOSS STOP: ${:.2f} < -${:.2f} ({:.0f}% of bankroll)".format(
+                            label, window_id, port_pnl, loss_limit,
+                            self.config.portfolio_loss_stop_pct * 100))
+                    return None
         price = max(0.01, min(0.99, round(price, 2)))
         size = max(1, round(size, 1))
         strat_window_key = "{}|{}".format(strategy, window_id)
@@ -3521,7 +3550,18 @@ class TradingEngine:
                                     continue
                                 else:
                                     self.logger.warning(
-                                        "  T4 SELL FAILED | {} | Sell rejected, falling back to abandon".format(wid))
+                                        "  T4 SELL FAILED | {} | Sell rejected, scheduling claim fallback".format(wid))
+                                    # V15.7-BUG1: Schedule claim for stranded tokens
+                                    meta = self.window_metadata.get(wid, {})
+                                    cid = meta.get("condition_id", "")
+                                    if cid and hasattr(self, '_claim_manager_ref'):
+                                        self._claim_manager_ref.schedule_claim(
+                                            cid, wid, meta.get("end_time", 0),
+                                            slug=meta.get("slug", ""),
+                                            sides="BOTH",
+                                            cost=self.window_fill_cost.get(wid, 0))
+                                        self.logger.info(
+                                            "  T4 -> CLAIM | {} | Scheduled CTF-DIRECT fallback".format(wid))
                             elif sell_size < 1.0:
                                 self.logger.info(
                                     "  T4 SKIP | {} | No tokens held (held={:.1f})".format(
@@ -3559,6 +3599,17 @@ class TradingEngine:
                         "merges": 0, "abandoned": 0, "t4_sells": 0
                     }
                 self.hedge_analytics["per_asset"][asset]["abandoned"] += 1
+                # V15.7-BUG1: Schedule claim for abandoned hedge windows
+                meta = self.window_metadata.get(wid, {})
+                cid = meta.get("condition_id", "")
+                if cid and hasattr(self, '_claim_manager_ref'):
+                    self._claim_manager_ref.schedule_claim(
+                        cid, wid, meta.get("end_time", 0),
+                        slug=meta.get("slug", ""),
+                        sides="BOTH",
+                        cost=self.window_fill_cost.get(wid, 0))
+                    self.logger.info(
+                        "  HEDGE ABANDONED -> CLAIM | {} | Scheduled CTF-DIRECT fallback".format(wid))
                 continue
 
             if profit_per_share < self.config.hedge_min_profit_per_share:
@@ -3980,10 +4031,25 @@ class TradingEngine:
                     if fail_counts[wid] >= 3:
                         self.logger.warning(
                             "  MOM-EXIT ABANDONED | {} | {} consecutive failures, "
-                            "closing window".format(wid, fail_counts[wid]))
+                            "scheduling claim fallback".format(wid, fail_counts[wid]))
                         self.closed_windows.add(wid)
                         stale_wids.append(wid)
                         fail_counts.pop(wid, None)
+                        # V15.7-BUG1: Schedule claim so ClaimManager can try
+                        # CTF-DIRECT redeem after market resolution, instead of
+                        # just abandoning the tokens in the wallet.
+                        meta = self.window_metadata.get(wid, {})
+                        condition_id = meta.get("condition_id", "")
+                        end_time = meta.get("end_time", 0)
+                        if condition_id and hasattr(self, '_claim_manager_ref'):
+                            self._claim_manager_ref.schedule_claim(
+                                condition_id, wid, end_time,
+                                slug=meta.get("slug", ""),
+                                sides="BOTH",
+                                cost=self.window_fill_cost.get(wid, 0))
+                            self.logger.info(
+                                "  MOM-EXIT -> CLAIM | {} | Scheduled for CTF-DIRECT "
+                                "redeem after resolution".format(wid))
             else:
                 self.logger.debug(
                     "  MOM CHECK | {} | {} @ ${:.2f} | bid ${:.2f} | {:+.1%} < {:.1%} | {:.0f}s".format(
@@ -4162,20 +4228,24 @@ class TradingEngine:
         return summary
 
     def get_stats(self):
-        pnl_data = self.get_live_pnl()  # V15.1-20: now returns dict or None
+        pnl_data = self.get_live_pnl()  # V15.7: now returns dict with portfolio_pnl
         # Backward-compat: extract scalar live_pnl for existing consumers
         if pnl_data and isinstance(pnl_data, dict):
-            live_pnl = pnl_data.get("wallet_delta")  # Primary metric: hard wallet change
+            live_pnl = pnl_data.get("portfolio_pnl")  # V15.7: PRIMARY metric is portfolio P&L
             wallet_delta = pnl_data.get("wallet_delta")
+            portfolio_pnl = pnl_data.get("portfolio_pnl")
             total_pnl = pnl_data.get("total_pnl")
             held_value = pnl_data.get("held_value", 0)
             wallet_now = pnl_data.get("wallet_now")
+            wallet_start = pnl_data.get("wallet_start")
         else:
             live_pnl = pnl_data  # Legacy: None
             wallet_delta = None
+            portfolio_pnl = None
             total_pnl = None
             held_value = 0
             wallet_now = None
+            wallet_start = None
         return {
             "active_orders": len(self.active_orders),
             "total_placed": self.total_orders_placed,
@@ -4194,11 +4264,13 @@ class TradingEngine:
             "available_capital": self.get_available_capital(),
             "session_spent": self.session_total_spent,
             "token_holdings": len(self.token_holdings),
-            "live_pnl": live_pnl,  # V15.1-20: now wallet_delta (hard fact)
+            "live_pnl": live_pnl,  # V15.7: now portfolio_pnl (wallet + positions)
             "wallet_delta": wallet_delta,
+            "portfolio_pnl": portfolio_pnl,  # V15.7: wallet_delta + held_value
             "total_pnl_est": total_pnl,
             "held_value": held_value,
             "wallet_now": wallet_now,
+            "wallet_start": wallet_start,
             "pending_claims": len(self.expired_windows_pending_claim),
             "hedges_completed": self.hedges_completed,
             "hedges_skipped": self.hedges_skipped,
@@ -5180,6 +5252,7 @@ class PolymarketBot:
         self.engine = TradingEngine(
             self.config, self.fee_calc, self.logger, self.balance_checker)
         self.claim_manager.set_engine(self.engine)
+        self.engine._claim_manager_ref = self.claim_manager  # V15.7: for mom-exit fallback claims
         self.kelly = KellySizer(self.config, self.fee_calc)
 
         self.reward_optimizer = RewardOptimizer(self.config, self.fee_calc, self.logger)

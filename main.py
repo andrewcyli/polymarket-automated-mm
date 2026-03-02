@@ -514,6 +514,13 @@ class PolyMakerBot(PolymarketBot):
             self.engine.cancel_all()
         except Exception:
             pass
+
+        # V15.7-BUG3: Residual token sweeper — schedule claims for all stranded tokens
+        try:
+            self._sweep_residual_tokens()
+        except Exception as e:
+            self.logger.warning("  Residual sweep failed: {}".format(e))
+
         self._print_summary("FINAL")
         self._print_claim_summary()
         self._print_v15_1_summary()
@@ -560,11 +567,14 @@ class PolyMakerBot(PolymarketBot):
 
         stats = self.engine.get_stats()
 
-        # V15.1-20: Calculate PnL: wallet_delta is primary (hard fact)
+        # V15.7: Calculate PnL: portfolio_pnl is primary (wallet + positions)
         total_pnl = 0.0
         wallet_delta = stats.get("wallet_delta")
-        if wallet_delta is not None:
-            total_pnl = wallet_delta  # Ground truth: actual wallet change
+        portfolio_pnl = stats.get("portfolio_pnl")
+        if portfolio_pnl is not None:
+            total_pnl = portfolio_pnl  # V15.7: PRIMARY metric: wallet + positions
+        elif wallet_delta is not None:
+            total_pnl = wallet_delta  # Fallback: wallet change only
         elif self.sim_engine:
             s = self.sim_engine.get_summary()
             total_pnl = s.get("realized_pnl", 0)
@@ -615,9 +625,87 @@ class PolyMakerBot(PolymarketBot):
             realized_pnl=realized_pnl,
             paired_windows=stats.get("paired_windows", 0),
             one_sided_fills=hedge_summary.get("one_sided_fills", 0),
+            # V15.7: Portfolio P&L metrics
+            wallet_delta=wallet_delta,
+            portfolio_pnl=portfolio_pnl,
+            held_value=stats.get("held_value", 0),
+            capital_in_positions=stats.get("capital_in_positions", 0),
         )
         if not success:
             self.logger.warning("  CC PUSH FAILED | update_run returned False | C{}".format(cc.cycle_count))
+
+    def _sweep_residual_tokens(self):
+        """V15.7-BUG3: Sweep all stranded tokens at shutdown.
+        Queries on-chain balances and schedules claims for any tokens
+        that the bot holds but hasn't claimed/merged/sold."""
+        if self.config.dry_run:
+            return
+        if not self.auto_merger.w3:
+            self.logger.info("  SWEEP | No RPC connection, skipping residual sweep")
+            return
+
+        self.logger.info("  SWEEP | Scanning for residual tokens...")
+        live = self.auto_merger.query_live_positions(self.engine._market_cache)
+        if not live:
+            self.logger.info("  SWEEP | No residual tokens found")
+            return
+
+        # Build reverse map: token_id -> (window_id, side, condition_id)
+        token_to_window = {}
+        for wid, meta in self.engine.window_metadata.items():
+            for key, side in [("token_up", "UP"), ("token_down", "DOWN")]:
+                tid = meta.get(key, "")
+                if tid:
+                    token_to_window[tid] = (wid, side, meta.get("condition_id", ""))
+        # Also check _market_cache
+        for wid, mkt in self.engine._market_cache.items():
+            for key, side in [("token_up", "UP"), ("token_down", "DOWN")]:
+                tid = mkt.get(key, "")
+                if tid and tid not in token_to_window:
+                    token_to_window[tid] = (wid, side, mkt.get("condition_id", ""))
+
+        swept = 0
+        total_tokens = 0
+        for tid, pos in live.items():
+            size = pos.get("size", 0)
+            if size < 1.0:
+                continue
+            total_tokens += size
+            info = token_to_window.get(tid)
+            if not info:
+                self.logger.info("  SWEEP | Unknown token {} ({:.1f} shares) - no window match".format(
+                    tid[:16], size))
+                continue
+            wid, side, cid = info
+            # Skip if already in claim queue
+            if wid in self.claim_manager._claim_queue:
+                continue
+            # Skip if already claimed
+            if wid in getattr(self.claim_manager, '_claimed_windows', set()):
+                continue
+            if cid:
+                self.claim_manager.schedule_claim(
+                    cid, wid, 0,  # end_time=0 means already expired
+                    slug=self.engine.window_metadata.get(wid, {}).get("slug", ""),
+                    sides="BOTH",
+                    cost=self.engine.window_fill_cost.get(wid, 0))
+                swept += 1
+                self.logger.info("  SWEEP | {} | {} {:.1f} tokens | cid={} | Scheduled claim".format(
+                    wid, side, size, cid[:16]))
+
+        if swept > 0:
+            self.logger.info("  SWEEP | Scheduled {} claims for {:.1f} residual tokens".format(
+                swept, total_tokens))
+            # Process the claims immediately
+            try:
+                claimed = self.claim_manager.process_claims()
+                if claimed > 0:
+                    self.logger.info("  SWEEP | Claimed {} positions".format(claimed))
+            except Exception as e:
+                self.logger.warning("  SWEEP | Claim processing failed: {}".format(e))
+        else:
+            self.logger.info("  SWEEP | {} tokens found but all already in claim queue".format(
+                total_tokens))
 
     def _push_final_metrics(self, status="completed"):
         """Push final metrics when run ends."""
@@ -670,6 +758,11 @@ class PolyMakerBot(PolymarketBot):
             realized_pnl=realized_pnl,
             paired_windows=stats.get("paired_windows", 0),
             one_sided_fills=hedge_summary.get("one_sided_fills", 0),
+            # V15.7: Portfolio P&L metrics
+            wallet_delta=stats.get("wallet_delta"),
+            portfolio_pnl=stats.get("portfolio_pnl"),
+            held_value=stats.get("held_value", 0),
+            capital_in_positions=stats.get("capital_in_positions", 0),
         )
         if result:
             self.logger.info("  CC FINAL PUSH OK | Run #{} stopped successfully".format(self._cc_run_id))
@@ -1070,6 +1163,10 @@ class PolyMakerBot(PolymarketBot):
                         self.book_reader, self.vol_tracker)
                     if hedges:
                         self.logger.info("  {} hedges completed".format(hedges))
+                    # V15.7-BUG2: Reconcile on-chain balances before mom-exit
+                    # to prevent selling tokens we don't actually hold
+                    if not self.config.dry_run and self.auto_merger.w3 and cycle % 3 == 0:
+                        self.auto_merger.query_live_positions(self.engine._market_cache)
                     # V15.1-14: Momentum exit — sell one-sided fills if price rises >X%
                     mom_exits = self.engine.process_momentum_exits(self.book_reader)
                     if mom_exits:
@@ -1204,6 +1301,27 @@ class PolyMakerBot(PolymarketBot):
                                     self.config.hard_loss_cooloff))
                             self._loss_stop_until = now + self.config.hard_loss_cooloff
                             trading_halted = True
+
+                    # V15.7: Source 3: Portfolio P&L (wallet change + position value)
+                    if not trading_halted and self.config.portfolio_loss_stop_enabled:
+                        pnl_data = self.engine.get_live_pnl()
+                        if pnl_data and isinstance(pnl_data, dict):
+                            port_pnl = pnl_data.get("portfolio_pnl", 0)
+                            port_limit = -self.config.portfolio_loss_stop_pct * self.config.kelly_bankroll
+                            if port_pnl < port_limit:
+                                self.logger.warning(
+                                    "  *** LOSS STOP (PORTFOLIO) *** portfolioP&L: ${:.2f} < limit ${:.2f} "
+                                    "(maxLoss={:.0%} x bankroll=${:.0f}). "
+                                    "Wallet: ${:.2f}, Held: ${:.2f}. "
+                                    "Halting for {:.0f}s.".format(
+                                        port_pnl, port_limit,
+                                        self.config.portfolio_loss_stop_pct,
+                                        self.config.kelly_bankroll,
+                                        pnl_data.get("wallet_delta", 0),
+                                        pnl_data.get("held_value", 0),
+                                        self.config.portfolio_loss_cooloff))
+                                self._loss_stop_until = now + self.config.portfolio_loss_cooloff
+                                trading_halted = True
 
                 # V15.1-30: CC pause control — stop new order placement only.
                 # Existing orders are LEFT on the book so pending pairs can
