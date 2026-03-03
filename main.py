@@ -118,6 +118,13 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     mm_spread_max = cc_config.get("mmSpreadMax")
     if mm_spread_max and mm_spread_max > 0:
         config.mm_max_spread = float(mm_spread_max)
+    # V15.7: Wire mmLevels and mmLevelSpacing from CC (was in CC schema but never mapped)
+    mm_levels = cc_config.get("mmLevels")
+    if mm_levels is not None and int(mm_levels) >= 1:
+        config.mm_num_levels = int(mm_levels)
+    mm_level_spacing = cc_config.get("mmLevelSpacing")
+    if mm_level_spacing is not None and float(mm_level_spacing) > 0:
+        config.mm_level_spacing = float(mm_level_spacing)
 
     # Risk parameters
     max_concurrent = cc_config.get("maxConcurrentWindows")
@@ -288,6 +295,33 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     # V15.6: Extended pre-exit timing
     config.pre_exit_time_5m = float(cc_config.get("preExitTime5m", 60.0))
     config.pre_exit_time_15m = float(cc_config.get("preExitTime15m", 120.0))
+
+    # V15.7: Combined spread multiplier cap (VPIN × DynSpread)
+    spread_mult_cap = cc_config.get("spreadMultiplierCap")
+    if spread_mult_cap is not None and float(spread_mult_cap) > 0:
+        config.spread_multiplier_cap = float(spread_mult_cap)
+
+    # V15.7: Graduated spread near window close
+    config.graduated_spread_enabled = bool(cc_config.get("graduatedSpreadEnabled", True))
+    grad_start_5m = cc_config.get("graduatedSpreadStart5m")
+    if grad_start_5m is not None and float(grad_start_5m) > 0:
+        config.graduated_spread_start_secs_5m = float(grad_start_5m)
+    grad_start_15m = cc_config.get("graduatedSpreadStart15m")
+    if grad_start_15m is not None and float(grad_start_15m) > 0:
+        config.graduated_spread_start_secs_15m = float(grad_start_15m)
+    grad_stop = cc_config.get("graduatedSpreadStopSecs")
+    if grad_stop is not None and float(grad_stop) > 0:
+        config.graduated_spread_stop_secs = float(grad_stop)
+    grad_max_mult = cc_config.get("graduatedSpreadMaxMult")
+    if grad_max_mult is not None and float(grad_max_mult) > 0:
+        config.graduated_spread_max_multiplier = float(grad_max_mult)
+
+    print(f"  MM Levels: {config.mm_num_levels} (spacing={config.mm_level_spacing:.3f})")
+    print(f"  V15.7: SpreadCap={config.spread_multiplier_cap:.1f}x | "
+          f"GradSpread={'ON' if config.graduated_spread_enabled else 'OFF'} "
+          f"(5m={config.graduated_spread_start_secs_5m:.0f}s->{config.graduated_spread_stop_secs:.0f}s, "
+          f"15m={config.graduated_spread_start_secs_15m:.0f}s->{config.graduated_spread_stop_secs:.0f}s, "
+          f"max={config.graduated_spread_max_multiplier:.1f}x)")
 
     print(f"  Pre-entry filters: MomGate={config.momentum_gate_threshold:.3f} (bypass@{config.momentum_gate_max_consec}) | "
           f"MidSkew={config.midpoint_skew_limit:.2f} | MinDepth=${config.min_book_depth:.0f} | MaxSpreadAsym={config.max_spread_asymmetry:.3f}")

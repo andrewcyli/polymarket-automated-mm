@@ -369,6 +369,19 @@ class BotConfig:
     pre_exit_time_5m: float = 60.0         # 60s before end for 5-min windows
     pre_exit_time_15m: float = 120.0       # 120s before end for 15-min windows
 
+    # V15.7: Combined spread multiplier cap (VPIN × DynSpread)
+    # Prevents over-widening when both VPIN and volatility are elevated
+    spread_multiplier_cap: float = 3.0     # Max combined multiplier (vol × vpin)
+
+    # V15.7: Graduated spread near window close (time-decay widening)
+    # Instead of binary stop at min_time_remaining, gradually widen spread
+    # as window approaches close to reduce late orphans.
+    graduated_spread_enabled: bool = True
+    graduated_spread_start_secs_5m: float = 120.0   # Start widening 120s before close (5m windows)
+    graduated_spread_start_secs_15m: float = 240.0  # Start widening 240s before close (15m windows)
+    graduated_spread_stop_secs: float = 30.0         # Stop quoting entirely at 30s
+    graduated_spread_max_multiplier: float = 3.0     # Max spread multiplier at stop_secs boundary
+
     # V15.1-19: Pre-entry filters for orphan reduction
     momentum_gate_threshold: float = 0.010   # V15.5: Raised from 0.2% to 1.0% — tighter gate rejects
                                                # volatile windows. Data: at 0.5% gate, Kelly=+36%.
@@ -4560,8 +4573,17 @@ class MarketMakingStrategy:
         window_id = market["window_id"]
         now = time.time()
         time_remaining = market["end_time"] - now
-        if time_remaining < self.config.min_time_remaining:
-            return
+        # V15.7: Graduated spread replaces binary min_time_remaining cutoff
+        # Instead of stopping entirely at 60s, we gradually widen spread from
+        # graduated_spread_start_secs down to graduated_spread_stop_secs.
+        # Below stop_secs, we still don't quote (too risky).
+        if self.config.graduated_spread_enabled:
+            if time_remaining < self.config.graduated_spread_stop_secs:
+                return
+        else:
+            # Legacy behavior: binary cutoff
+            if time_remaining < self.config.min_time_remaining:
+                return
         # V15.1-6: Skip windows too far out
         if time_remaining > self.config.max_order_horizon:
             return
@@ -4753,7 +4775,19 @@ class MarketMakingStrategy:
             else:
                 dynamic_base_spread = self.config.mm_base_spread * self.config.dynamic_spread_vol_floor
         # Apply VPIN multiplier on top of volatility-adjusted spread
-        dynamic_base_spread *= vpin_spread_mult
+        # V15.7: Cap combined multiplier to prevent over-widening
+        vol_mult = dynamic_base_spread / self.config.mm_base_spread if self.config.mm_base_spread > 0 else 1.0
+        combined_mult = vol_mult * vpin_spread_mult
+        if combined_mult > self.config.spread_multiplier_cap:
+            capped_mult = self.config.spread_multiplier_cap
+            self.logger.info(
+                "  SPREAD CAP | {} | vol={:.1f}x vpin={:.1f}x combined={:.1f}x > cap {:.1f}x | "
+                "Using capped {:.1f}x".format(
+                    window_id, vol_mult, vpin_spread_mult, combined_mult,
+                    self.config.spread_multiplier_cap, capped_mult))
+            dynamic_base_spread = self.config.mm_base_spread * capped_mult
+        else:
+            dynamic_base_spread *= vpin_spread_mult
 
         # V15.1-12: Relaxed directional filter — CL-DN/CL-UP now only block
         # at STRONG confidence (>80%). At 60-80% (CL- prefix), the skew already
@@ -4806,6 +4840,33 @@ class MarketMakingStrategy:
                 "  SPREAD FLOOR | {} | d={:.3f} < min {:.3f} (base {:.3f} x vol x vpin), using min".format(
                     window_id, optimal_d, dynamic_base_spread, self.config.mm_base_spread))
             optimal_d = dynamic_base_spread
+        # V15.7: Graduated spread near window close
+        # Linearly widen spread as time_remaining decreases from start_secs to stop_secs.
+        # This replaces the binary 60s cutoff with a smooth ramp:
+        #   At start_secs: multiplier = 1.0 (no change)
+        #   At stop_secs:  multiplier = graduated_spread_max_multiplier (e.g., 3.0x)
+        #   Below stop_secs: don't quote (handled at top of execute())
+        if self.config.graduated_spread_enabled:
+            tf = market.get("timeframe", "5m")
+            if tf == "15m":
+                grad_start = self.config.graduated_spread_start_secs_15m
+            else:
+                grad_start = self.config.graduated_spread_start_secs_5m
+            grad_stop = self.config.graduated_spread_stop_secs
+            if time_remaining < grad_start:
+                # Linear interpolation: 1.0 at grad_start, max_mult at grad_stop
+                progress = (grad_start - time_remaining) / (grad_start - grad_stop)
+                progress = min(1.0, max(0.0, progress))  # Clamp to [0, 1]
+                grad_mult = 1.0 + progress * (self.config.graduated_spread_max_multiplier - 1.0)
+                optimal_d *= grad_mult
+                self.logger.info(
+                    "  GRAD SPREAD | {} | {:.0f}s rem | progress={:.0%} | "
+                    "spread x{:.2f} | d={:.4f}".format(
+                        window_id, time_remaining, progress, grad_mult, optimal_d))
+                # Track graduated spread activations
+                if "graduated_spread_activations" not in self.engine.hedge_analytics:
+                    self.engine.hedge_analytics["graduated_spread_activations"] = 0
+                self.engine.hedge_analytics["graduated_spread_activations"] += 1
         buy_up_price = round(midpoint - optimal_d + skew, 2)
         buy_down_price = round((1.0 - midpoint) - optimal_d - skew, 2)
         if buy_up_price <= 0.02 or buy_down_price <= 0.02:
