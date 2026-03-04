@@ -675,6 +675,11 @@ class PolyMakerBot(PolymarketBot):
             portfolio_pnl=portfolio_pnl,
             held_value=stats.get("held_value", 0),
             capital_in_positions=stats.get("capital_in_positions", 0),
+            # V15.8: Position value breakdown (active vs expired)
+            active_position_value=stats.get("active_position_value"),
+            unclaimed_est=stats.get("unclaimed_est"),
+            expired_token_count=stats.get("expired_token_count"),
+            held_value_legacy=stats.get("held_value_legacy"),
         )
         if not success:
             self.logger.warning("  CC PUSH FAILED | update_run returned False | C{}".format(cc.cycle_count))

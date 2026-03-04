@@ -234,6 +234,10 @@ class PolyMakerClient:
             "portfolio_pnl": "portfolioPnl",
             "held_value": "heldValue",
             "capital_in_positions": "capitalInPositions",
+            "active_position_value": "activePositionValue",
+            "unclaimed_est": "unclaimedEst",
+            "expired_token_count": "expiredTokenCount",
+            "held_value_legacy": "heldValueLegacy",
         }
         data: Dict[str, Any] = {"runId": rid}
         for k, v in metrics.items():
@@ -293,6 +297,10 @@ class PolyMakerClient:
             "portfolio_pnl": "portfolioPnl",
             "held_value": "heldValue",
             "capital_in_positions": "capitalInPositions",
+            "active_position_value": "activePositionValue",
+            "unclaimed_est": "unclaimedEst",
+            "expired_token_count": "expiredTokenCount",
+            "held_value_legacy": "heldValueLegacy",
         }
         data: Dict[str, Any] = {"runId": rid, "status": status}
         if error_message:

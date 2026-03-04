@@ -3066,40 +3066,117 @@ class TradingEngine:
                         self._update_total_capital()
 
     def get_position_value(self):
-        """V15.1-16: Compute live position value from token_holdings and market_cache.
-        Uses the best available price for each token:
-        1. Market's last known price from market_cache
-        2. Cost basis per share from token_holdings
-        3. Fallback: 0.50 (binary market midpoint)
+        """V15.8: Compute live position value with expired-market awareness.
+        For ACTIVE markets: uses market price (bid/ask from market_cache).
+        For EXPIRED markets: values at $0 (conservative). Winning tokens are
+        tracked separately as unclaimed_winnings. The wallet already reflects
+        claimed winnings, so counting expired tokens at market price double-counts.
+        Returns total value of ACTIVE positions only.
         """
-        total = 0.0
+        return self.get_position_value_breakdown()["active_value"]
+
+    def get_position_value_breakdown(self):
+        """V15.8: Detailed position value with active vs expired breakdown.
+        Returns dict with:
+          active_value: value of tokens in live/tradeable markets
+          expired_token_count: number of tokens in expired markets (worth $0 or claimable)
+          expired_shares: total shares in expired markets
+          unclaimed_est: estimated value of unclaimed winning tokens
+          total_legacy: old-style total (for backward compat logging)
+        """
+        import time as _time
+        now = _time.time()
+        active_value = 0.0
+        total_legacy = 0.0
+        expired_token_count = 0
+        expired_shares = 0.0
+        unclaimed_est = 0.0
+
+        # Build reverse lookup: token_id -> (window_id, end_time, side)
+        token_window_map = {}
+        # Check market_cache (active windows)
+        for wid, market in self._market_cache.items():
+            end_time = market.get("end_time", 0)
+            for key, side in (("token_up", "UP"), ("token_down", "DOWN")):
+                tid = market.get(key, "")
+                if tid:
+                    token_window_map[tid] = {"wid": wid, "end_time": end_time, "side": side}
+        # Check expired_windows_pending_claim
+        for wid, info in self.expired_windows_pending_claim.items():
+            end_time = info.get("end_time", 0)
+            winning_token = info.get("winning_token", "")
+            for key, side in (("token_up", "UP"), ("token_down", "DOWN")):
+                tid = info.get(key, "")
+                if tid:
+                    token_window_map[tid] = {
+                        "wid": wid, "end_time": end_time, "side": side,
+                        "winning_token": winning_token,
+                        "resolved": info.get("resolved", False),
+                    }
+        # Check window_metadata for any remaining
+        for wid, meta in self.window_metadata.items():
+            end_time = meta.get("end_time", 0)
+            for key, side in (("token_up", "UP"), ("token_down", "DOWN")):
+                tid = meta.get(key, "")
+                if tid and tid not in token_window_map:
+                    token_window_map[tid] = {"wid": wid, "end_time": end_time, "side": side}
+
         for token_id, holding in self.token_holdings.items():
             size = holding.get("size", 0)
             if size <= 0:
                 continue
-            # Try to find the token's current price from market_cache
+
+            # Determine market price for legacy/active valuation
             price = None
             for wid, market in self._market_cache.items():
                 if token_id == market.get("token_up"):
-                    # UP token: price is the UP probability
                     price = market.get("up_price", market.get("prob_up"))
                     break
                 elif token_id == market.get("token_down"):
-                    # DOWN token: price is the DOWN probability
                     price = market.get("down_price", market.get("prob_down"))
                     break
             if price is None or price <= 0:
-                # Fallback: use cost basis per share, or 0.50
                 cost = holding.get("cost", 0)
                 price = (cost / size) if size > 0 and cost > 0 else 0.50
-            total += size * price
-        return total
+            total_legacy += size * price
+
+            # Check if this token belongs to an expired market
+            win_info = token_window_map.get(token_id)
+            if win_info:
+                end_time = win_info.get("end_time", 0)
+                # 5-minute markets: expired if end_time + 5min < now
+                # Use generous buffer (10 min) to avoid false positives
+                if end_time > 0 and (end_time + 600) < now:
+                    expired_token_count += 1
+                    expired_shares += size
+                    # If we know the winning token, estimate unclaimed value
+                    winning_token = win_info.get("winning_token", "")
+                    if winning_token == token_id:
+                        unclaimed_est += size * 1.0  # Winner: $1.00/share
+                    elif winning_token:
+                        pass  # Loser: $0.00/share
+                    else:
+                        # Unknown resolution: estimate conservatively at $0
+                        pass
+                    continue  # Don't add to active_value
+
+            # Active market: use market price
+            active_value += size * price
+
+        return {
+            "active_value": round(active_value, 4),
+            "expired_token_count": expired_token_count,
+            "expired_shares": round(expired_shares, 1),
+            "unclaimed_est": round(unclaimed_est, 4),
+            "total_legacy": round(total_legacy, 4),
+        }
 
     def get_live_pnl(self):
-        """V15.7: Return dict with wallet_delta, portfolio_pnl, and total_pnl.
+        """V15.8: Return dict with wallet_delta, portfolio_pnl, and total_pnl.
         wallet_delta = current_wallet - starting_wallet (hard fact, no estimation)
-        portfolio_pnl = wallet_delta + held_position_value (wallet + positions)
-        total_pnl = wallet_delta + position_value + capital_deployed (includes open orders)
+        portfolio_pnl = wallet_delta + active_held_value + unclaimed_est
+        V15.8 FIX: Expired tokens are no longer counted at stale market price.
+        Active positions use live market price. Unclaimed winnings estimated separately.
         """
         if self.starting_wallet_balance is None or not self.balance_checker:
             return None
@@ -3107,17 +3184,21 @@ class TradingEngine:
         if current is None:
             return None
         wallet_delta = current - self.starting_wallet_balance
-        # V15.7: Position value is an estimate — orphan tokens may be worth $0
-        # but get_position_value marks them at market price. Use conservatively.
-        held_value = self.get_position_value()
-        # V15.7: Portfolio P&L = wallet change + position value
-        # This is the TRUE P&L: money in wallet + money locked in tokens
+        # V15.8: Use breakdown to separate active vs expired positions
+        breakdown = self.get_position_value_breakdown()
+        active_value = breakdown["active_value"]
+        unclaimed_est = breakdown["unclaimed_est"]
+        expired_count = breakdown["expired_token_count"]
+        total_legacy = breakdown["total_legacy"]
+        # V15.8: Corrected held_value = active positions + estimated unclaimed winnings
+        held_value = active_value + unclaimed_est
+        # V15.8: Portfolio P&L = wallet change + active positions + unclaimed winnings
         portfolio_pnl = wallet_delta + held_value
         # Total P&L also includes capital in open orders (not yet filled)
         total_pnl = wallet_delta + self.capital_deployed + held_value
         return {
             "wallet_delta": wallet_delta,
-            "portfolio_pnl": portfolio_pnl,  # V15.7: PRIMARY P&L metric
+            "portfolio_pnl": portfolio_pnl,  # V15.8: CORRECTED P&L metric
             "total_pnl": total_pnl,
             "held_value": held_value,
             "capital_deployed": self.capital_deployed,
@@ -3125,6 +3206,12 @@ class TradingEngine:
             "wallet_start": self.starting_wallet_balance,
             "capital_in_positions": self.capital_in_positions,
             "session_realized_pnl": self.session_realized_returns - self.session_realized_cost,
+            # V15.8: Position breakdown for CC dashboard
+            "active_position_value": active_value,
+            "unclaimed_est": unclaimed_est,
+            "expired_token_count": expired_count,
+            "expired_shares": breakdown["expired_shares"],
+            "held_value_legacy": total_legacy,  # Old-style total for comparison
         }
 
     # V15.1-4: Verbose order rejection logging
