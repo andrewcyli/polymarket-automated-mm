@@ -317,17 +317,17 @@ class BotConfig:
     hedge_vol_multiplier: float = 2.0
     hedge_min_loss_threshold: float = 0.005
     hedge_max_loss_threshold: float = 0.025
-    hedge_max_combined_cost: float = 0.98     # V15.1-13: Max UP+DOWN+fees before rejecting hedge
-    hedge_min_profit_per_share: float = 0.005 # V15.1-13: Min profit/share after fees to accept hedge
+    hedge_max_combined_cost: float = 0.98     # LEGACY (V15.1-13): kept for backward compat
+    hedge_min_profit_per_share: float = -1.0   # V15.8: DISABLED — max_ask controls profitability
 
-    # V15.2-T4: Last Resort Sell — sell the filled side at market bid when all buy-tiers exhausted
-    hedge_t4_sell_pct: float = 33.0      # V15.5: Trigger when <33% remaining (sell-at-33% strategy)
-                                          # Data: 94% of pairs complete by 33%, so only 6% sacrifice
-                                          # At 33%, orphan tokens worth avg $0.22 (range $0.03-$0.33)
-    hedge_t4_max_loss: float = 0.30      # V15.5: Max loss per share ($0.30 = 30c)
-                                          # Data: avg loss at 33% is $0.25/sh, worst case $0.42/sh
-                                          # $0.30 cap catches ~75% of orphans; rest fall to abandon
-                                          # Even at $0.30 loss, saving $5.22-$0.30=$4.92/orphan
+    # V15.8: hedge_tiers now use (pct, max_ask) format instead of (pct, max_combined_cost)
+    # max_ask = the maximum opposing ask price the bot will pay to complete the hedge.
+    # T4 uses min_bid = the minimum sell bid price to accept a last-resort sell.
+    hedge_t4_sell_pct: float = 33.0      # Trigger when <33% remaining
+    hedge_t4_min_bid: float = 0.15       # V15.8: Min bid to accept T4 sell ($0.15)
+                                          # Replaces hedge_t4_max_loss — easier to reason about
+                                          # "Sell if bid >= $0.15" vs "sell if loss <= $0.30"
+    hedge_t4_max_loss: float = 0.30      # LEGACY: kept for backward compat, not used if min_bid set
     hedge_t4_enabled: bool = True        # Enable/disable T4 sell tier
 
     auto_claim_enabled: bool = True
@@ -3513,14 +3513,13 @@ class TradingEngine:
         completed = 0
         # V15.2: Percentage-based tiered hedge pricing.
         # config.hedge_tiers is a list of (pct_remaining_threshold, max_combined_cost)
-        # sorted by pct descending (T1=67% triggers first, T3=13% triggers last).
+        # V15.8: hedge_tiers format is (pct_remaining_threshold, max_ask).
+        # max_ask = the maximum opposing ask price the bot will pay to complete the hedge.
+        # This is a direct price check — no fee calculation needed at the gate.
+        # sorted by pct descending (T1=75% triggers first, T3=40% triggers last).
         # Tier triggers when % of window time remaining < threshold.
-        # This auto-scales to any window duration (5m, 15m, etc.).
-        # V15.5: Adjusted tiers — T4 sell now triggers at 33%, so buy-tiers
-        # only operate in the 67%-33% window. T1 is conservative (profitable hedge),
-        # T2 accepts small loss, T3 is aggressive before T4 sell takes over.
         hedge_tiers = getattr(self.config, 'hedge_tiers', [
-            (67, 0.98), (50, 1.02), (33, 1.05)
+            (75, 0.52), (55, 0.69), (40, 0.79)
         ])
         # Sort tiers by pct descending (highest pct = earliest trigger)
         hedge_tiers = sorted(hedge_tiers, key=lambda t: t[0], reverse=True)
@@ -3637,19 +3636,18 @@ class TradingEngine:
             fee_other = self.fee_calc._interp_fee_per_share(other_ask)
             total_cost = filled_price + other_ask + fee_filled + fee_other
             profit_per_share = 1.0 - total_cost
-            tier_pct, tier_max_cost = active_tier
+            tier_pct, tier_max_ask = active_tier
             is_last_tier = (active_tier_idx == len(hedge_tiers) - 1)
 
-            # Check against the active tier's max combined cost
-            max_other_price = tier_max_cost - filled_price - fee_filled - fee_other
-            if other_ask > max_other_price:
+            # V15.8: Direct max_ask comparison — no fee calculation needed at gate
+            if other_ask > tier_max_ask:
                 # If we haven't exhausted all tiers, keep waiting for next tier
                 if not is_last_tier and time_remaining > 0:
                     self.logger.info(
-                        "  HEDGE WAIT T{} | {} | {} ask ${:.2f} > max ${:.2f} | "
+                        "  HEDGE WAIT T{} | {} | {} ask ${:.2f} > maxAsk ${:.2f} | "
                         "{:.0f}% remaining ({}s left) | src={}".format(
                             active_tier_idx + 1, wid,
-                            other_side, other_ask, max_other_price,
+                            other_side, other_ask, tier_max_ask,
                             pct_remaining, int(time_remaining),
                             "cache" if market else "hedge-entry"))
                     continue
@@ -3657,7 +3655,7 @@ class TradingEngine:
                 # All buy-tiers exhausted. Instead of abandoning, try to SELL
                 # the filled side at market bid to recover capital with minimal loss.
                 t4_pct = getattr(self.config, 'hedge_t4_sell_pct', 33.0)  # V15.5: sell-at-33%
-                t4_max_loss = getattr(self.config, 'hedge_t4_max_loss', 0.30)  # V15.5: $0.30 cap
+                t4_min_bid = getattr(self.config, 'hedge_t4_min_bid', 0.15)  # V15.8: min bid to accept sell
                 t4_enabled = getattr(self.config, 'hedge_t4_enabled', True)
                 # V15.4-FIX: Removed time_remaining > 0 condition.
                 # T4 must fire even after window expires because we still hold tokens.
@@ -3671,7 +3669,8 @@ class TradingEngine:
                             # Check actual token holdings before selling
                             actual_held = self.token_holdings.get(filled_token, {}).get("size", 0)
                             sell_size = min(filled_size, actual_held) if actual_held >= 1.0 else 0
-                            if sell_size >= 1.0 and loss_per_share <= t4_max_loss:
+                            # V15.8: Use min_bid instead of max_loss
+                            if sell_size >= 1.0 and sell_bid >= t4_min_bid:
                                 fee_sell = self.fee_calc._interp_fee_per_share(sell_bid)
                                 net_loss = loss_per_share + fee_sell
                                 self.logger.info(
@@ -3758,8 +3757,8 @@ class TradingEngine:
                                         wid, actual_held))
                             else:
                                 self.logger.info(
-                                    "  T4 LOSS CAP | {} | Loss ${:.3f}/sh > max ${:.3f} | Abandoning".format(
-                                        wid, loss_per_share, t4_max_loss))
+                                    "  T4 BID LOW | {} | bid ${:.2f} < minBid ${:.2f} (loss ${:.3f}/sh) | Abandoning".format(
+                                        wid, sell_bid, t4_min_bid, loss_per_share))
                 # ── End T4 ──────────────────────────────────────────────────
                 # V15.5-FIX2: If T4 didn't fire because pct_remaining is still
                 # above threshold but time remains, keep waiting for T4 trigger.
@@ -3768,17 +3767,17 @@ class TradingEngine:
                 t4_pct_check = getattr(self.config, 'hedge_t4_sell_pct', 33.0)
                 if t4_enabled_check and is_last_tier and pct_remaining >= t4_pct_check and time_remaining > 0:
                     self.logger.info(
-                        "  HEDGE WAIT T4 | {} | {} ask ${:.2f} > max ${:.2f} | "
+                        "  HEDGE WAIT T4 | {} | {} ask ${:.2f} > maxAsk ${:.2f} | "
                         "{:.0f}% rem > {:.0f}% T4 trigger | Waiting for T4 ({:.0f}s left)".format(
-                            wid, other_side, other_ask, max_other_price,
+                            wid, other_side, other_ask, tier_max_ask,
                             pct_remaining, t4_pct_check, time_remaining))
                     continue
                 # If T4 didn't fire or failed, fall through to abandon
                 self.logger.info(
-                    "  HEDGE PRICE CAP (ALL TIERS) | {} | {} @ ${:.2f} | {} ask ${:.2f} > max ${:.2f} | "
-                    "Combined ${:.3f} > T3 cap ${:.3f} | {:.0f}% rem".format(
+                    "  HEDGE ASK CAP (ALL TIERS) | {} | {} @ ${:.2f} | {} ask ${:.2f} > maxAsk ${:.2f} | "
+                    "{:.0f}% rem".format(
                         wid, filled_side, filled_price, other_side, other_ask,
-                        max_other_price, total_cost, tier_max_cost, pct_remaining))
+                        tier_max_ask, pct_remaining))
                 self._pending_hedges.remove(hedge)
                 self.hedges_skipped += 1
                 self.hedge_analytics["resolved_abandoned"] += 1
@@ -3802,96 +3801,12 @@ class TradingEngine:
                         "  HEDGE ABANDONED -> CLAIM | {} | Scheduled CTF-DIRECT fallback".format(wid))
                 continue
 
-            if profit_per_share < self.config.hedge_min_profit_per_share:
-                if not is_last_tier and time_remaining > 0:
-                    continue
-                # ── V15.2-T4: Also try T4 sell on low-profit exhaustion ─────
-                t4_pct = getattr(self.config, 'hedge_t4_sell_pct', 33.0)  # V15.5: sell-at-33%
-                t4_max_loss = getattr(self.config, 'hedge_t4_max_loss', 0.30)  # V15.5: $0.30 cap
-                t4_enabled = getattr(self.config, 'hedge_t4_enabled', True)
-                # V15.4-FIX: Removed time_remaining > 0 condition.
-                # T4 must fire even after window expires because we still hold tokens.
-                if t4_enabled and (pct_remaining < t4_pct or time_remaining <= 0):
-                    filled_token = hedge.get("filled_token", "")
-                    if filled_token:
-                        filled_spread = book_reader.get_spread(filled_token)
-                        if filled_spread:
-                            sell_bid = filled_spread["bid"]
-                            loss_per_share = filled_price - sell_bid
-                            actual_held = self.token_holdings.get(filled_token, {}).get("size", 0)
-                            sell_size = min(filled_size, actual_held) if actual_held >= 1.0 else 0
-                            if sell_size >= 1.0 and loss_per_share <= t4_max_loss:
-                                fee_sell = self.fee_calc._interp_fee_per_share(sell_bid)
-                                net_loss = loss_per_share + fee_sell
-                                self.logger.info(
-                                    "\n  T4 LAST RESORT SELL (LOW PROFIT) | {} | {} {:.0f} @ ${:.2f} -> bid ${:.2f} | "
-                                    "Loss ${:.3f}/sh | {:.0f}% rem".format(
-                                        wid, filled_side, sell_size, filled_price, sell_bid,
-                                        loss_per_share, pct_remaining))
-                                cancelled = self.cancel_window_orders(wid)
-                                result = self.place_order(
-                                    filled_token, "SELL", sell_bid, sell_size,
-                                    wid, "T4-SELL", "mm", is_taker=True)
-                                if not result and not self.config.dry_run and self.client:
-                                    try:
-                                        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-                                        self.client.update_balance_allowance(
-                                            BalanceAllowanceParams(
-                                                asset_type=AssetType.CONDITIONAL,
-                                                token_id=filled_token,
-                                            )
-                                        )
-                                        import time as _time
-                                        _time.sleep(2)
-                                        result = self.place_order(
-                                            filled_token, "SELL", sell_bid, sell_size,
-                                            wid, "T4-SELL-RETRY", "mm", is_taker=True)
-                                    except Exception as e:
-                                        self.logger.warning(
-                                            "  T4 APPROVAL FAIL | {} | {}".format(wid, str(e)[:100]))
-                                if result:
-                                    self._pending_hedges.remove(hedge)
-                                    completed += 1
-                                    self.window_fill_sides.pop(wid, None)
-                                    self.window_fill_cost.pop(wid, None)
-                                    self.window_fill_tokens.pop(wid, None)
-                                    self.closed_windows.add(wid)
-                                    self.held_windows.discard(wid)
-                                    self.window_entry_count.pop(wid, None)
-                                    cost = filled_price * sell_size
-                                    self.capital_in_positions = max(0, self.capital_in_positions - cost)
-                                    self._update_total_capital()
-                                    elapsed_t4 = time.time() - hedge["time"]
-                                    self.hedge_analytics["resolved_by_t4_sell"] += 1
-                                    self.hedge_analytics["tier_counts"]["t4"] += 1
-                                    self.hedge_analytics["tier_costs"]["t4"].append(loss_per_share)
-                                    self.hedge_analytics["tier_times"]["t4"].append(elapsed_t4)
-                                    asset = wid.split("-")[0] if "-" in wid else "unknown"
-                                    if asset not in self.hedge_analytics["per_asset"]:
-                                        self.hedge_analytics["per_asset"][asset] = {
-                                            "one_sided": 0, "hedges": 0, "exits": 0,
-                                            "merges": 0, "abandoned": 0, "t4_sells": 0
-                                        }
-                                    pa = self.hedge_analytics["per_asset"][asset]
-                                    pa["t4_sells"] = pa.get("t4_sells", 0) + 1
-                                    continue
-                # ── End T4 (low profit path) ────────────────────────────────
-                self.logger.info(
-                    "  HEDGE LOW PROFIT | {} | {} @ ${:.2f} | {} ask ${:.2f} | "
-                    "Pair ${:.3f} | Profit ${:.4f} < min ${:.3f}".format(
-                        wid, filled_side, filled_price, other_side, other_ask,
-                        total_cost, profit_per_share, self.config.hedge_min_profit_per_share))
-                self._pending_hedges.remove(hedge)
-                self.hedges_skipped += 1
-                self.hedge_analytics["resolved_abandoned"] += 1
-                asset = wid.split("-")[0] if "-" in wid else "unknown"
-                if asset not in self.hedge_analytics["per_asset"]:
-                    self.hedge_analytics["per_asset"][asset] = {
-                        "one_sided": 0, "hedges": 0, "exits": 0,
-                        "merges": 0, "abandoned": 0, "t4_sells": 0
-                    }
-                self.hedge_analytics["per_asset"][asset]["abandoned"] += 1
-                continue
+            # V15.8: min_profit_per_share gate REMOVED.
+            # The max_ask per tier already controls profitability directly.
+            # If you set T1 max_ask=$0.52, that implies profit. If T3 max_ask=$0.79,
+            # you're explicitly accepting a loss to complete the pair.
+            # The old min_profit_per_share was blocking T2/T3 from ever completing
+            # hedges, making them dead code.
 
             size = filled_size
             tier_label = "T{}".format(active_tier_idx + 1)

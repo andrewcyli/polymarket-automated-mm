@@ -219,21 +219,47 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     config.hedge_max_loss_per_share = 0.02    # Legacy fallback threshold
     # Tiered hedge: list of (pct_remaining_threshold, max_combined_cost)
     # pct_remaining is the % of window time left — tier triggers when remaining < threshold
-    config.hedge_tiers = [
-        (float(cc_config.get("hedgeTier1Pct", 67)), float(cc_config.get("hedgeTier1Cost", 1.03))),
-        (float(cc_config.get("hedgeTier2Pct", 50)), float(cc_config.get("hedgeTier2Cost", 1.10))),
-        (float(cc_config.get("hedgeTier3Pct", 33)), float(cc_config.get("hedgeTier3Cost", 1.20))),
-    ]
-    # Sort tiers by pct descending (T1=67% triggers first, T3=13% triggers last)
-    config.hedge_tiers = sorted(config.hedge_tiers, key=lambda t: t[0], reverse=True)
-    # Keep legacy fields for backward compat (use tier 1 as default)
-    config.hedge_completion_delay = 30  # Legacy fallback
-    config.hedge_max_combined_cost = config.hedge_tiers[0][1]
+    # V15.8: hedge_tiers use (pct, max_ask) format.
+    # max_ask = the maximum opposing ask price the bot will pay to complete the hedge.
+    # Backward compat: if CC sends hedgeTierXMaxAsk, use it; else fall back to hedgeTierXCost.
+    def _get_tier_max_ask(cc, tier_num, default_max_ask, default_cost):
+        """Get max_ask from CC config with backward compat from old max_combined_cost."""
+        max_ask = cc.get(f"hedgeTier{tier_num}MaxAsk")
+        if max_ask is not None:
+            return float(max_ask)
+        # Backward compat: convert old max_combined_cost to approximate max_ask
+        # max_ask ≈ max_combined - typical_fill(0.45) - fee_filled(0.01) - fee_other(0.02)
+        cost = cc.get(f"hedgeTier{tier_num}Cost")
+        if cost is not None:
+            return float(cost) - 0.48  # Approximate conversion
+        return default_max_ask
 
-    # V15.2-T4: Last Resort Sell — sell filled side at market bid when all buy-tiers exhausted
+    config.hedge_tiers = [
+        (float(cc_config.get("hedgeTier1Pct", 75)), _get_tier_max_ask(cc_config, 1, 0.52, 1.03)),
+        (float(cc_config.get("hedgeTier2Pct", 55)), _get_tier_max_ask(cc_config, 2, 0.69, 1.10)),
+        (float(cc_config.get("hedgeTier3Pct", 40)), _get_tier_max_ask(cc_config, 3, 0.79, 1.20)),
+    ]
+    # Sort tiers by pct descending (T1=75% triggers first, T3=40% triggers last)
+    config.hedge_tiers = sorted(config.hedge_tiers, key=lambda t: t[0], reverse=True)
+    # Keep legacy fields for backward compat
+    config.hedge_completion_delay = 30
+    config.hedge_max_combined_cost = config.hedge_tiers[0][1]  # Legacy
+    # V15.8: min_profit_per_share disabled — max_ask controls profitability
+    config.hedge_min_profit_per_share = -1.0
+
+    # V15.8-T4: Last Resort Sell — sell filled side at market bid when all buy-tiers exhausted
+    # Uses min_bid (minimum sell bid to accept) instead of max_loss
     config.hedge_t4_enabled = bool(cc_config.get("hedgeT4Enabled", True))
     config.hedge_t4_sell_pct = float(cc_config.get("hedgeTier4Pct", 33.0))
-    config.hedge_t4_max_loss = float(cc_config.get("hedgeTier4MaxLoss", 0.30))
+    # V15.8: Prefer hedgeTier4MinBid; fall back to converting hedgeTier4MaxLoss
+    t4_min_bid = cc_config.get("hedgeTier4MinBid")
+    if t4_min_bid is not None:
+        config.hedge_t4_min_bid = float(t4_min_bid)
+    else:
+        # Backward compat: convert max_loss to min_bid (min_bid = typical_fill - max_loss)
+        t4_max_loss = float(cc_config.get("hedgeTier4MaxLoss", 0.30))
+        config.hedge_t4_min_bid = max(0.05, 0.45 - t4_max_loss)  # Floor at $0.05
+        config.hedge_t4_max_loss = t4_max_loss  # Keep legacy
 
     # V15.1-14: Momentum exit — sell one-sided fill if price rises >X%
     config.momentum_exit_enabled = bool(cc_config.get("momentumExitEnabled", True))
@@ -250,10 +276,9 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     config.pause_orders = bool(cc_config.get("pauseOrders", False))
 
     print(f"  Hedge: {'ON' if config.hedge_completion_enabled else 'OFF'} "
-          f"(tiers: {', '.join(f'${t[1]:.2f}@<{t[0]:.0f}%rem' for t in config.hedge_tiers)}, "
-          f"minProfit=${config.hedge_min_profit_per_share:.3f})")
+          f"(tiers: {', '.join(f'maxAsk${t[1]:.2f}@<{t[0]:.0f}%rem' for t in config.hedge_tiers)})")
     print(f"  T4 Last Resort: {'ON' if config.hedge_t4_enabled else 'OFF'} "
-          f"(trigger=<{config.hedge_t4_sell_pct:.0f}%rem, maxLoss=${config.hedge_t4_max_loss:.3f}/sh)")
+          f"(trigger=<{config.hedge_t4_sell_pct:.0f}%rem, minBid=${config.hedge_t4_min_bid:.2f})")
     print(f"  Momentum Exit: {'ON' if config.momentum_exit_enabled else 'OFF'} "
           f"(threshold={config.momentum_exit_threshold:.1%}, "
           f"maxWait={config.momentum_exit_max_wait_secs:.0f}s)")
@@ -1243,16 +1268,29 @@ class PolyMakerBot(PolymarketBot):
                         # Full config refresh every 5 cycles
                         if cycle % 5 == 0:
                             self.config.hedge_completion_enabled = bool(fresh_config.get("hedgeEnabled", True))
-                            self.config.hedge_min_profit_per_share = float(fresh_config.get("hedgeMinProfit", 0.005))
+                            # V15.8: min_profit disabled
+                            self.config.hedge_min_profit_per_share = -1.0
+                            # V15.8: hot-reload hedge tiers with max_ask format
+                            def _hr_max_ask(cc, n, default):
+                                v = cc.get(f"hedgeTier{n}MaxAsk")
+                                if v is not None: return float(v)
+                                c = cc.get(f"hedgeTier{n}Cost")
+                                if c is not None: return float(c) - 0.48
+                                return default
                             self.config.hedge_tiers = sorted([
-                                (float(fresh_config.get("hedgeTier1Pct", 67)), float(fresh_config.get("hedgeTier1Cost", 1.03))),
-                                (float(fresh_config.get("hedgeTier2Pct", 50)), float(fresh_config.get("hedgeTier2Cost", 1.10))),
-                                (float(fresh_config.get("hedgeTier3Pct", 33)), float(fresh_config.get("hedgeTier3Cost", 1.20))),
+                                (float(fresh_config.get("hedgeTier1Pct", 75)), _hr_max_ask(fresh_config, 1, 0.52)),
+                                (float(fresh_config.get("hedgeTier2Pct", 55)), _hr_max_ask(fresh_config, 2, 0.69)),
+                                (float(fresh_config.get("hedgeTier3Pct", 40)), _hr_max_ask(fresh_config, 3, 0.79)),
                             ], key=lambda t: t[0], reverse=True)
-                            # V15.2-T4: Last Resort Sell config
+                            # V15.8-T4: hot-reload with min_bid
                             self.config.hedge_t4_enabled = bool(fresh_config.get("hedgeT4Enabled", True))
                             self.config.hedge_t4_sell_pct = float(fresh_config.get("hedgeTier4Pct", 33.0))
-                            self.config.hedge_t4_max_loss = float(fresh_config.get("hedgeTier4MaxLoss", 0.30))
+                            t4_mb = fresh_config.get("hedgeTier4MinBid")
+                            if t4_mb is not None:
+                                self.config.hedge_t4_min_bid = float(t4_mb)
+                            else:
+                                t4_ml = float(fresh_config.get("hedgeTier4MaxLoss", 0.30))
+                                self.config.hedge_t4_min_bid = max(0.05, 0.45 - t4_ml)
                             # V15.2: Max order horizon
                             moh = fresh_config.get("maxOrderHorizon")
                             if moh is not None and moh > 0:
