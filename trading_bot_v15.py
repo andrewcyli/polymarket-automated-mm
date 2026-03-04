@@ -350,6 +350,13 @@ class BotConfig:
     momentum_exit_min_hold_secs: float = 10.0  # Min hold time before checking
     momentum_exit_max_wait_secs: float = 120.0 # Max wait for hedge before checking momentum
 
+    # V15.8: Post-WS-RECOVERED immediate assessment
+    # When a cancelled order fills anyway (WS-RECOVERED), check the opposing
+    # side's ask price. If ask > this threshold, skip hedge tiers entirely
+    # and fast-track to momentum exit (backdate fill time so exit checker
+    # evaluates immediately). Set to 0 to disable.
+    ws_recovered_max_opposing_ask: float = 0.80
+
     # V15.6: VPIN toxicity filter — pause when order flow is one-sided
     vpin_enabled: bool = True
     vpin_lookback_secs: float = 60.0       # Window to measure buy/sell volume
@@ -357,6 +364,10 @@ class BotConfig:
     vpin_min_trades: int = 5               # Need at least N trades to compute VPIN
     vpin_spread_multiplier: float = 1.5    # Widen spread by this when VPIN is elevated (0.4-0.7)
     vpin_block_multiplier: float = 2.0     # Widen spread by this when VPIN > threshold (>0.7)
+
+    # V15.8: VPIN volatility fallback — when trade data is insufficient for VPIN,
+    # use price volatility as a proxy for informed trading activity
+    vpin_vol_fallback_enabled: bool = True
 
     # V15.6: Dynamic spread — scale mm_base_spread with realized volatility
     dynamic_spread_enabled: bool = True
@@ -711,12 +722,19 @@ class VPINTracker:
     Uses the Lee-Ready tick rule: trades above midpoint are buy-initiated,
     trades below are sell-initiated. Trades at midpoint use the "side" field
     from the WebSocket event.
+    
+    V15.8: When trade data is insufficient (NO_DATA), falls back to a
+    price-volatility proxy using the VolatilityTracker. If short-term
+    price volatility is HIGH/EXTREME, applies a spread multiplier as if
+    VPIN were elevated, since rapid price moves correlate with informed
+    trading even when trade-level data is sparse.
     """
 
-    def __init__(self, config, state_store=None, logger=None):
+    def __init__(self, config, state_store=None, logger=None, vol_tracker=None):
         self.config = config
         self.state_store = state_store
         self.logger = logger
+        self.vol_tracker = vol_tracker  # V15.8: For fallback when trade data insufficient
         # Per-token VPIN cache: {token_id: (vpin_value, timestamp)}
         self._cache = {}
         self._cache_ttl = 5.0  # Recompute every 5s max
@@ -724,6 +742,9 @@ class VPINTracker:
         self._total_checks = 0
         self._blocks = 0
         self._widens = 0
+        self._no_data_count = 0        # V15.8: Track NO_DATA occurrences
+        self._fallback_activations = 0  # V15.8: Track vol-fallback activations
+        self._fallback_widens = 0       # V15.8: Fallback-triggered widens
 
     def compute_vpin(self, token_id):
         """
@@ -770,6 +791,66 @@ class VPINTracker:
         self._cache[token_id] = (vpin, len(trades), now)
         return vpin, len(trades)
 
+    def _vol_fallback_multiplier(self, token_up, token_down):
+        """
+        V15.8: Volatility-based fallback when VPIN has NO_DATA.
+        
+        Uses the VolatilityTracker to estimate flow toxicity from price
+        movements. Rapid price changes correlate with informed trading,
+        so HIGH/EXTREME volatility triggers a spread widen similar to
+        ELEVATED VPIN.
+        
+        Returns (multiplier, level_str, pseudo_vpin).
+        """
+        if not self.vol_tracker:
+            return 1.0, "NO_DATA", 0.0
+
+        # Get vol level for both tokens, use the worse one
+        vol_up, vol_sum_up = self.vol_tracker.get_volatility_level(token_up)
+        vol_dn, vol_sum_dn = self.vol_tracker.get_volatility_level(token_down)
+
+        # Pick the more volatile side
+        vol_level = vol_up
+        vol_sum = vol_sum_up
+        if vol_dn in ("EXTREME", "HIGH") and vol_up not in ("EXTREME", "HIGH"):
+            vol_level = vol_dn
+            vol_sum = vol_sum_dn
+        elif vol_dn == "HIGH" and vol_up != "EXTREME":
+            vol_level = vol_dn
+            vol_sum = vol_sum_dn
+
+        self._fallback_activations += 1
+
+        # Map volatility level to a pseudo-VPIN multiplier
+        # EXTREME vol -> treat like TOXIC VPIN (block multiplier)
+        # HIGH vol -> treat like ELEVATED VPIN (spread multiplier)
+        # MEDIUM/LOW -> no adjustment (normal)
+        vpin_fallback_enabled = getattr(self.config, 'vpin_vol_fallback_enabled', True)
+        if not vpin_fallback_enabled:
+            return 1.0, "NO_DATA", 0.0
+
+        if vol_level == "EXTREME":
+            self._fallback_widens += 1
+            # Use block multiplier for extreme vol
+            pseudo_vpin = 0.85  # Synthetic value for logging
+            mult = self.config.vpin_block_multiplier
+            if self.logger:
+                self.logger.info(
+                    "  VPIN FALLBACK | vol={} ({:.4f}) | Treating as TOXIC | "
+                    "mult=x{:.1f}".format(vol_level, vol_sum or 0, mult))
+            return mult, "VOL-TOXIC", pseudo_vpin
+        elif vol_level == "HIGH":
+            self._fallback_widens += 1
+            pseudo_vpin = 0.55  # Synthetic value for logging
+            mult = self.config.vpin_spread_multiplier
+            if self.logger:
+                self.logger.info(
+                    "  VPIN FALLBACK | vol={} ({:.4f}) | Treating as ELEVATED | "
+                    "mult=x{:.1f}".format(vol_level, vol_sum or 0, mult))
+            return mult, "VOL-ELEVATED", pseudo_vpin
+        else:
+            return 1.0, "NO_DATA", 0.0
+
     def get_spread_multiplier(self, token_up, token_down):
         """
         Get the spread multiplier based on VPIN of both tokens.
@@ -779,6 +860,9 @@ class VPINTracker:
           1.0  = normal (VPIN < 0.40 or insufficient data)
           vpin_spread_multiplier = elevated (0.40 <= VPIN < threshold)
           vpin_block_multiplier  = toxic (VPIN >= threshold)
+        
+        V15.8: When both tokens return NO_DATA, falls back to volatility-based
+        proxy to provide some protection during data-sparse periods.
         """
         if not self.config.vpin_enabled:
             return 1.0, "OFF", 0.0
@@ -795,7 +879,9 @@ class VPINTracker:
             max_vpin = max(max_vpin, vpin_dn)
 
         if max_vpin <= 0.0 and vpin_up is None and vpin_dn is None:
-            return 1.0, "NO_DATA", 0.0
+            self._no_data_count += 1
+            # V15.8: Fall back to volatility-based proxy
+            return self._vol_fallback_multiplier(token_up, token_down)
 
         if max_vpin >= self.config.vpin_threshold:
             self._blocks += 1
@@ -812,6 +898,10 @@ class VPINTracker:
             "blocks": self._blocks,
             "widens": self._widens,
             "block_rate": self._blocks / max(1, self._total_checks),
+            "no_data_count": self._no_data_count,
+            "no_data_rate": self._no_data_count / max(1, self._total_checks),
+            "fallback_activations": self._fallback_activations,
+            "fallback_widens": self._fallback_widens,
         }
 
 
@@ -4840,6 +4930,11 @@ class MarketMakingStrategy:
                 "  SPREAD FLOOR | {} | d={:.3f} < min {:.3f} (base {:.3f} x vol x vpin), using min".format(
                     window_id, optimal_d, dynamic_base_spread, self.config.mm_base_spread))
             optimal_d = dynamic_base_spread
+
+        # V15.8: Comprehensive spread decomposition log
+        # Records every spread component for post-session analysis.
+        _pre_grad_d = optimal_d  # Save pre-graduated value for logging
+
         # V15.7: Graduated spread near window close
         # Linearly widen spread as time_remaining decreases from start_secs to stop_secs.
         # This replaces the binary 60s cutoff with a smooth ramp:
@@ -4867,6 +4962,25 @@ class MarketMakingStrategy:
                 if "graduated_spread_activations" not in self.engine.hedge_analytics:
                     self.engine.hedge_analytics["graduated_spread_activations"] = 0
                 self.engine.hedge_analytics["graduated_spread_activations"] += 1
+        # V15.8: Log the full spread decomposition for every order placement
+        grad_mult_actual = optimal_d / _pre_grad_d if _pre_grad_d > 0 else 1.0
+        self.logger.info(
+            "  SPREAD DECOMP | {} | base={:.3f} | dynSprd={:.3f} (vol={} x{:.1f}) | "
+            "vpin={} x{:.1f} (val={:.2f}) | combined={:.3f} (cap={:.1f}) | "
+            "grad=x{:.2f} | final_d={:.4f} | mid={:.3f} | skew={:+.3f} | "
+            "levels={}".format(
+                window_id,
+                self.config.mm_base_spread,
+                dynamic_base_spread / vpin_spread_mult if vpin_spread_mult > 0 else dynamic_base_spread,
+                vol_level, vol_mult,
+                vpin_level_str, vpin_spread_mult, vpin_value,
+                dynamic_base_spread,
+                self.config.spread_multiplier_cap,
+                grad_mult_actual,
+                optimal_d,
+                midpoint, skew,
+                self.config.mm_num_levels))
+
         buy_up_price = round(midpoint - optimal_d + skew, 2)
         buy_down_price = round((1.0 - midpoint) - optimal_d - skew, 2)
         if buy_up_price <= 0.02 or buy_down_price <= 0.02:

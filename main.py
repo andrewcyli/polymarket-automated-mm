@@ -484,6 +484,8 @@ class PolyMakerBot(PolymarketBot):
                     logger_instance=self.logger,
                 )
                 # Re-inject wrapped readers into strategies that hold references
+                # V15.8: Store book_reader ref on engine for WS-RECOVERED assessment
+                self.engine._book_reader_ref = self.book_reader
                 self.mm_strategy.book_reader = self.book_reader
                 self.mm_strategy.price_feed = self.price_feed
                 self.sniper.book_reader = self.book_reader
@@ -499,11 +501,14 @@ class PolyMakerBot(PolymarketBot):
                     )
                 self.logger.info("  WebSocket manager initialized (market+user+rtds)")
                 # V15.6: VPIN toxicity tracker — uses WS trade stream
+                # V15.8: Pass vol_tracker for fallback when trade data is insufficient
                 self.vpin_tracker = VPINTracker(
-                    self.config, state_store=self.ws_manager.state_store, logger=self.logger)
+                    self.config, state_store=self.ws_manager.state_store,
+                    logger=self.logger, vol_tracker=self.vol_tracker)
                 self.mm_strategy.vpin_tracker = self.vpin_tracker
-                self.logger.info("  VPIN tracker initialized (threshold={:.0%}, lookback={}s)".format(
-                    self.config.vpin_threshold, self.config.vpin_lookback_secs))
+                self.logger.info("  VPIN tracker initialized (threshold={:.0%}, lookback={}s, vol_fallback={})".format(
+                    self.config.vpin_threshold, self.config.vpin_lookback_secs,
+                    "ON" if self.config.vpin_vol_fallback_enabled else "OFF"))
                 # Phase 2: WS-based fill detection
                 self.ws_fill_detector = WSFillDetector(
                     ws_manager=self.ws_manager,
@@ -579,6 +584,12 @@ class PolyMakerBot(PolymarketBot):
                 self.logger.info("WebSocket manager stopped.")
             except Exception:
                 pass
+
+        # V15.8: Write structured per-session performance log
+        try:
+            perf_data = self._write_session_performance_log()
+        except Exception as e:
+            self.logger.warning("  Performance log failed: {}".format(e))
 
         # Stop CC run with final metrics
         try:
@@ -740,6 +751,260 @@ class PolyMakerBot(PolymarketBot):
         else:
             self.logger.info("  SWEEP | {} tokens found but all already in claim queue".format(
                 total_tokens))
+
+    def _write_session_performance_log(self):
+        """
+        V15.8: Write a structured per-session performance log file.
+        
+        Outputs a JSON file to logs/{run_id}/performance.json containing
+        all key metrics in a machine-readable format for easy post-session
+        analysis without needing to parse the full bot.log.
+        
+        Also writes a human-readable performance.txt summary.
+        """
+        import json as _json
+        from datetime import datetime, timezone as _tz
+
+        stats = self.engine.get_stats()
+        merge_stats = self.auto_merger.get_stats()
+        claim_stats = self.claim_manager.get_claim_stats()
+        hedge_analytics = stats.get("hedge_analytics", {})
+
+        # VPIN stats
+        vpin_stats = {}
+        if hasattr(self, 'vpin_tracker') and self.vpin_tracker:
+            vpin_stats = self.vpin_tracker.get_stats()
+
+        # WS fill detector stats
+        ws_stats = {}
+        if hasattr(self, 'ws_fill_detector') and self.ws_fill_detector:
+            ws_stats = self.ws_fill_detector.get_stats()
+
+        # Volatility stats
+        vol_stats = {}
+        if hasattr(self, 'vol_tracker') and self.vol_tracker:
+            vol_stats = self.vol_tracker.get_all_stats()
+
+        # Churn stats
+        churn_stats = {}
+        if hasattr(self, 'churn_manager') and self.churn_manager:
+            churn_stats = self.churn_manager.get_stats()
+
+        # Reward stats
+        reward_stats = {}
+        if hasattr(self, 'mm_strategy') and self.mm_strategy:
+            reward_stats = self.mm_strategy.get_reward_stats()
+
+        # Build the performance record
+        now = datetime.now(_tz.utc)
+        run_id = self._cc_run_id or "local"
+        session_duration = time.time() - (cc.run_start_time if cc.run_start_time else time.time())
+
+        # P&L metrics
+        wallet_delta = stats.get("wallet_delta")
+        portfolio_pnl = stats.get("portfolio_pnl")
+        total_pnl = portfolio_pnl if portfolio_pnl is not None else (wallet_delta or 0)
+        starting_bankroll = self.config.kelly_bankroll
+        pnl_pct = (total_pnl / starting_bankroll * 100) if starting_bankroll > 0 else 0
+
+        # Resolution funnel
+        one_sided = hedge_analytics.get("one_sided_fills", 0)
+        resolved_merge = hedge_analytics.get("resolved_by_merge", 0)
+        resolved_hedge = hedge_analytics.get("resolved_by_hedge", 0)
+        resolved_exit = hedge_analytics.get("resolved_by_exit", 0)
+        resolved_t4 = hedge_analytics.get("resolved_by_t4_sell", 0)
+        resolved_abandoned = hedge_analytics.get("resolved_abandoned", 0)
+        total_resolved = resolved_merge + resolved_hedge + resolved_exit + resolved_t4
+
+        perf = {
+            "session": {
+                "run_id": run_id,
+                "timestamp_utc": now.isoformat(),
+                "duration_seconds": round(session_duration, 0),
+                "duration_human": "{:.1f}h".format(session_duration / 3600),
+                "total_cycles": cc.cycle_count,
+                "mode": "dry_run" if self.config.dry_run else "live",
+            },
+            "pnl": {
+                "total_pnl": round(total_pnl, 4),
+                "pnl_pct": round(pnl_pct, 2),
+                "wallet_delta": round(wallet_delta, 4) if wallet_delta is not None else None,
+                "portfolio_pnl": round(portfolio_pnl, 4) if portfolio_pnl is not None else None,
+                "held_value": round(stats.get("held_value", 0), 4),
+                "peak_pnl": round(self._peak_pnl, 4),
+                "max_drawdown": round(self._max_drawdown, 4),
+                "starting_bankroll": starting_bankroll,
+                "ending_bankroll": round(starting_bankroll + total_pnl, 4),
+                "realized_pnl": round(stats.get("session_realized_pnl", 0), 4),
+            },
+            "orders": {
+                "total_placed": stats.get("total_placed", 0),
+                "total_filled": stats.get("total_filled", 0),
+                "total_cancelled": stats.get("total_cancelled", 0),
+                "fill_rate": round(stats.get("total_filled", 0) / max(1, stats.get("total_placed", 0)), 4),
+            },
+            "windows": {
+                "paired": stats.get("paired_windows", 0),
+                "filled": stats.get("filled_windows", 0),
+                "closed": stats.get("closed_windows", 0),
+                "held": stats.get("held_windows", 0),
+                "one_sided_fills": one_sided,
+            },
+            "resolution_funnel": {
+                "total_one_sided": one_sided,
+                "resolved_by_merge": resolved_merge,
+                "resolved_by_merge_pct": round(resolved_merge / max(1, one_sided) * 100, 1),
+                "resolved_by_hedge": resolved_hedge,
+                "resolved_by_exit": resolved_exit,
+                "resolved_by_exit_pct": round(resolved_exit / max(1, one_sided) * 100, 1),
+                "resolved_by_t4_sell": resolved_t4,
+                "resolved_abandoned": resolved_abandoned,
+                "total_resolved": total_resolved,
+                "resolution_rate": round(total_resolved / max(1, one_sided) * 100, 1),
+            },
+            "exit_analytics": {
+                "exit_count": hedge_analytics.get("exit_count", len(hedge_analytics.get("exit_profits", []))),
+                "exit_total_profit": round(sum(hedge_analytics.get("exit_profits", [])), 4),
+                "exit_avg_profit": round(
+                    sum(hedge_analytics.get("exit_profits", [])) / max(1, len(hedge_analytics.get("exit_profits", []))), 4),
+                "exit_avg_hold_secs": round(
+                    sum(hedge_analytics.get("exit_hold_times", [])) / max(1, len(hedge_analytics.get("exit_hold_times", []))), 1),
+            },
+            "merges": {
+                "completed": merge_stats.get("merges_completed", 0),
+                "failed": merge_stats.get("merges_failed", 0),
+                "total_usd_returned": round(merge_stats.get("total_merged_usd", 0), 4),
+            },
+            "claims": {
+                "completed": claim_stats.get("claimed_total", 0),
+                "total_usd": round(claim_stats.get("total_claimed_usd", 0), 4),
+                "pending": claim_stats.get("pending_claims", 0),
+                "blind_attempts": claim_stats.get("blind_attempts", 0),
+                "blind_successes": claim_stats.get("blind_successes", 0),
+            },
+            "filters": {
+                "gate_blocks": hedge_analytics.get("gate_blocks", 0),
+                "gate_bypasses": hedge_analytics.get("gate_bypasses", 0),
+                "vpin_blocks": hedge_analytics.get("vpin_blocks", 0),
+                "vpin_widens": hedge_analytics.get("vpin_widens", 0),
+                "midpoint_skips": hedge_analytics.get("midpoint_skips", 0),
+                "graduated_spread_activations": hedge_analytics.get("graduated_spread_activations", 0),
+                "ws_recovered_fast_tracks": hedge_analytics.get("ws_recovered_fast_tracks", 0),
+            },
+            "vpin": {
+                "total_checks": vpin_stats.get("total_checks", 0),
+                "blocks": vpin_stats.get("blocks", 0),
+                "widens": vpin_stats.get("widens", 0),
+                "no_data_count": vpin_stats.get("no_data_count", 0),
+                "no_data_rate": round(vpin_stats.get("no_data_rate", 0) * 100, 1),
+                "fallback_activations": vpin_stats.get("fallback_activations", 0),
+                "fallback_widens": vpin_stats.get("fallback_widens", 0),
+            },
+            "ws_fills": {
+                "ws_fills_session": ws_stats.get("ws_fills_session", 0),
+                "rest_fallback_count": ws_stats.get("rest_fallback_count", 0),
+            },
+            "strategies": {
+                "mm_trades": stats.get("mm_trades", 0),
+                "sniper_trades": stats.get("sniper_trades", 0),
+                "arb_trades": stats.get("arb_trades", 0),
+                "contrarian_trades": stats.get("contrarian_trades", 0),
+                "estimated_maker_rewards": round(reward_stats.get("total_estimated_reward", 0), 6),
+            },
+            "per_asset": hedge_analytics.get("per_asset", {}),
+            "tier_counts": hedge_analytics.get("tier_counts", {}),
+            "config_snapshot": {
+                "kelly_fraction": self.config.kelly_fraction,
+                "kelly_bankroll": self.config.kelly_bankroll,
+                "mm_order_size": self.config.mm_order_size,
+                "mm_base_spread": self.config.mm_base_spread,
+                "mm_num_levels": self.config.mm_num_levels,
+                "momentum_gate_threshold": self.config.momentum_gate_threshold,
+                "momentum_exit_threshold": self.config.momentum_exit_threshold,
+                "momentum_exit_min_hold_secs": self.config.momentum_exit_min_hold_secs,
+                "vpin_enabled": self.config.vpin_enabled,
+                "vpin_threshold": self.config.vpin_threshold,
+                "vpin_min_trades": self.config.vpin_min_trades,
+                "vpin_vol_fallback_enabled": self.config.vpin_vol_fallback_enabled,
+                "dynamic_spread_enabled": self.config.dynamic_spread_enabled,
+                "graduated_spread_enabled": self.config.graduated_spread_enabled,
+                "ws_recovered_max_opposing_ask": self.config.ws_recovered_max_opposing_ask,
+                "hedge_t4_enabled": self.config.hedge_t4_enabled,
+                "max_total_exposure": self.config.max_total_exposure,
+                "max_position_per_market": self.config.max_position_per_market,
+                "max_concurrent_windows": self.config.max_concurrent_windows,
+                "assets_15m": self.config.assets_15m,
+                "assets_5m": self.config.assets_5m,
+            },
+        }
+
+        # Write JSON performance file
+        session_dir = os.path.join("logs", str(run_id))
+        os.makedirs(session_dir, exist_ok=True)
+        json_path = os.path.join(session_dir, "performance.json")
+        try:
+            with open(json_path, "w") as f:
+                _json.dump(perf, f, indent=2, default=str)
+            self.logger.info("  PERF LOG | Written to {}".format(os.path.abspath(json_path)))
+        except Exception as e:
+            self.logger.warning("  PERF LOG | Failed to write JSON: {}".format(e))
+
+        # Write human-readable summary
+        txt_path = os.path.join(session_dir, "performance.txt")
+        try:
+            lines = [
+                "=" * 70,
+                "  SESSION PERFORMANCE SUMMARY",
+                "  Run #{} | {} | {}".format(run_id, now.strftime("%Y-%m-%d %H:%M UTC"), perf["session"]["duration_human"]),
+                "=" * 70,
+                "",
+                "  P&L:          ${:+,.4f} ({:+.2f}%)".format(total_pnl, pnl_pct),
+                "  Wallet Delta: ${:+,.4f}".format(wallet_delta or 0),
+                "  Held Value:   ${:,.4f}".format(stats.get("held_value", 0)),
+                "  Peak P&L:     ${:+,.4f}".format(self._peak_pnl),
+                "  Max Drawdown: ${:,.4f}".format(self._max_drawdown),
+                "",
+                "  Orders: {} placed / {} filled / {} cancelled ({:.0%} fill rate)".format(
+                    perf["orders"]["total_placed"], perf["orders"]["total_filled"],
+                    perf["orders"]["total_cancelled"], perf["orders"]["fill_rate"]),
+                "",
+                "  Resolution Funnel ({} one-sided fills):".format(one_sided),
+                "    Merge:     {} ({:.1f}%)".format(resolved_merge, perf["resolution_funnel"]["resolved_by_merge_pct"]),
+                "    Mom Exit:  {} ({:.1f}%)".format(resolved_exit, perf["resolution_funnel"]["resolved_by_exit_pct"]),
+                "    Hedge:     {}".format(resolved_hedge),
+                "    T4 Sell:   {}".format(resolved_t4),
+                "    Abandoned: {}".format(resolved_abandoned),
+                "    Rate:      {:.1f}%".format(perf["resolution_funnel"]["resolution_rate"]),
+                "",
+                "  Merges: {} completed (${:,.2f} returned)".format(
+                    perf["merges"]["completed"], perf["merges"]["total_usd_returned"]),
+                "  Claims: {} completed (${:,.2f})".format(
+                    perf["claims"]["completed"], perf["claims"]["total_usd"]),
+                "",
+                "  Filters:",
+                "    Gate blocks:    {}".format(perf["filters"]["gate_blocks"]),
+                "    VPIN blocks:    {}".format(perf["filters"]["vpin_blocks"]),
+                "    VPIN widens:    {}".format(perf["filters"]["vpin_widens"]),
+                "    Midpoint skips: {}".format(perf["filters"]["midpoint_skips"]),
+                "    Grad spread:    {}".format(perf["filters"]["graduated_spread_activations"]),
+                "    WS-REC fast:    {}".format(perf["filters"]["ws_recovered_fast_tracks"]),
+                "",
+                "  VPIN: {} checks | {:.1f}% no-data | {} fallback widens".format(
+                    perf["vpin"]["total_checks"], perf["vpin"]["no_data_rate"],
+                    perf["vpin"]["fallback_widens"]),
+                "",
+                "  Config: kelly={:.0%} bankroll=${:.0f} spread={:.3f} size=${:.0f}".format(
+                    self.config.kelly_fraction, self.config.kelly_bankroll,
+                    self.config.mm_base_spread, self.config.mm_order_size),
+                "=" * 70,
+            ]
+            with open(txt_path, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            self.logger.info("  PERF LOG | Summary written to {}".format(os.path.abspath(txt_path)))
+        except Exception as e:
+            self.logger.warning("  PERF LOG | Failed to write summary: {}".format(e))
+
+        return perf
 
     def _push_final_metrics(self, status="completed"):
         """Push final metrics when run ends."""
@@ -1541,6 +1806,10 @@ class PolyMakerBot(PolymarketBot):
                 self.running = False
                 self.engine.cancel_all()
                 self._print_summary("FINAL")
+                try:
+                    self._write_session_performance_log()
+                except Exception:
+                    pass
                 self._push_final_metrics("stopped")
                 break
             except Exception as e:

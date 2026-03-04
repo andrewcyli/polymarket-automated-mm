@@ -468,13 +468,73 @@ class WSFillDetector:
                             for h in self.engine._pending_hedges
                         )
                         if not already_pending:
+                            # V15.8: Post-WS-RECOVERED immediate assessment.
+                            # When a fill arrives from a cancelled order (recovered=True),
+                            # check the opposing side's ask price. If it's too expensive
+                            # (> ws_recovered_max_opposing_ask), the hedge tiers will almost
+                            # certainly fail. Instead, fast-track to momentum exit by setting
+                            # the fill time to (now - momentum_exit_max_wait_secs) so the
+                            # momentum exit checker evaluates it immediately next cycle.
+                            ws_recovered_fast_track = False
+                            ws_recovered_max_ask = getattr(self.engine.config, 'ws_recovered_max_opposing_ask', 0.80)
+                            if recovered and ws_recovered_max_ask > 0:
+                                # Determine the opposing token
+                                market = self.engine._market_cache.get(wid)
+                                meta = self.engine.window_metadata.get(wid, {})
+                                other_token = ""
+                                if side_label == "UP":
+                                    other_token = (market or meta).get("token_down", "")
+                                else:
+                                    other_token = (market or meta).get("token_up", "")
+                                if other_token:
+                                    try:
+                                        from ws_orderbook import WSOrderBookReader
+                                        # Try to get spread from the book_reader reference
+                                        book_reader = getattr(self.engine, '_book_reader_ref', None)
+                                        if book_reader:
+                                            opp_spread = book_reader.get_spread(other_token)
+                                            if opp_spread:
+                                                opp_ask = opp_spread.get("ask", 0)
+                                                if opp_ask > ws_recovered_max_ask:
+                                                    ws_recovered_fast_track = True
+                                                    self.logger.info(
+                                                        "  WS-RECOVERED ASSESSMENT | {} | {} | "
+                                                        "Opposing {} ask ${:.2f} > max ${:.2f} | "
+                                                        "Fast-tracking to momentum exit".format(
+                                                            wid, side_label,
+                                                            "DOWN" if side_label == "UP" else "UP",
+                                                            opp_ask, ws_recovered_max_ask))
+                                                else:
+                                                    self.logger.info(
+                                                        "  WS-RECOVERED ASSESSMENT | {} | {} | "
+                                                        "Opposing ask ${:.2f} <= max ${:.2f} | "
+                                                        "Normal hedge path".format(
+                                                            wid, side_label, opp_ask, ws_recovered_max_ask))
+                                    except Exception as e:
+                                        self.logger.debug(
+                                            "  WS-RECOVERED ASSESSMENT ERROR | {} | {}".format(wid, e))
+
+                            # Set fill time: if fast-tracked, backdate so momentum exit
+                            # evaluates immediately; otherwise use current time.
+                            fill_time = time.time()
+                            if ws_recovered_fast_track:
+                                # Backdate by max_wait_secs so momentum exit checks immediately
+                                max_wait = getattr(self.engine.config, 'momentum_exit_max_wait_secs', 120.0)
+                                fill_time = time.time() - max_wait
+                                # Also track analytics
+                                if "ws_recovered_fast_tracks" not in self.engine.hedge_analytics:
+                                    self.engine.hedge_analytics["ws_recovered_fast_tracks"] = 0
+                                self.engine.hedge_analytics["ws_recovered_fast_tracks"] += 1
+
                             self.engine._pending_hedges.append({
                                 "window_id": wid,
                                 "filled_side": side_label,
                                 "filled_price": fill_price,
                                 "filled_size": fill_size,
                                 "filled_token": fill_token,
-                                "time": time.time(),
+                                "time": fill_time,
+                                "ws_recovered": recovered,
+                                "ws_recovered_fast_track": ws_recovered_fast_track,
                             })
 
             # Mark as processed
