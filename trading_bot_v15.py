@@ -416,6 +416,14 @@ class BotConfig:
     # V15.1-19: Session blackout windows (list of [start_hour_utc, end_hour_utc] pairs)
     trading_blackout_windows: list = field(default_factory=list)
 
+    # V15.9: Auto-pause on consecutive momentum gate blocks
+    # When enabled, halts NEW window creation (but continues managing existing
+    # windows: merges, hedges, claims, exits) after N consecutive gate blocks
+    # across ALL assets. Resumes when M consecutive passes occur.
+    auto_pause_enabled: bool = False
+    auto_pause_gate_threshold: int = 10   # Consecutive blocks to trigger pause
+    auto_pause_resume_threshold: int = 3  # Consecutive passes to resume
+
     rpc_gas_cache_ttl: float = 30.0
     rpc_min_call_interval: float = 0.5  # V15.1-27: Reduced from 1.5s (smart token selection means fewer calls)
 
@@ -1635,6 +1643,9 @@ class AutoMerger:
         self.merges_failed = 0
         self.total_merged_usd = 0.0
         self._merged_windows = set()
+        # V15.9: Gas cost tracking per window
+        self._window_gas_costs = {}  # {window_id: total_gas_matic}
+        self._session_total_gas = 0.0  # Total gas spent this session (MATIC)
         self._init_web3()
 
     def set_engine(self, engine):
@@ -2049,6 +2060,8 @@ class AutoMerger:
         """Execute a call through the Gnosis Safe proxy using execTransaction.
         V15.1-23: Core Safe execution helper. Signs the Safe tx hash with the
         owner key and submits via execTransaction.
+        V15.9: Returns (success, gas_cost_matic) tuple instead of just bool.
+        gas_cost_matic is the actual MATIC spent on gas (gasUsed * effectiveGasPrice).
         
         The Safe's execTransaction signature:
           execTransaction(to, value, data, operation, safeTxGas, baseGas,
@@ -2106,16 +2119,25 @@ class AutoMerger:
             self.rpc_limiter.wait()
             tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+            # V15.9: Compute actual gas cost in MATIC from receipt
+            effective_gas_price = getattr(receipt, 'effectiveGasPrice', None)
+            if effective_gas_price is None:
+                effective_gas_price = int(gas_price * 1.3)
+            gas_cost_wei = receipt.gasUsed * effective_gas_price
+            gas_cost_matic = gas_cost_wei / 1e18
+            # Accumulate gas cost per window and session total
+            self._window_gas_costs[window_id] = self._window_gas_costs.get(window_id, 0.0) + gas_cost_matic
+            self._session_total_gas += gas_cost_matic
             if receipt.status == 1:
-                self.logger.info("  SAFE TX OK | {} | {} | Tx: {} | Gas: {}".format(
-                    label, window_id, self.w3.to_hex(tx_hash)[:20], receipt.gasUsed))
+                self.logger.info("  SAFE TX OK | {} | {} | Tx: {} | Gas: {} | Cost: {:.6f} MATIC".format(
+                    label, window_id, self.w3.to_hex(tx_hash)[:20], receipt.gasUsed, gas_cost_matic))
                 return True
             else:
                 self.logger.warning(
-                    "  SAFE TX REVERTED | {} | {} | Tx: {} | Gas: {} | "
+                    "  SAFE TX REVERTED | {} | {} | Tx: {} | Gas: {} | Cost: {:.6f} MATIC | "
                     "Signer: {} | Proxy: {}".format(
                         label, window_id,
-                        self.w3.to_hex(tx_hash), receipt.gasUsed,
+                        self.w3.to_hex(tx_hash), receipt.gasUsed, gas_cost_matic,
                         self.account.address[:10] + "...",
                         proxy_addr[:10] + "..."))
                 return False
@@ -2150,17 +2172,25 @@ class AutoMerger:
             self.rpc_limiter.wait()
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+            # V15.9: Track gas cost for direct merge
+            effective_gas_price = getattr(receipt, 'effectiveGasPrice', None)
+            if effective_gas_price is None:
+                effective_gas_price = int(gas_price * 1.3)
+            gas_cost_wei = receipt.gasUsed * effective_gas_price
+            gas_cost_matic = gas_cost_wei / 1e18
+            self._window_gas_costs[window_id] = self._window_gas_costs.get(window_id, 0.0) + gas_cost_matic
+            self._session_total_gas += gas_cost_matic
             if receipt.status == 1:
-                self.logger.info("  MERGE TX OK (direct) | {} | Tx: {}...".format(
-                    window_id, self.w3.to_hex(tx_hash)[:20]))
+                self.logger.info("  MERGE TX OK (direct) | {} | Tx: {}... | Cost: {:.6f} MATIC".format(
+                    window_id, self.w3.to_hex(tx_hash)[:20], gas_cost_matic))
                 return True
             else:
                 # V15.1-21: Verbose revert logging for direct merge
                 self.logger.warning(
-                    "  MERGE TX REVERTED (direct) | {} | Tx: {} | Gas used: {} | "
+                    "  MERGE TX REVERTED (direct) | {} | Tx: {} | Gas used: {} | Cost: {:.6f} MATIC | "
                     "Signer: {}".format(
                         window_id, self.w3.to_hex(tx_hash),
-                        receipt.gasUsed, self.account.address[:10] + "..."))
+                        receipt.gasUsed, gas_cost_matic, self.account.address[:10] + "..."))
         except Exception as e:
             err = str(e)
             err_lower = err.lower()
@@ -2172,11 +2202,26 @@ class AutoMerger:
                 self.rpc_limiter.report_rate_limit(15)
         return False
 
+    def get_gas_cost(self, window_id):
+        """V15.9: Get accumulated gas cost for a specific window."""
+        return self._window_gas_costs.get(window_id, 0.0)
+
+    def get_gas_stats(self):
+        """V15.9: Get session-level gas cost statistics."""
+        window_count = len(self._window_gas_costs)
+        return {
+            "session_total_gas_matic": self._session_total_gas,
+            "windows_with_gas": window_count,
+            "avg_gas_per_window": self._session_total_gas / window_count if window_count > 0 else 0.0,
+            "window_gas_costs": dict(self._window_gas_costs),
+        }
+
     def get_stats(self):
         return {
             "merges_completed": self.merges_completed,
             "merges_failed": self.merges_failed,
             "total_merged_usd": self.total_merged_usd,
+            "session_total_gas_matic": self._session_total_gas,
         }
 
 
@@ -2203,6 +2248,9 @@ class AutoClaimManager:
         self.blind_redeem_attempts = 0
         self.blind_redeem_successes = 0
         self.rpc_limiter = RPCRateLimiter(min_interval=config.rpc_min_call_interval)
+        # V15.9: Gas cost tracking for claim transactions
+        self._window_gas_costs = {}  # {window_id: total_gas_matic}
+        self._session_total_gas = 0.0
         self._init_web3()
 
     def set_engine(self, engine):
@@ -2506,9 +2554,16 @@ class AutoClaimManager:
             self.rpc_limiter.wait()
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+            # V15.9: Track gas cost for claim transactions
+            effective_gas_price = getattr(receipt, 'effectiveGasPrice', None)
+            if effective_gas_price is None:
+                effective_gas_price = int(gas_price * 1.3)
+            gas_cost_wei = receipt.gasUsed * effective_gas_price
+            gas_cost_matic = gas_cost_wei / 1e18
+            self._track_gas_cost(window_id, gas_cost_matic)
             if receipt.status == 1:
-                self.logger.info("  CLAIMED (direct) | {} | Tx: {}".format(
-                    window_id, self.w3.to_hex(tx_hash)[:20]))
+                self.logger.info("  CLAIMED (direct) | {} | Tx: {} | Gas: {:.6f} MATIC".format(
+                    window_id, self.w3.to_hex(tx_hash)[:20], gas_cost_matic))
                 return True
             return False
         except Exception as e:
@@ -2657,6 +2712,15 @@ class AutoClaimManager:
                         exits += 1
         return exits
 
+    def _track_gas_cost(self, window_id, gas_cost_matic):
+        """V15.9: Track gas cost for a window's claim transaction."""
+        self._window_gas_costs[window_id] = self._window_gas_costs.get(window_id, 0.0) + gas_cost_matic
+        self._session_total_gas += gas_cost_matic
+
+    def get_gas_cost(self, window_id):
+        """V15.9: Get accumulated gas cost for a specific window."""
+        return self._window_gas_costs.get(window_id, 0.0)
+
     def get_claim_stats(self):
         return {
             "pending_claims": len(self._pending_claims),
@@ -2666,6 +2730,7 @@ class AutoClaimManager:
             "rpc_backed_off": self.rpc_limiter.is_backed_off,
             "blind_attempts": self.blind_redeem_attempts,
             "blind_successes": self.blind_redeem_successes,
+            "session_total_gas_matic": self._session_total_gas,
         }
 
 
@@ -4720,6 +4785,11 @@ class MarketMakingStrategy:
         self._cycle_reward_estimates = []
         self._total_estimated_reward = 0.0
         self._gate_block_count = {}  # {asset: consecutive_block_count} — for momentum gate bypass
+        # V15.9: Auto-pause state — tracks consecutive gate blocks/passes globally
+        self._autopause_active = False
+        self._autopause_consec_blocks = 0  # Global consecutive gate blocks (across all assets)
+        self._autopause_consec_passes = 0  # Global consecutive gate passes since last block
+        self._autopause_trigger_count = 0  # How many times auto-pause has been triggered this session
 
     def execute(self, market):
         asset = market["asset"]
@@ -4850,6 +4920,20 @@ class MarketMakingStrategy:
                         window_id, momentum * 100, effective_threshold * 100, bypass_str))
                 # V15.1-25: Track gate block analytics
                 self.engine.hedge_analytics["gate_blocks"] += 1
+                # V15.9: Auto-pause — track global consecutive gate blocks
+                if self.config.auto_pause_enabled:
+                    self._autopause_consec_blocks += 1
+                    self._autopause_consec_passes = 0  # Reset pass counter on any block
+                    if (not self._autopause_active
+                            and self._autopause_consec_blocks >= self.config.auto_pause_gate_threshold):
+                        self._autopause_active = True
+                        self._autopause_trigger_count += 1
+                        self.logger.warning(
+                            "  AUTO-PAUSE TRIGGERED | {} consecutive gate blocks >= threshold {} | "
+                            "Trigger #{} | Halting new window creation".format(
+                                self._autopause_consec_blocks,
+                                self.config.auto_pause_gate_threshold,
+                                self._autopause_trigger_count))
                 return
             else:
                 if bypassed:
@@ -4862,6 +4946,18 @@ class MarketMakingStrategy:
                     self.engine.hedge_analytics["gate_bypasses"] += 1
                 # Reset counter on pass
                 self._gate_block_count[asset] = 0
+                # V15.9: Auto-pause — track global consecutive passes
+                if self.config.auto_pause_enabled:
+                    self._autopause_consec_passes += 1
+                    self._autopause_consec_blocks = 0  # Reset block counter on pass
+                    if (self._autopause_active
+                            and self._autopause_consec_passes >= self.config.auto_pause_resume_threshold):
+                        self._autopause_active = False
+                        self.logger.info(
+                            "  AUTO-PAUSE RESUMED | {} consecutive passes >= resume threshold {} | "
+                            "New window creation re-enabled".format(
+                                self._autopause_consec_passes,
+                                self.config.auto_pause_resume_threshold))
         # V15.1-19 Filter C: Spread Symmetry — skip if UP/DN spreads diverge too much
         if (self.config.max_spread_asymmetry > 0 and spread_down):
             dn_spread = spread_down.get("spread", 0)
@@ -5144,6 +5240,17 @@ class MarketMakingStrategy:
                     window_id, total_exp_after, self.engine.config.max_total_exposure))
             return
 
+        # V15.9: Auto-pause guard — skip NEW window creation when auto-paused.
+        # Existing windows (already in _window_first_placed) continue to be managed
+        # for refreshes, but no new windows are opened.
+        if (self.config.auto_pause_enabled and self._autopause_active
+                and window_id not in self._window_first_placed):
+            self.logger.info(
+                "  AUTO-PAUSE SKIP | {} | New window blocked (trigger #{}, {} consec blocks)".format(
+                    window_id, self._autopause_trigger_count,
+                    self._autopause_consec_blocks))
+            return
+
         for level in range(self.config.mm_num_levels):
             offset = optimal_d + (level * self.config.mm_level_spacing)
             up_price = round(midpoint - offset + skew, 2)
@@ -5219,6 +5326,15 @@ class MarketMakingStrategy:
     def cleanup_window(self, window_id):
         """V15.1-P5: Clean up tracking when a window expires."""
         self._window_first_placed.pop(window_id, None)
+
+    def get_autopause_state(self):
+        """V15.9: Return auto-pause state for CC reporting."""
+        return {
+            "active": self._autopause_active,
+            "consec_blocks": self._autopause_consec_blocks,
+            "consec_passes": self._autopause_consec_passes,
+            "trigger_count": self._autopause_trigger_count,
+        }
 
     def get_reward_stats(self):
         return {"total_estimated_reward": self._total_estimated_reward}

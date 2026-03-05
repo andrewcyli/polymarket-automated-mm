@@ -238,6 +238,8 @@ class PolyMakerClient:
             "unclaimed_est": "unclaimedEst",
             "expired_token_count": "expiredTokenCount",
             "held_value_legacy": "heldValueLegacy",
+            "autopause_active": "autopauseActive",
+            "autopause_count": "autopauseCount",
         }
         data: Dict[str, Any] = {"runId": rid}
         for k, v in metrics.items():
@@ -301,6 +303,8 @@ class PolyMakerClient:
             "unclaimed_est": "unclaimedEst",
             "expired_token_count": "expiredTokenCount",
             "held_value_legacy": "heldValueLegacy",
+            "autopause_active": "autopauseActive",
+            "autopause_count": "autopauseCount",
         }
         data: Dict[str, Any] = {"runId": rid, "status": status}
         if error_message:
@@ -461,7 +465,8 @@ class PolyMakerClient:
         hedge_tier_reached: Optional[int] = None,
         hedge_attempts: Optional[List[Dict[str, Any]]] = None,
         window_pnl: Optional[float] = None,
-        condition_id: Optional[str] = None,
+            condition_id: Optional[str] = None,
+            gas_cost: Optional[float] = None,
     ) -> Optional[int]:
         """
         Report a single window lifecycle event to the Command Center Analytics.
@@ -531,6 +536,8 @@ class PolyMakerClient:
             data["windowPnl"] = round(window_pnl, 4)
         if condition_id is not None:
             data["conditionId"] = condition_id
+        if gas_cost is not None:
+            data["gasCost"] = round(gas_cost, 8)
         
         result = self._post("/window/event", data)
         if result and "eventId" in result:

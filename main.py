@@ -376,6 +376,14 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     if config.trading_blackout_windows:
         print(f"  Blackout windows: {config.trading_blackout_windows}")
 
+    # V15.9: Auto-pause on consecutive momentum gate blocks
+    config.auto_pause_enabled = bool(cc_config.get("autoPauseEnabled", False))
+    config.auto_pause_gate_threshold = int(cc_config.get("autoPauseGateThreshold", 10))
+    config.auto_pause_resume_threshold = int(cc_config.get("autoPauseResumeThreshold", 3))
+    print(f"  V15.9: AutoPause={'ON' if config.auto_pause_enabled else 'OFF'} "
+          f"(block>={config.auto_pause_gate_threshold} → pause, "
+          f"pass>={config.auto_pause_resume_threshold} → resume)")
+
     # ── Auto-claim/redeem: reclaim USDC after market resolution ──────────
     # After a 15-min market resolves, winning shares are worth $1 each.
     # Auto-claim redeems them back to USDC so capital returns to bankroll.
@@ -735,6 +743,9 @@ class PolyMakerBot(PolymarketBot):
             unclaimed_est=stats.get("unclaimed_est"),
             expired_token_count=stats.get("expired_token_count"),
             held_value_legacy=stats.get("held_value_legacy"),
+            # V15.9: Auto-pause state for CC dashboard
+            autopause_active=self.mm_strategy.get_autopause_state()["active"] if hasattr(self, 'mm_strategy') else False,
+            autopause_count=self.mm_strategy.get_autopause_state()["trigger_count"] if hasattr(self, 'mm_strategy') else 0,
         )
         if not success:
             self.logger.warning("  CC PUSH FAILED | update_run returned False | C{}".format(cc.cycle_count))
@@ -1151,6 +1162,15 @@ class PolyMakerBot(PolymarketBot):
                 event["windowPnl"] = round(res_log["window_pnl"], 4)
             if res_log.get("hedge_attempts"):
                 event["hedgeAttempts"] = res_log["hedge_attempts"]
+            
+            # V15.9: Include gas cost from merge and claim transactions
+            gas_cost = 0.0
+            if hasattr(self, 'auto_merger') and self.auto_merger:
+                gas_cost += self.auto_merger.get_gas_cost(wid)
+            if hasattr(self, 'claim_manager') and self.claim_manager:
+                gas_cost += self.claim_manager.get_gas_cost(wid)
+            if gas_cost > 0:
+                event["gasCost"] = round(gas_cost, 8)
             
             events.append(event)
             self._reported_windows.add(wid)
