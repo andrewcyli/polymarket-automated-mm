@@ -148,6 +148,25 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     if reserve_ratio is not None and reserve_ratio >= 0:
         config.deploy_reserve_pct = float(reserve_ratio)
 
+    # V15.8-FIX: Portfolio loss stop — sync from CC config (was hardcoded at 15%)
+    # CC maxLossPct controls BOTH realized and portfolio loss stops.
+    # Previously portfolio_loss_stop_pct was hardcoded at 0.15, ignoring CC.
+    if max_loss_pct is not None and max_loss_pct > 0:
+        config.portfolio_loss_stop_pct = float(max_loss_pct)
+    portfolio_cooloff = cc_config.get("lossCooldownSec")
+    if portfolio_cooloff is not None and portfolio_cooloff > 0:
+        config.portfolio_loss_cooloff = int(portfolio_cooloff)
+
+    # V15.8: VPIN vol fallback toggle from CC
+    vpin_vol_fallback = cc_config.get("vpinVolFallbackEnabled")
+    if vpin_vol_fallback is not None:
+        config.vpin_vol_fallback_enabled = bool(vpin_vol_fallback)
+
+    # V15.8: WS-RECOVERED max opposing ask from CC
+    ws_rec_max_ask = cc_config.get("wsRecoveredMaxOpposingAsk")
+    if ws_rec_max_ask is not None and ws_rec_max_ask > 0:
+        config.ws_recovered_max_opposing_ask = float(ws_rec_max_ask)
+
     # Dry run mode
     mode = cc_config.get("mode", "dry_run")
     config.dry_run = (mode != "live")
@@ -549,6 +568,11 @@ class PolyMakerBot(PolymarketBot):
         else:
             self.logger.info("  WebSocket manager: disabled via WS_ENABLED=false")
 
+        # ── Window Analytics Tracker ──
+        # Track which windows have been reported to CC to avoid duplicates
+        self._reported_windows = set()  # {window_id, ...}
+        self._window_resolution_log = {}  # {window_id: {resolution, time, ...}}
+
         # Validate credentials for live mode
         if not self.config.dry_run:
             missing = []
@@ -615,6 +639,12 @@ class PolyMakerBot(PolymarketBot):
             perf_data = self._write_session_performance_log()
         except Exception as e:
             self.logger.warning("  Performance log failed: {}".format(e))
+
+        # Report any remaining window events to CC Analytics
+        try:
+            self._report_window_events()
+        except Exception as e:
+            self.logger.warning("  Window event reporting failed: {}".format(e))
 
         # Stop CC run with final metrics
         try:
@@ -1035,6 +1065,105 @@ class PolyMakerBot(PolymarketBot):
             self.logger.warning("  PERF LOG | Failed to write summary: {}".format(e))
 
         return perf
+
+    def _report_window_events(self):
+        """Report newly-resolved windows to CC Analytics.
+        
+        Monitors engine.closed_windows for new entries since last check,
+        builds event data from engine state, and sends to CC.
+        Called each cycle alongside _push_metrics().
+        """
+        if not self._cc_run_id or not cc._is_ready():
+            return
+        
+        # Find newly closed windows
+        all_closed = set(self.engine.closed_windows)
+        new_closed = all_closed - self._reported_windows
+        if not new_closed:
+            return
+        
+        events = []
+        now_ms = int(time.time() * 1000)
+        ha = self.engine.hedge_analytics
+        
+        for wid in new_closed:
+            # Extract asset and duration from window_id format: "BTC-5m-1709568000"
+            parts = wid.split("-")
+            asset = parts[0].upper() if parts else "UNKNOWN"
+            duration = "5m"
+            if len(parts) >= 2:
+                duration = parts[1] if parts[1] in ("5m", "15m") else "5m"
+            
+            # Get window metadata
+            meta = self.engine.window_metadata.get(wid, {})
+            market = self.engine._market_cache.get(wid, {})
+            end_time = meta.get("end_time", 0) or market.get("end_time", 0)
+            interval = market.get("interval", 300 if "5m" in wid else 900)
+            window_open_ms = int((end_time - interval) * 1000) if end_time else 0
+            window_close_ms = int(end_time * 1000) if end_time else 0
+            condition_id = meta.get("condition_id", "") or market.get("condition_id", "")
+            
+            # Determine resolution type from the engine's resolution log
+            # (populated at each resolution point in trading_bot_v15.py)
+            resolution = self.engine._resolution_log.get(wid, {}).get("resolution", "merge")
+            
+            # Get fill data
+            fill_side_data = self.engine.window_fill_sides.get(wid)
+            fill_side = None
+            fill_price = None
+            fill_size = None
+            if isinstance(fill_side_data, dict):
+                fill_side = fill_side_data.get("side")
+                fill_price = fill_side_data.get("price")
+                fill_size = fill_side_data.get("size")
+            elif isinstance(fill_side_data, str):
+                fill_side = fill_side_data
+            
+            # Build event
+            event = {
+                "runId": self._cc_run_id,
+                "windowId": wid,
+                "asset": asset,
+                "windowDuration": duration,
+                "resolution": resolution,
+                "windowOpenMs": window_open_ms,
+                "windowCloseMs": window_close_ms,
+                "resolvedMs": now_ms,
+            }
+            if fill_side:
+                event["fillSide"] = fill_side
+            if fill_price is not None:
+                event["fillPrice"] = round(float(fill_price), 4)
+            if fill_size is not None:
+                event["fillSize"] = round(float(fill_size), 2)
+            if condition_id:
+                event["conditionId"] = condition_id
+            
+            # Add resolution-specific data from the engine's resolution log
+            res_log = self.engine._resolution_log.get(wid, {})
+            if res_log.get("time_to_close_sec") is not None:
+                event["timeToCloseSec"] = round(res_log["time_to_close_sec"], 1)
+            if res_log.get("opposing_fill_price") is not None:
+                event["opposingFillPrice"] = round(res_log["opposing_fill_price"], 4)
+            if res_log.get("hedge_tier_reached") is not None:
+                event["hedgeTierReached"] = res_log["hedge_tier_reached"]
+            if res_log.get("window_pnl") is not None:
+                event["windowPnl"] = round(res_log["window_pnl"], 4)
+            if res_log.get("hedge_attempts"):
+                event["hedgeAttempts"] = res_log["hedge_attempts"]
+            
+            events.append(event)
+            self._reported_windows.add(wid)
+        
+        if events:
+            try:
+                result = cc.report_window_events_batch(events)
+                if result:
+                    self.logger.info("  CC ANALYTICS | Reported {} window events".format(len(events)))
+                else:
+                    self.logger.warning("  CC ANALYTICS | Failed to report {} window events".format(len(events)))
+            except Exception as e:
+                self.logger.warning("  CC ANALYTICS | Error reporting events: {}".format(str(e)[:100]))
 
     def _push_final_metrics(self, status="completed"):
         """Push final metrics when run ends."""
@@ -1843,6 +1972,8 @@ class PolyMakerBot(PolymarketBot):
 
                 # Push metrics to Command Center
                 self._push_metrics()
+                # Report resolved windows to CC Analytics
+                self._report_window_events()
 
             except KeyboardInterrupt:
                 self.logger.info("\nKeyboardInterrupt received. Shutting down...")

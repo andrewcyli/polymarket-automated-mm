@@ -439,6 +439,123 @@ class PolyMakerClient:
         result = self._post("/markets/report", {"markets": markets})
         return result is not None
 
+    # ========== Window Analytics ==========
+
+    def report_window_event(
+        self,
+        run_id: Optional[int] = None,
+        window_id: str = "",
+        asset: str = "",
+        window_duration: str = "5m",
+        resolution: str = "merge",
+        window_open_ms: int = 0,
+        window_close_ms: int = 0,
+        first_fill_ms: Optional[int] = None,
+        second_fill_ms: Optional[int] = None,
+        resolved_ms: Optional[int] = None,
+        time_to_close_sec: Optional[float] = None,
+        fill_side: Optional[str] = None,
+        fill_price: Optional[float] = None,
+        fill_size: Optional[float] = None,
+        opposing_fill_price: Optional[float] = None,
+        hedge_tier_reached: Optional[int] = None,
+        hedge_attempts: Optional[List[Dict[str, Any]]] = None,
+        window_pnl: Optional[float] = None,
+        condition_id: Optional[str] = None,
+    ) -> Optional[int]:
+        """
+        Report a single window lifecycle event to the Command Center Analytics.
+        
+        Call this when a window is resolved (merge, orphan_sell, momentum_exit,
+        hedge_buy, t4_sell, abandoned).
+        
+        Args:
+            run_id: Run ID (defaults to current_run_id)
+            window_id: The window identifier (e.g., "btc-5m-1709568000")
+            asset: Asset symbol (e.g., "BTC", "ETH")
+            window_duration: "5m" or "15m"
+            resolution: One of: merge, orphan_sell, momentum_exit, hedge_buy, t4_sell, abandoned
+            window_open_ms: Window open timestamp (epoch ms)
+            window_close_ms: Window close/expiry timestamp (epoch ms)
+            first_fill_ms: When the first side was filled (epoch ms)
+            second_fill_ms: When the second side was filled (epoch ms, for merges)
+            resolved_ms: When the window was actually resolved (epoch ms)
+            time_to_close_sec: Seconds from first fill to resolution
+            fill_side: "UP", "DOWN", or "BOTH"
+            fill_price: Price of the initial fill
+            fill_size: Size of the initial fill in shares
+            opposing_fill_price: Price of the opposing side fill (for merges/hedges)
+            hedge_tier_reached: Highest hedge tier attempted (1-4)
+            hedge_attempts: List of dicts: [{tier, pctRemaining, askPrice, timestamp}, ...]
+            window_pnl: Realized P&L for this window
+            condition_id: Polymarket condition ID
+            
+        Returns:
+            The event ID on success, None on failure.
+        """
+        rid = run_id or self.current_run_id
+        if not rid:
+            return None
+        
+        data = {
+            "runId": rid,
+            "windowId": window_id,
+            "asset": asset,
+            "windowDuration": window_duration,
+            "resolution": resolution,
+            "windowOpenMs": window_open_ms,
+            "windowCloseMs": window_close_ms,
+        }
+        # Add optional fields only if provided
+        if first_fill_ms is not None:
+            data["firstFillMs"] = first_fill_ms
+        if second_fill_ms is not None:
+            data["secondFillMs"] = second_fill_ms
+        if resolved_ms is not None:
+            data["resolvedMs"] = resolved_ms
+        if time_to_close_sec is not None:
+            data["timeToCloseSec"] = round(time_to_close_sec, 1)
+        if fill_side is not None:
+            data["fillSide"] = fill_side
+        if fill_price is not None:
+            data["fillPrice"] = round(fill_price, 4)
+        if fill_size is not None:
+            data["fillSize"] = round(fill_size, 2)
+        if opposing_fill_price is not None:
+            data["opposingFillPrice"] = round(opposing_fill_price, 4)
+        if hedge_tier_reached is not None:
+            data["hedgeTierReached"] = hedge_tier_reached
+        if hedge_attempts is not None:
+            data["hedgeAttempts"] = hedge_attempts
+        if window_pnl is not None:
+            data["windowPnl"] = round(window_pnl, 4)
+        if condition_id is not None:
+            data["conditionId"] = condition_id
+        
+        result = self._post("/window/event", data)
+        if result and "eventId" in result:
+            return result["eventId"]
+        return None
+
+    def report_window_events_batch(
+        self,
+        events: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Report multiple window events at once (e.g., at session end).
+        
+        Args:
+            events: List of event dicts with the same fields as report_window_event().
+                    Each dict must include: runId, windowId, asset, windowDuration,
+                    resolution, windowOpenMs, windowCloseMs.
+                    
+        Returns:
+            Response dict with created/failed counts, or None on failure.
+        """
+        if not events:
+            return None
+        return self._post("/window/events", {"events": events})
+
     # ========== Convenience Methods ==========
 
     def increment_cycle(self):

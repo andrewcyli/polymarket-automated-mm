@@ -1861,6 +1861,12 @@ class AutoMerger:
                             "merges": 0, "abandoned": 0, "t4_sells": 0
                         }
                     self.engine.hedge_analytics["per_asset"][asset]["merges"] += 1
+                    # V15.9: Log resolution for CC Analytics
+                    self.engine._resolution_log[wid] = {
+                        "resolution": "merge",
+                        "time": time.time(),
+                        "window_pnl": mergeable,  # shares returned = value for merge
+                    }
             else:
                 self.merges_failed += 1
                 cycle_fails += 1
@@ -2714,6 +2720,9 @@ class TradingEngine:
         self._market_cache = {}
         self.hedges_completed = 0
         self.hedges_skipped = 0
+        # V15.9: Per-window resolution log for CC Analytics
+        # {window_id: {resolution, time, time_to_close_sec, opposing_fill_price, ...}}
+        self._resolution_log = {}
         # V15.1-25: Hedge & exit analytics tracker
         self.hedge_analytics = {
             "one_sided_fills": 0,       # Total one-sided fills detected
@@ -3611,6 +3620,12 @@ class TradingEngine:
                             "merges": 0, "abandoned": 0, "t4_sells": 0
                         }
                     self.hedge_analytics["per_asset"][asset]["abandoned"] += 1
+                    # V15.9: Log abandoned resolution for CC Analytics
+                    self._resolution_log[wid] = {
+                        "resolution": "abandoned",
+                        "time": time.time(),
+                        "time_to_close_sec": time.time() - hedge["time"],
+                    }
                     self.logger.warning(
                         "  HEDGE ABANDON (NO TOKEN) | {} | No token data for {} side".format(
                             wid, other_side))
@@ -3629,6 +3644,12 @@ class TradingEngine:
                             "merges": 0, "abandoned": 0, "t4_sells": 0
                         }
                     self.hedge_analytics["per_asset"][asset]["abandoned"] += 1
+                    # V15.9: Log abandoned resolution for CC Analytics
+                    self._resolution_log[wid] = {
+                        "resolution": "abandoned",
+                        "time": time.time(),
+                        "time_to_close_sec": time.time() - hedge["time"],
+                    }
                 continue
 
             other_ask = spread["ask"]
@@ -3733,6 +3754,15 @@ class TradingEngine:
                                         }
                                     pa = self.hedge_analytics["per_asset"][asset]
                                     pa["t4_sells"] = pa.get("t4_sells", 0) + 1
+                                    # V15.9: Log T4 sell resolution for CC Analytics
+                                    self._resolution_log[wid] = {
+                                        "resolution": "t4_sell",
+                                        "time": time.time(),
+                                        "time_to_close_sec": elapsed_t4,
+                                        "opposing_fill_price": sell_bid,
+                                        "hedge_tier_reached": 4,
+                                        "window_pnl": -(net_loss * sell_size),
+                                    }
                                     self.logger.info(
                                         "  T4 SOLD | {} | {} {:.0f} @ ${:.2f} | Loss ${:.3f}/sh".format(
                                             wid, filled_side, sell_size, sell_bid, net_loss))
@@ -3788,6 +3818,14 @@ class TradingEngine:
                         "merges": 0, "abandoned": 0, "t4_sells": 0
                     }
                 self.hedge_analytics["per_asset"][asset]["abandoned"] += 1
+                # V15.9: Log abandoned resolution for CC Analytics
+                self._resolution_log[wid] = {
+                    "resolution": "abandoned",
+                    "time": time.time(),
+                    "time_to_close_sec": time.time() - hedge["time"],
+                    "opposing_fill_price": other_ask,
+                    "hedge_tier_reached": active_tier_idx + 1,
+                }
                 # V15.7-BUG1: Schedule claim for abandoned hedge windows
                 meta = self.window_metadata.get(wid, {})
                 cid = meta.get("condition_id", "")
@@ -3836,6 +3874,15 @@ class TradingEngine:
                         "merges": 0, "abandoned": 0, "t4_sells": 0
                     }
                 self.hedge_analytics["per_asset"][asset]["hedges"] += 1
+                # V15.9: Log resolution for CC Analytics
+                self._resolution_log[wid] = {
+                    "resolution": "hedge_buy",
+                    "time": time.time(),
+                    "time_to_close_sec": elapsed,
+                    "opposing_fill_price": other_ask,
+                    "hedge_tier_reached": active_tier_idx + 1,
+                    "window_pnl": profit_per_share * size,
+                }
             self._pending_hedges.remove(hedge)
         return completed
 
@@ -3999,6 +4046,13 @@ class TradingEngine:
                             "merges": 0, "abandoned": 0, "t4_sells": 0
                         }
                     self.hedge_analytics["per_asset"][asset]["exits"] += 1
+                    # V15.9: Log resolution for CC Analytics
+                    self._resolution_log[wid] = {
+                        "resolution": "momentum_exit",
+                        "time": time.time(),
+                        "time_to_close_sec": hold_secs,
+                        "window_pnl": exit_profit,
+                    }
                     # V15.1-28: Orphan recovery — check if opposite side has tokens
                     # from a late fill (order filled after cancel). Instead of selling
                     # at a loss, try to BUY the missing side to re-pair for merge.
@@ -4107,6 +4161,13 @@ class TradingEngine:
                                             self.capital_in_positions - opp_cost)
                                         self._update_total_capital()
                                         self.hedge_analytics["orphan_sells"] += 1
+                                        # V15.9: Log orphan sell resolution for CC Analytics
+                                        self._resolution_log[wid + "_orphan"] = {
+                                            "resolution": "orphan_sell",
+                                            "time": time.time(),
+                                            "opposing_fill_price": opp_bid,
+                                            "window_pnl": -(opp_held * (1.0 - opp_bid)),  # loss from selling below $1
+                                        }
                                         self.logger.info(
                                             "  ORPHAN SOLD | {} | {} {:.1f} @ ${:.2f} "
                                             "= ${:.2f}".format(
