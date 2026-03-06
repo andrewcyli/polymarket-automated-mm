@@ -3330,6 +3330,13 @@ class TradingEngine:
                     "    REJECT {} | {} | cost ${:.2f} > available ${:.2f}".format(
                         label, window_id, order_cost, available))
                 return None
+            # V15.9-FIX: Hedge buys are recovery operations, not new exposure.
+            # They MUST bypass the window spend cap, total exposure, and asset
+            # exposure checks. The window already has one-sided risk; the hedge
+            # reduces net risk by completing the pair. Without this bypass,
+            # hedges are rejected whenever filled_cost + hedge_cost > cap
+            # (which is always true when the opposing ask > $0.50).
+            is_hedge_order = label.startswith("HEDGE-")
             wexp = self.window_exposure.get(window_id, 0)
             # V15.1-16: Include fill costs in per-market budget check.
             # window_exposure only tracks OPEN orders; after a fill the order is
@@ -3341,25 +3348,42 @@ class TradingEngine:
             # This scales automatically when max_position_per_market changes
             market_cap_with_tolerance = self.config.max_position_per_market * 1.02
             if total_window_spend + order_cost > market_cap_with_tolerance:
-                self.logger.info(
-                    "    REJECT {} | {} | window spend ${:.2f}(open)+${:.2f}(filled)+${:.2f}(new) > max ${:.2f}".format(
-                        label, window_id, wexp, wfill, order_cost,
-                        market_cap_with_tolerance))
-                return None
+                if is_hedge_order:
+                    self.logger.info(
+                        "    HEDGE BYPASS | {} | window spend ${:.2f}(open)+${:.2f}(filled)+${:.2f}(new) > max ${:.2f} — allowed (recovery)".format(
+                            window_id, wexp, wfill, order_cost,
+                            market_cap_with_tolerance))
+                else:
+                    self.logger.info(
+                        "    REJECT {} | {} | window spend ${:.2f}(open)+${:.2f}(filled)+${:.2f}(new) > max ${:.2f}".format(
+                            label, window_id, wexp, wfill, order_cost,
+                            market_cap_with_tolerance))
+                    return None
             if self.total_exposure + order_cost > self.config.max_total_exposure:
-                self.logger.info(
-                    "    REJECT {} | {} | total exp ${:.2f}+${:.2f} > max ${:.2f}".format(
-                        label, window_id, self.total_exposure, order_cost,
-                        self.config.max_total_exposure))
-                return None
+                if is_hedge_order:
+                    self.logger.info(
+                        "    HEDGE BYPASS | {} | total exp ${:.2f}+${:.2f} > max ${:.2f} — allowed (recovery)".format(
+                            window_id, self.total_exposure, order_cost,
+                            self.config.max_total_exposure))
+                else:
+                    self.logger.info(
+                        "    REJECT {} | {} | total exp ${:.2f}+${:.2f} > max ${:.2f}".format(
+                            label, window_id, self.total_exposure, order_cost,
+                            self.config.max_total_exposure))
+                    return None
             asset = window_id.split("-")[0] if "-" in window_id else ""
             aexp = self.asset_exposure.get(asset, 0)
             max_asset = self.config.max_total_exposure * self.config.max_asset_exposure_pct
             if aexp + order_cost > max_asset:
-                self.logger.info(
-                    "    REJECT {} | {} | asset {} exp ${:.2f}+${:.2f} > max ${:.2f}".format(
-                        label, window_id, asset, aexp, order_cost, max_asset))
-                return None
+                if is_hedge_order:
+                    self.logger.info(
+                        "    HEDGE BYPASS | {} | asset {} exp ${:.2f}+${:.2f} > max ${:.2f} — allowed (recovery)".format(
+                            window_id, asset, aexp, order_cost, max_asset))
+                else:
+                    self.logger.info(
+                        "    REJECT {} | {} | asset {} exp ${:.2f}+${:.2f} > max ${:.2f}".format(
+                            label, window_id, asset, aexp, order_cost, max_asset))
+                    return None
         elif side == "SELL":
             held = self.token_holdings.get(token_id, {}).get("size", 0)
             if held < size * 0.5 and not self.config.dry_run:
