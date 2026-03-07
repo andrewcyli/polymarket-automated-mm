@@ -384,7 +384,26 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
           f"(block>={config.auto_pause_gate_threshold} → pause, "
           f"pass>={config.auto_pause_resume_threshold} → resume)")
 
-    # ── Auto-claim/redeem: reclaim USDC after market resolution ──────────
+    # V16: Smart Exit Engine configuration
+    config.exit_mode = cc_config.get("exitMode", "tiers")  # "tiers" or "smart"
+    config.smart_exit_immediate_sell_ask = float(cc_config.get("smartExitImmediateSellAsk", 0.85))
+    config.smart_exit_sell_threshold = float(cc_config.get("smartExitSellThreshold", 0.55))
+    config.smart_exit_hedge_threshold = float(cc_config.get("smartExitHedgeThreshold", 0.40))
+    config.smart_exit_velocity_window = float(cc_config.get("smartExitVelocityWindow", 15.0))
+    config.smart_exit_ask_weight = float(cc_config.get("smartExitAskWeight", 0.40))
+    config.smart_exit_velocity_weight = float(cc_config.get("smartExitVelocityWeight", 0.20))
+    config.smart_exit_time_weight = float(cc_config.get("smartExitTimeWeight", 0.20))
+    config.smart_exit_cex_weight = float(cc_config.get("smartExitCexWeight", 0.20))
+    config.smart_exit_binance_enabled = bool(cc_config.get("smartExitBinanceEnabled", True))
+    config.smart_exit_binance_history = int(cc_config.get("smartExitBinanceHistory", 300))
+    print(f"  V16: ExitMode={config.exit_mode} | "
+          f"SellAsk>{config.smart_exit_immediate_sell_ask} | "
+          f"Thresholds: sell>{config.smart_exit_sell_threshold}, hedge<{config.smart_exit_hedge_threshold} | "
+          f"Weights: ask={config.smart_exit_ask_weight}, vel={config.smart_exit_velocity_weight}, "
+          f"time={config.smart_exit_time_weight}, cex={config.smart_exit_cex_weight} | "
+          f"Binance={'ON' if config.smart_exit_binance_enabled else 'OFF'}")
+
+    # ── Auto-claim/redeem: reclaim USDC after market resolution ──────────────
     # After a 15-min market resolves, winning shares are worth $1 each.
     # Auto-claim redeems them back to USDC so capital returns to bankroll.
     # This is FREE (gasless) through Polymarket's relayer system.

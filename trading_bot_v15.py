@@ -424,6 +424,23 @@ class BotConfig:
     auto_pause_gate_threshold: int = 10   # Consecutive blocks to trigger pause
     auto_pause_resume_threshold: int = 3  # Consecutive passes to resume
 
+    # V16: Smart Exit Engine
+    # Replaces T1/T2/T3/T4 tier waterfall with a continuous scoring model
+    # that combines order book signals, CEX momentum, and time pressure.
+    # When exit_mode="tiers", the existing tier logic runs unchanged.
+    # When exit_mode="smart", the SmartExitEngine makes hedge/sell decisions.
+    exit_mode: str = "tiers"                    # "tiers" or "smart"
+    smart_exit_immediate_sell_ask: float = 0.85  # Ask above this → sell immediately
+    smart_exit_sell_threshold: float = 0.55      # Score above this → sell
+    smart_exit_hedge_threshold: float = 0.40     # Score below this → hedge
+    smart_exit_velocity_window: float = 15.0     # Seconds for velocity computation
+    smart_exit_ask_weight: float = 0.40          # Weight: opposing ask level
+    smart_exit_velocity_weight: float = 0.20     # Weight: ask velocity
+    smart_exit_time_weight: float = 0.20         # Weight: time pressure
+    smart_exit_cex_weight: float = 0.20          # Weight: CEX momentum
+    smart_exit_binance_enabled: bool = True       # Enable Binance WebSocket feed
+    smart_exit_binance_history: int = 300         # Seconds of price history to keep
+
     rpc_gas_cache_ttl: float = 30.0
     rpc_min_call_interval: float = 0.5  # V15.1-27: Reduced from 1.5s (smart token selection means fewer calls)
 
@@ -3742,10 +3759,173 @@ class TradingEngine:
                 continue
 
             other_ask = spread["ask"]
+            other_bid = spread.get("bid", 0.0)  # V16: Need bid for sell value estimation
             fee_filled = self.fee_calc._interp_fee_per_share(filled_price)
             fee_other = self.fee_calc._interp_fee_per_share(other_ask)
             total_cost = filled_price + other_ask + fee_filled + fee_other
             profit_per_share = 1.0 - total_cost
+
+            # ── V16: Smart Exit Engine ──────────────────────────────────
+            # When exit_mode="smart", use the scoring model instead of tier waterfall.
+            # The smart engine evaluates ask level, velocity, time pressure, and CEX
+            # momentum to decide SELL vs HEDGE vs WAIT.
+            if getattr(self.config, 'exit_mode', 'tiers') == 'smart' and hasattr(self, '_smart_exit_engine') and self._smart_exit_engine:
+                asset = wid.split("-")[0] if "-" in wid else ""
+                filled_token = hedge.get("filled_token", "")
+                decision = self._smart_exit_engine.evaluate(
+                    window_id=wid,
+                    filled_side=filled_side,
+                    filled_price=filled_price,
+                    opposing_ask=other_ask,
+                    opposing_bid=other_bid,
+                    pct_remaining=pct_remaining,
+                    window_duration=window_duration,
+                    asset=asset,
+                )
+                action = decision["action"]
+                score = decision["score"]
+                reason = decision["reason"]
+
+                if action == "WAIT":
+                    self.logger.info(
+                        "  SMART WAIT | {} | {} | score={:.3f} | {}".format(
+                            wid, filled_side, score, reason))
+                    continue
+
+                elif action == "SELL":
+                    # Smart sell — sell the held token (like T4 but score-driven)
+                    if filled_token:
+                        filled_spread = book_reader.get_spread(filled_token)
+                        if filled_spread:
+                            sell_bid = filled_spread["bid"]
+                            actual_held = self.token_holdings.get(filled_token, {}).get("size", 0)
+                            sell_size = min(filled_size, actual_held) if actual_held >= 1.0 else 0
+                            if sell_size >= 1.0 and sell_bid >= 0.01:  # Accept any non-zero bid
+                                fee_sell = self.fee_calc._interp_fee_per_share(sell_bid)
+                                loss_per_share = filled_price - sell_bid + fee_sell
+                                self.logger.info(
+                                    "\n  SMART-SELL | {} | {} {:.0f} @ ${:.2f} -> bid ${:.2f} | "
+                                    "Loss ${:.3f}/sh | score={:.3f} | {}".format(
+                                        wid, filled_side, sell_size, filled_price, sell_bid,
+                                        loss_per_share, score, reason))
+                                cancelled = self.cancel_window_orders(wid)
+                                if cancelled:
+                                    self.logger.info(
+                                        "  SMART-SELL CANCEL | {} | Cancelled {} orders".format(wid, cancelled))
+                                result = self.place_order(
+                                    filled_token, "SELL", sell_bid, sell_size,
+                                    wid, "SMART-SELL", "mm", is_taker=True)
+                                # Retry with approval if rejected
+                                if not result and not self.config.dry_run and self.client:
+                                    try:
+                                        self.logger.info(
+                                            "  SMART-SELL RETRY | {} | Attempting CLOB approval + retry".format(wid))
+                                        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                                        self.client.update_balance_allowance(
+                                            BalanceAllowanceParams(
+                                                asset_type=AssetType.CONDITIONAL,
+                                                token_id=filled_token,
+                                            )
+                                        )
+                                        import time as _time
+                                        _time.sleep(2)
+                                        result = self.place_order(
+                                            filled_token, "SELL", sell_bid, sell_size,
+                                            wid, "SMART-SELL-RETRY", "mm", is_taker=True)
+                                    except Exception as e:
+                                        self.logger.warning(
+                                            "  SMART-SELL APPROVAL FAIL | {} | {}".format(wid, str(e)[:100]))
+                                if result:
+                                    self._pending_hedges.remove(hedge)
+                                    completed += 1
+                                    self.window_fill_sides.pop(wid, None)
+                                    self.window_fill_cost.pop(wid, None)
+                                    self.window_fill_tokens.pop(wid, None)
+                                    self.closed_windows.add(wid)
+                                    self.held_windows.discard(wid)
+                                    self.window_entry_count.pop(wid, None)
+                                    cost = filled_price * sell_size
+                                    self.capital_in_positions = max(0, self.capital_in_positions - cost)
+                                    self._update_total_capital()
+                                    self.hedge_analytics["resolved_by_t4_sell"] += 1
+                                    elapsed_se = time.time() - hedge["time"]
+                                    self.hedge_analytics["tier_counts"]["smart_sell"] = self.hedge_analytics["tier_counts"].get("smart_sell", 0) + 1
+                                    self._resolution_log[wid] = {
+                                        "resolution": "smart_sell",
+                                        "time": time.time(),
+                                        "time_to_close_sec": elapsed_se,
+                                        "opposing_fill_price": sell_bid,
+                                        "smart_exit_score": score,
+                                        "smart_exit_trigger": decision.get("trigger", ""),
+                                        "window_pnl": -(loss_per_share * sell_size),
+                                    }
+                                    self._smart_exit_engine.on_window_resolved(wid)
+                                    self.logger.info(
+                                        "  SMART-SELL OK | {} | {} {:.0f} @ ${:.2f}".format(
+                                            wid, filled_side, sell_size, sell_bid))
+                                    continue
+                                else:
+                                    self.logger.warning(
+                                        "  SMART-SELL FAILED | {} | Sell rejected".format(wid))
+                    # If sell failed or no token, fall through to abandon check
+                    if time_remaining <= 0:
+                        self._pending_hedges.remove(hedge)
+                        self.hedges_skipped += 1
+                        self.hedge_analytics["resolved_abandoned"] += 1
+                        asset = wid.split("-")[0] if "-" in wid else "unknown"
+                        if asset not in self.hedge_analytics["per_asset"]:
+                            self.hedge_analytics["per_asset"][asset] = {
+                                "one_sided": 0, "hedges": 0, "exits": 0,
+                                "merges": 0, "abandoned": 0, "t4_sells": 0
+                            }
+                        self.hedge_analytics["per_asset"][asset]["abandoned"] += 1
+                        self._resolution_log[wid] = {
+                            "resolution": "abandoned",
+                            "time": time.time(),
+                            "time_to_close_sec": time.time() - hedge["time"],
+                            "smart_exit_score": score,
+                        }
+                        self._smart_exit_engine.on_window_resolved(wid)
+                    continue
+
+                elif action == "HEDGE":
+                    # Smart hedge — buy the opposing side (like T1/T2 but score-driven)
+                    size = filled_size
+                    self.logger.info(
+                        "\n  SMART-HEDGE | {} | {} @ ${:.2f} | Buy {} @ ${:.2f} | "
+                        "Pair: ${:.3f} | ${:+.3f}/sh | score={:.3f} | {}".format(
+                            wid, filled_side, filled_price, other_side, other_ask,
+                            total_cost, profit_per_share, score, reason))
+                    result = self.place_order(
+                        other_token, "BUY", other_ask, size,
+                        wid, "SMART-HEDGE-{}".format(other_side), "mm", is_taker=True)
+                    if result:
+                        completed += 1
+                        self.hedges_completed += 1
+                        self.hedge_analytics["resolved_by_hedge"] += 1
+                        self.hedge_analytics["tier_counts"]["smart_hedge"] = self.hedge_analytics["tier_counts"].get("smart_hedge", 0) + 1
+                        elapsed_sh = time.time() - hedge["time"]
+                        asset = wid.split("-")[0] if "-" in wid else "unknown"
+                        if asset not in self.hedge_analytics["per_asset"]:
+                            self.hedge_analytics["per_asset"][asset] = {
+                                "one_sided": 0, "hedges": 0, "exits": 0,
+                                "merges": 0, "abandoned": 0, "t4_sells": 0
+                            }
+                        self.hedge_analytics["per_asset"][asset]["hedges"] += 1
+                        self._resolution_log[wid] = {
+                            "resolution": "smart_hedge",
+                            "time": time.time(),
+                            "time_to_close_sec": elapsed_sh,
+                            "opposing_fill_price": other_ask,
+                            "smart_exit_score": score,
+                            "smart_exit_trigger": decision.get("trigger", ""),
+                            "window_pnl": profit_per_share * size,
+                        }
+                        self._smart_exit_engine.on_window_resolved(wid)
+                    self._pending_hedges.remove(hedge)
+                    continue
+            # ── End V16 Smart Exit ──────────────────────────────────────
+
             tier_pct, tier_max_ask = active_tier
             is_last_tier = (active_tier_idx == len(hedge_tiers) - 1)
 
@@ -5648,6 +5828,51 @@ class PolymarketBot:
 
         self.window_conditions = {}
 
+        # V16: Smart Exit Engine + Binance Feed initialization
+        self._binance_feed = None
+        self._smart_exit_engine = None
+        if getattr(self.config, 'exit_mode', 'tiers') == 'smart':
+            try:
+                from binance_feed import BinanceFeed
+                from smart_exit import SmartExitEngine
+                # Start Binance WebSocket feed for CEX momentum data
+                if getattr(self.config, 'smart_exit_binance_enabled', True):
+                    symbols = []
+                    for a in getattr(self.config, 'assets', ['btc', 'eth', 'sol', 'xrp']):
+                        sym = {'btc': 'btcusdt', 'eth': 'ethusdt', 'sol': 'solusdt', 'xrp': 'xrpusdt'}.get(a.lower())
+                        if sym:
+                            symbols.append(sym)
+                    if symbols:
+                        self._binance_feed = BinanceFeed(
+                            symbols=symbols,
+                            max_history=getattr(self.config, 'smart_exit_binance_history', 300),
+                            logger=self.logger)
+                        self._binance_feed.start()
+                        self.logger.info("  V16: Binance feed started for {}".format(symbols))
+                # Initialize Smart Exit Engine
+                self._smart_exit_engine = SmartExitEngine(
+                    config={
+                        'immediate_sell_ask': getattr(self.config, 'smart_exit_immediate_sell_ask', 0.85),
+                        'sell_threshold': getattr(self.config, 'smart_exit_sell_threshold', 0.55),
+                        'hedge_threshold': getattr(self.config, 'smart_exit_hedge_threshold', 0.40),
+                        'velocity_window': getattr(self.config, 'smart_exit_velocity_window', 15.0),
+                        'ask_weight': getattr(self.config, 'smart_exit_ask_weight', 0.40),
+                        'velocity_weight': getattr(self.config, 'smart_exit_velocity_weight', 0.20),
+                        'time_weight': getattr(self.config, 'smart_exit_time_weight', 0.20),
+                        'cex_weight': getattr(self.config, 'smart_exit_cex_weight', 0.20),
+                    },
+                    binance_feed=self._binance_feed,
+                    logger=self.logger)
+                self.logger.info("  V16: Smart Exit Engine initialized (mode=smart)")
+            except ImportError as e:
+                self.logger.warning("  V16: Smart Exit import failed: {} — falling back to tiers".format(e))
+                self._smart_exit_engine = None
+            except Exception as e:
+                self.logger.warning("  V16: Smart Exit init failed: {} — falling back to tiers".format(e))
+                self._smart_exit_engine = None
+        # Wire smart exit engine to the trade engine for hedge decisions
+        self.engine._smart_exit_engine = self._smart_exit_engine
+
         self.mm_strategy = MarketMakingStrategy(
             self.config, self.engine, self.book_reader,
             self.price_feed, self.kelly, self.fee_calc, self.logger,
@@ -5672,6 +5897,13 @@ class PolymarketBot:
         self.logger.info("\nShutdown signal received. Cancelling all orders...")
         self.logger.info("  (Press Ctrl+C again to force-quit immediately)")
         self.running = False
+        # V16: Stop Binance feed
+        if hasattr(self, '_binance_feed') and self._binance_feed:
+            try:
+                self._binance_feed.stop()
+                self.logger.info("  V16: Binance feed stopped.")
+            except Exception:
+                pass
         try:
             self.engine.cancel_all()
         except Exception:
