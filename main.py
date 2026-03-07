@@ -101,9 +101,9 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     # Derive mm_order_size from budgetPerMarket (half for UP, half for DOWN)
     if budget_per_market and budget_per_market > 0:
         config.mm_order_size = round(float(budget_per_market) / 2.0, 2)
-        # Set per-market position cap to full budgetPerMarket (allows both sides)
-        config.max_position_per_market = float(budget_per_market)
         print(f"  Budget per market: ${budget_per_market:.2f} -> order size: ${config.mm_order_size:.2f}/side")
+        # NOTE: max_position_per_market is computed AFTER all settings are applied
+        # (see V15.9-FIX block below) to use final mm_num_levels and edge_premium_size_mult
 
     # Session budget controls total exposure cap
     if session_budget and session_budget > 0:
@@ -400,6 +400,26 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     # CC is the authority for bankroll. Don't let v15 override it from wallet.
     config.auto_detect_bankroll = False
 
+    # ── V15.9-FIX: Compute per-market cap AFTER all settings are applied ──
+    # budgetPerMarket is the BASE BID, not the MAX cap.
+    # The per-market cap must accommodate compounding factors:
+    #   1. Share floor: Polymarket min 5 shares -> 5 * $1.00 = $5.00 worst case
+    #   2. Premium edge sizing: up to edge_premium_size_mult (1.5x)
+    #   3. Multi-level orders: each level adds another pair
+    #   4. Share rounding: actual cost slightly exceeds budget
+    # Without this headroom, the DOWN side of every pair gets rejected
+    # because open(UP) + new(DN) > cap, causing 100% orphan-cancel.
+    if budget_per_market and budget_per_market > 0:
+        min_shares = 5  # Polymarket minimum order size
+        worst_case_pair = min_shares * 1.0  # max pair cost = shares * $1
+        base_cap = max(float(budget_per_market), worst_case_pair)
+        num_levels = config.mm_num_levels  # now final from CC
+        premium_mult = config.edge_premium_size_mult  # 1.5x default
+        rounding_buffer = 1.10  # 10% for share rounding + spread widening
+        config.max_position_per_market = base_cap * num_levels * premium_mult * rounding_buffer
+        print(f"  Per-market cap: ${config.max_position_per_market:.2f} "
+              f"(base=${base_cap:.0f} x {num_levels}lvl x {premium_mult}x premium x {rounding_buffer}x buffer)")
+
     # ── Pre-flight validation ──────────────────────────────────────────
     _preflight_validate(config, cc_config)
 
@@ -434,11 +454,12 @@ def _preflight_validate(config: BotConfig, cc_config: dict):
             f"exceeds sessionBudget (${session_budget}). Bot may run out of capital."
         )
     
-    # Check: budgetPerMarket should be at least $10 for viable pair orders
-    if budget_per_market < 10:
+    # Check: budgetPerMarket should be at least $2 (Polymarket's actual minimum)
+    if budget_per_market > 0 and budget_per_market < 2:
         issues.append(
-            f"  ⚠️  budgetPerMarket (${budget_per_market}) is below $10 minimum. "
-            f"Each market needs at least $5/side for viable pair orders."
+            f"  ⚠️  budgetPerMarket (${budget_per_market}) is below $2 minimum. "
+            f"Polymarket requires at least $1/side. At very low budgets, "
+            f"gas costs may exceed merge profits."
         )
     
     # Check: max loss makes sense
