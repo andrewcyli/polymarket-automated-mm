@@ -556,6 +556,49 @@ class PolyMakerBot(PolymarketBot):
                            f"cooldown={self.config.hard_loss_cooloff:.0f}s, "
                            f"dry_run={self.config.dry_run}")
 
+            # V16-FIX: Re-initialize Smart Exit Engine AFTER CC config is applied.
+            # PolymarketBot.__init__() checks exit_mode before CC overrides are set,
+            # so it always sees 'tiers' and skips SmartExitEngine. We must re-init here.
+            if getattr(self.config, 'exit_mode', 'tiers') == 'smart':
+                try:
+                    from binance_feed import BinanceFeed
+                    from smart_exit import SmartExitEngine
+                    # Start Binance WebSocket feed for CEX momentum data
+                    if getattr(self.config, 'smart_exit_binance_enabled', True):
+                        symbols = []
+                        for a in getattr(self.config, 'assets', ['btc', 'eth', 'sol', 'xrp']):
+                            sym = {'btc': 'btcusdt', 'eth': 'ethusdt', 'sol': 'solusdt', 'xrp': 'xrpusdt'}.get(a.lower())
+                            if sym:
+                                symbols.append(sym)
+                        if symbols:
+                            self._binance_feed = BinanceFeed(
+                                symbols=symbols,
+                                max_history=getattr(self.config, 'smart_exit_binance_history', 300),
+                                logger=self.logger)
+                            self._binance_feed.start()
+                            self.logger.info("  V16: Binance feed started for {}".format(symbols))
+                    # Initialize Smart Exit Engine
+                    self._smart_exit_engine = SmartExitEngine(
+                        config={
+                            'immediate_sell_ask': getattr(self.config, 'smart_exit_immediate_sell_ask', 0.85),
+                            'sell_threshold': getattr(self.config, 'smart_exit_sell_threshold', 0.55),
+                            'hedge_threshold': getattr(self.config, 'smart_exit_hedge_threshold', 0.40),
+                            'velocity_window': getattr(self.config, 'smart_exit_velocity_window', 15.0),
+                            'ask_weight': getattr(self.config, 'smart_exit_ask_weight', 0.40),
+                            'velocity_weight': getattr(self.config, 'smart_exit_velocity_weight', 0.20),
+                            'time_weight': getattr(self.config, 'smart_exit_time_weight', 0.20),
+                            'cex_weight': getattr(self.config, 'smart_exit_cex_weight', 0.20),
+                        },
+                        binance_feed=self._binance_feed,
+                        logger=self.logger)
+                    self.logger.info("  V16: Smart Exit Engine initialized (mode=smart, post-CC)")
+                except ImportError as e:
+                    self.logger.warning("  V16: Smart Exit import failed: {} — falling back to tiers".format(e))
+                    self._smart_exit_engine = None
+                except Exception as e:
+                    self.logger.warning("  V16: Smart Exit init error: {} — falling back to tiers".format(e))
+                    self._smart_exit_engine = None
+
         # ── WebSocket Manager (Phase 1 async foundation) ──
         self.ws_manager = None
         self.ws_fill_detector = None
