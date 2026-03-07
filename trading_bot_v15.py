@@ -5838,13 +5838,13 @@ class PolymarketBot:
                 # Start Binance WebSocket feed for CEX momentum data
                 if getattr(self.config, 'smart_exit_binance_enabled', True):
                     symbols = []
-                    for a in getattr(self.config, 'assets', ['btc', 'eth', 'sol', 'xrp']):
+                    for a in getattr(self.config, 'assets_5m', getattr(self.config, 'assets_15m', ['btc', 'eth', 'sol', 'xrp'])):
                         sym = {'btc': 'btcusdt', 'eth': 'ethusdt', 'sol': 'solusdt', 'xrp': 'xrpusdt'}.get(a.lower())
                         if sym:
                             symbols.append(sym)
                     if symbols:
                         # BinanceFeed expects 'assets' (e.g. ['btc','eth']), not 'symbols' (e.g. ['btcusdt'])
-                        feed_assets = [a.lower() for a in getattr(self.config, 'assets', ['btc', 'eth', 'sol', 'xrp'])]
+                        feed_assets = list(set(a.lower() for a in getattr(self.config, 'assets_5m', []) + getattr(self.config, 'assets_15m', ['btc', 'eth'])))
                         self._binance_feed = BinanceFeed(
                             assets=feed_assets,
                             history_seconds=getattr(self.config, 'smart_exit_binance_history', 300))

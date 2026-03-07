@@ -566,13 +566,13 @@ class PolyMakerBot(PolymarketBot):
                     # Start Binance WebSocket feed for CEX momentum data
                     if getattr(self.config, 'smart_exit_binance_enabled', True):
                         symbols = []
-                        for a in getattr(self.config, 'assets', ['btc', 'eth', 'sol', 'xrp']):
+                        for a in getattr(self.config, 'assets_5m', getattr(self.config, 'assets_15m', ['btc', 'eth', 'sol', 'xrp'])):
                             sym = {'btc': 'btcusdt', 'eth': 'ethusdt', 'sol': 'solusdt', 'xrp': 'xrpusdt'}.get(a.lower())
                             if sym:
                                 symbols.append(sym)
                         if symbols:
                             # BinanceFeed expects 'assets' (e.g. ['btc','eth']), not 'symbols'
-                            feed_assets = [a.lower() for a in getattr(self.config, 'assets', ['btc', 'eth', 'sol', 'xrp'])]
+                            feed_assets = list(set(a.lower() for a in getattr(self.config, 'assets_5m', []) + getattr(self.config, 'assets_15m', ['btc', 'eth'])))
                             self._binance_feed = BinanceFeed(
                                 assets=feed_assets,
                                 history_seconds=getattr(self.config, 'smart_exit_binance_history', 300))
@@ -596,6 +596,12 @@ class PolyMakerBot(PolymarketBot):
                 except Exception as e:
                     self.logger.warning("  V16: Smart Exit init error: {} — falling back to tiers".format(e))
                     self._smart_exit_engine = None
+                # V16-FIX: Wire smart exit engine to TradingEngine where
+                # process_hedge_completions actually runs. Without this,
+                # engine._smart_exit_engine stays None from parent __init__.
+                if hasattr(self, 'engine') and self.engine:
+                    self.engine._smart_exit_engine = self._smart_exit_engine
+                    self.engine._binance_feed = self._binance_feed
 
         # ── WebSocket Manager (Phase 1 async foundation) ──
         self.ws_manager = None
