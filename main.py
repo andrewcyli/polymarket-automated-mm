@@ -171,6 +171,13 @@ def apply_cc_config(config: BotConfig, cc_config: dict):
     mode = cc_config.get("mode", "dry_run")
     config.dry_run = (mode != "live")
 
+    # Simulation fill rate (dry-run only)
+    sim_fill_rate = cc_config.get("simFillRate")
+    if sim_fill_rate is not None and float(sim_fill_rate) >= 0:
+        config.sim_fill_rate = float(sim_fill_rate)
+        if config.dry_run:
+            print(f"  Sim fill rate: {config.sim_fill_rate:.0%}")
+
     # ── Per-Strategy Toggles & Budgets from CC ──────────────────────
     # CC is the authority for which strategies are active and their budgets.
     # If not toggled on, budget = $0 and strategy is disabled.
