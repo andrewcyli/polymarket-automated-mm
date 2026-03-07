@@ -571,26 +571,24 @@ class PolyMakerBot(PolymarketBot):
                             if sym:
                                 symbols.append(sym)
                         if symbols:
+                            # BinanceFeed expects 'assets' (e.g. ['btc','eth']), not 'symbols'
+                            feed_assets = [a.lower() for a in getattr(self.config, 'assets', ['btc', 'eth', 'sol', 'xrp'])]
                             self._binance_feed = BinanceFeed(
-                                symbols=symbols,
-                                max_history=getattr(self.config, 'smart_exit_binance_history', 300),
-                                logger=self.logger)
+                                assets=feed_assets,
+                                history_seconds=getattr(self.config, 'smart_exit_binance_history', 300))
                             self._binance_feed.start()
                             self.logger.info("  V16: Binance feed started for {}".format(symbols))
                     # Initialize Smart Exit Engine
                     self._smart_exit_engine = SmartExitEngine(
-                        config={
-                            'immediate_sell_ask': getattr(self.config, 'smart_exit_immediate_sell_ask', 0.85),
-                            'sell_threshold': getattr(self.config, 'smart_exit_sell_threshold', 0.55),
-                            'hedge_threshold': getattr(self.config, 'smart_exit_hedge_threshold', 0.40),
-                            'velocity_window': getattr(self.config, 'smart_exit_velocity_window', 15.0),
-                            'ask_weight': getattr(self.config, 'smart_exit_ask_weight', 0.40),
-                            'velocity_weight': getattr(self.config, 'smart_exit_velocity_weight', 0.20),
-                            'time_weight': getattr(self.config, 'smart_exit_time_weight', 0.20),
-                            'cex_weight': getattr(self.config, 'smart_exit_cex_weight', 0.20),
-                        },
-                        binance_feed=self._binance_feed,
-                        logger=self.logger)
+                        immediate_sell_ask=getattr(self.config, 'smart_exit_immediate_sell_ask', 0.85),
+                        sell_score_threshold=getattr(self.config, 'smart_exit_sell_threshold', 0.55),
+                        hedge_score_threshold=getattr(self.config, 'smart_exit_hedge_threshold', 0.40),
+                        velocity_window=getattr(self.config, 'smart_exit_velocity_window', 15.0),
+                        ask_weight=getattr(self.config, 'smart_exit_ask_weight', 0.40),
+                        velocity_weight=getattr(self.config, 'smart_exit_velocity_weight', 0.20),
+                        time_weight=getattr(self.config, 'smart_exit_time_weight', 0.20),
+                        cex_weight=getattr(self.config, 'smart_exit_cex_weight', 0.20),
+                        binance_feed=self._binance_feed)
                     self.logger.info("  V16: Smart Exit Engine initialized (mode=smart, post-CC)")
                 except ImportError as e:
                     self.logger.warning("  V16: Smart Exit import failed: {} — falling back to tiers".format(e))
