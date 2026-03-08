@@ -18,6 +18,7 @@ requests
 
 # WebSocket support
 websockets
+websocket-client
 certifi
 
 # Optional: Google Sheets integration (legacy, not required for Command Center mode)
