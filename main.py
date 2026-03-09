@@ -576,8 +576,19 @@ class PolyMakerBot(PolymarketBot):
                             self._binance_feed = BinanceFeed(
                                 assets=feed_assets,
                                 history_seconds=getattr(self.config, 'smart_exit_binance_history', 300))
-                            self._binance_feed.start()
-                            self.logger.info("  V16: Binance feed started for {}".format(symbols))
+                            feed_ok = self._binance_feed.start()
+                            if feed_ok:
+                                self.logger.info("  V16: Binance feed started for {} (assets={})".format(symbols, feed_assets))
+                                # Give the feed a moment to connect and receive first trades
+                                import time as _time
+                                _time.sleep(2)
+                                prices = self._binance_feed.get_prices()
+                                connected = any(p > 0 for p in prices.values())
+                                self.logger.info("  V16: Binance feed status: connected={} prices={}".format(
+                                    connected, {k: f'${v:,.2f}' for k, v in prices.items() if v > 0}))
+                            else:
+                                self.logger.warning("  V16: Binance feed FAILED to start (websocket-client installed? pip install websocket-client)")
+                                self._binance_feed = None
                     # Initialize Smart Exit Engine
                     self._smart_exit_engine = SmartExitEngine(
                         immediate_sell_ask=getattr(self.config, 'smart_exit_immediate_sell_ask', 0.85),

@@ -94,11 +94,15 @@ class AskVelocityTracker:
                 old_snap = snap
                 break
         
-        if old_snap is None:
-            # All observations are older than velocity window — use most recent two
+        latest = history[-1]
+        
+        if old_snap is None or old_snap is latest:
+            # All observations are older than velocity window, or only the
+            # just-recorded observation is within the window — fall back to
+            # the second-most-recent observation so we always compare two
+            # distinct data points.
             old_snap = history[-2]
         
-        latest = history[-1]
         dt = latest.timestamp - old_snap.timestamp
         if dt < 0.5:  # Need at least 0.5s between observations
             return 0.0
