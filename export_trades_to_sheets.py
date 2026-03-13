@@ -128,7 +128,7 @@ def export_trades_to_sheets():
             # Clear existing data
             worksheet.clear()
             print("   Cleared old data")
-        except:
+        except Exception:
             worksheet = spreadsheet.add_worksheet(title='Trade History', rows=1000, cols=20)
             print("   ✓ Created new 'Trade History' tab")
 

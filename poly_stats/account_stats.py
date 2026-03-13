@@ -39,7 +39,7 @@ def get_all_positions(client):
         positions = positions[['asset', 'size', 'avgPrice', 'curPrice', 'percentPnl']]
         positions = positions.rename(columns={'size': 'position_size'})
         return positions
-    except:
+    except Exception:
         return pd.DataFrame()
     
 def combine_dfs(orders_df, positions, markets_df, selected_df):

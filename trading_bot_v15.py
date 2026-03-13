@@ -506,6 +506,87 @@ def setup_logging(level="INFO"):
 
 
 # -----------------------------------------------------------------
+# Structured Audit Logger — JSONL for trade/fill/merge events
+# -----------------------------------------------------------------
+
+class AuditLogger:
+    """Writes structured JSON events to a JSONL file for audit trail.
+    Each line is a self-contained JSON object with event type, timestamp,
+    and relevant fields for post-hoc analysis."""
+
+    def __init__(self, log_dir=LOG_DIR):
+        os.makedirs(log_dir, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        self._path = os.path.join(log_dir, "audit_{}.jsonl".format(ts))
+        self._fh = open(self._path, "a")
+
+    def _write(self, event):
+        event["ts"] = datetime.now(timezone.utc).isoformat()
+        try:
+            self._fh.write(json.dumps(event, default=str) + "\n")
+            self._fh.flush()
+        except Exception:
+            pass  # Never crash the bot due to audit logging
+
+    def order_placed(self, order_id, token_id, side, price, size,
+                     window_id, strategy, is_taker=False, dry_run=False):
+        self._write({
+            "event": "order_placed",
+            "order_id": order_id,
+            "token_id": token_id,
+            "side": side,
+            "price": price,
+            "size": size,
+            "cost": round(price * size, 4),
+            "window_id": window_id,
+            "strategy": strategy,
+            "is_taker": is_taker,
+            "dry_run": dry_run,
+        })
+
+    def order_rejected(self, reason, token_id, side, price, size,
+                       window_id, strategy, details=None):
+        self._write({
+            "event": "order_rejected",
+            "reason": reason,
+            "token_id": token_id,
+            "side": side,
+            "price": price,
+            "size": size,
+            "window_id": window_id,
+            "strategy": strategy,
+            "details": details or {},
+        })
+
+    def fill_recorded(self, token_id, side, price, size, fee, window_id=""):
+        self._write({
+            "event": "fill",
+            "token_id": token_id,
+            "side": side,
+            "price": price,
+            "size": size,
+            "fee": fee,
+            "cost": round(price * size + fee, 4),
+            "window_id": window_id,
+        })
+
+    def merge_executed(self, condition_id, shares, window_id, success):
+        self._write({
+            "event": "merge",
+            "condition_id": condition_id,
+            "shares": shares,
+            "window_id": window_id,
+            "success": success,
+        })
+
+    def close(self):
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+
+# -----------------------------------------------------------------
 # Shared constants and ABIs
 # -----------------------------------------------------------------
 
@@ -556,6 +637,7 @@ class RewardOptimizer:
             target_score = self.config.reward_target_pct
         if max_spread <= 0 or target_score <= 0 or target_score >= 1:
             return self.config.mm_base_spread
+        target_score = min(target_score, 1.0)  # Guard against math domain error in sqrt
         s = max_spread * (1.0 - math.sqrt(target_score))
         s = max(self.config.reward_min_distance, min(s, self.config.reward_max_distance))
         self._stats["calculations"] += 1
@@ -2043,14 +2125,17 @@ class AutoMerger:
                 [usdc_addr, parent, cid_bytes, [1, 2], amount_raw])
             ctf_addr = Web3.to_checksum_address(CTF_ADDRESS)
             if self.proxy_contract:
-                return self._merge_via_proxy(ctf_addr, merge_data, window_id)
+                result = self._merge_via_proxy(ctf_addr, merge_data, window_id)
             else:
-                return self._merge_direct(ctf_addr, merge_data, window_id)
+                result = self._merge_direct(ctf_addr, merge_data, window_id)
+            self.audit.merge_executed(condition_id, shares, window_id, result)
+            return result
         except Exception as e:
             err = str(e).lower()
             if "rate limit" in err or "-32090" in err:
                 self.rpc_limiter.report_rate_limit(15)
             self.logger.warning("  MERGE ERROR | {} | {}".format(window_id, e))
+            self.audit.merge_executed(condition_id, shares, window_id, False)
             return False
 
     def _merge_via_proxy(self, ctf_addr, merge_data, window_id):
@@ -2760,6 +2845,7 @@ class TradingEngine:
         self.config = config
         self.fee_calc = fee_calc
         self.logger = logger
+        self.audit = AuditLogger()
         self.balance_checker = balance_checker
         self.orders_by_window = {}
         self.active_orders = {}
@@ -3346,6 +3432,9 @@ class TradingEngine:
                 self.logger.info(
                     "    REJECT {} | {} | cost ${:.2f} > available ${:.2f}".format(
                         label, window_id, order_cost, available))
+                self.audit.order_rejected("capital_exceeded", token_id, side, price, size,
+                                          window_id, strategy,
+                                          {"cost": order_cost, "available": available})
                 return None
             # V15.9-FIX: Hedge buys are recovery operations, not new exposure.
             # They MUST bypass the window spend cap, total exposure, and asset
@@ -3415,6 +3504,8 @@ class TradingEngine:
                 "    [{:8s}] {:12s} {:4s} {:6.1f} @ ${:.2f} = ${:6.2f}{}".format(
                     strategy.upper(), label, side, size, price, price * size, fee_str))
             self._track_order(order_id, window_id, side, price, size, token_id, strategy)
+            self.audit.order_placed(order_id, token_id, side, price, size,
+                                    window_id, strategy, is_taker, dry_run=True)
             if self.sim_engine:
                 self.sim_engine.record_order(order_id, {
                     "window_id": window_id, "side": side, "price": price,
@@ -3434,6 +3525,8 @@ class TradingEngine:
                     "    [{:8s}] {:12s} {:4s} {:6.1f} @ ${:.2f} = ${:6.2f} | {}...".format(
                         strategy.upper(), label, side, size, price, price * size, oid[:16]))
                 self._track_order(oid, window_id, side, price, size, token_id, strategy)
+                self.audit.order_placed(oid, token_id, side, price, size,
+                                        window_id, strategy, is_taker, dry_run=False)
                 # V15.1-8: Taker orders fill immediately on Polymarket (FOK).
                 # Record the fill right away so token_holdings is up-to-date
                 # for merge/claim logic within the same cycle.
@@ -3482,6 +3575,8 @@ class TradingEngine:
                 err_msg = (result.get("errorMsg", str(result))
                            if isinstance(result, dict) else str(result))
                 self.logger.warning(f"    Order rejected: {err_msg}")
+                self.audit.order_rejected("exchange_rejected", token_id, side, price, size,
+                                          window_id, strategy, {"error": err_msg})
         except Exception as e:
             import traceback
             self.logger.error(f"    Order failed: {e}")
@@ -3502,6 +3597,7 @@ class TradingEngine:
                 self.token_holdings[token_id]["size"] = max(
                     0, self.token_holdings[token_id]["size"] - size)
             self.capital_in_positions = max(0, self.capital_in_positions - price * size)
+        self.audit.fill_recorded(token_id, side, price, size, fee)
         self._update_total_capital()
 
     def record_claim(self, amount):

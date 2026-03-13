@@ -25,7 +25,7 @@ def update_positions(avgOnly=False):
                 if col not in global_state.performing or not isinstance(global_state.performing[col], set) or len(global_state.performing[col]) == 0:
                     try:
                         old_size = position['size']
-                    except:
+                    except (KeyError, TypeError):
                         old_size = 0
 
                     if asset in  global_state.last_trade_update:

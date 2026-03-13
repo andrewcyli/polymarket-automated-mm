@@ -167,7 +167,7 @@ def check_trade_history(wallet_address):
                 try:
                     dt = datetime.fromtimestamp(int(timestamp) / 1000)
                     time_str = dt.strftime('%Y-%m-%d %H:%M:%S')
-                except:
+                except (ValueError, TypeError, OverflowError):
                     time_str = timestamp
             else:
                 time_str = 'Unknown'
@@ -224,7 +224,7 @@ def export_to_sheets(client, wallet_address):
         try:
             orders = client.get_all_orders()
             order_count = len(orders) if not orders.empty else 0
-        except:
+        except Exception:
             order_count = 0
 
         # Prepare rows to append

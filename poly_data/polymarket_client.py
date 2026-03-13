@@ -196,9 +196,10 @@ class PolymarketClient:
 
     def merge_positions(self, amount_to_merge, condition_id, is_neg_risk_market):
         amount_to_merge_str = str(amount_to_merge)
-        node_command = f'node poly_merger/merge.js {amount_to_merge_str} {condition_id} {"true" if is_neg_risk_market else "false"}'
-        print(node_command)
-        result = subprocess.run(node_command, shell=True, capture_output=True, text=True)
+        neg_risk_flag = "true" if is_neg_risk_market else "false"
+        node_command = ['node', 'poly_merger/merge.js', amount_to_merge_str, str(condition_id), neg_risk_flag]
+        print(' '.join(node_command))
+        result = subprocess.run(node_command, capture_output=True, text=True)
         if result.returncode != 0:
             print("Error:", result.stderr)
             raise Exception(f"Error in merging positions: {result.stderr}")
