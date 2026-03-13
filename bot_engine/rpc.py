@@ -39,6 +39,18 @@ class RPCRateLimiter:
         self.wait()
         try:
             price = w3.eth.gas_price
+            # Also check the latest block's base fee as a floor — some RPCs
+            # return stale/low gas_price values that sit below the actual
+            # base fee, causing every transaction to be rejected.
+            try:
+                block = w3.eth.get_block("latest")
+                base_fee = getattr(block, "baseFeePerGas", None)
+                if base_fee and base_fee > price:
+                    price = int(base_fee * 1.15)  # 15% above base fee
+            except Exception:
+                pass
+            # Hard floor: 30 Gwei (Polygon rarely goes below this)
+            price = max(price, 30_000_000_000)
             self._gas_cache = price
             self._gas_cache_time = now
             return price

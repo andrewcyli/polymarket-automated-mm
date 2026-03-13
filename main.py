@@ -899,7 +899,7 @@ class PolyMakerBot(PolymarketBot):
                 continue
             wid, side, cid = info
             # Skip if already in claim queue
-            if wid in self.claim_manager._claim_queue:
+            if wid in self.claim_manager._pending_claims:
                 continue
             # Skip if already claimed
             if wid in getattr(self.claim_manager, '_claimed_windows', set()):

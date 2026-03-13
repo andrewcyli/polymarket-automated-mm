@@ -15,6 +15,7 @@ from bot_engine.constants import (
     CTF_ADDRESS, USDC_E_ADDRESS, _encode_abi,
 )
 from bot_engine.rpc import RPCRateLimiter
+from bot_engine.logging_setup import AuditLogger
 
 
 class AutoMerger:
@@ -22,6 +23,7 @@ class AutoMerger:
         self.config = config
         self.logger = logger
         self.engine = engine
+        self.audit = AuditLogger()
         self.w3 = None
         self.ctf_contract = None
         self.account = None
