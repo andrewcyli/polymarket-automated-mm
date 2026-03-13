@@ -50,7 +50,7 @@ def log_position_snapshot():
         try:
             orders_df = global_state.client.get_all_orders()
             order_count = len(orders_df) if not orders_df.empty else 0
-        except:
+        except Exception:
             order_count = 0
 
         # Get wallet address

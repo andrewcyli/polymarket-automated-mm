@@ -556,6 +556,7 @@ class RewardOptimizer:
             target_score = self.config.reward_target_pct
         if max_spread <= 0 or target_score <= 0 or target_score >= 1:
             return self.config.mm_base_spread
+        target_score = min(target_score, 1.0)  # Guard against math domain error in sqrt
         s = max_spread * (1.0 - math.sqrt(target_score))
         s = max(self.config.reward_min_distance, min(s, self.config.reward_max_distance))
         self._stats["calculations"] += 1

@@ -16,7 +16,7 @@ def get_sel_df(spreadsheet, sheet_name='Selected Markets'):
         sel_df = pd.DataFrame(wk2.get_all_records())
         sel_df = sel_df[sel_df['question'] != ""].reset_index(drop=True)
         return sel_df
-    except:
+    except Exception:
         return pd.DataFrame()
     
 def get_all_markets(client):
@@ -37,7 +37,7 @@ def get_all_markets(client):
 
             if cursor is None:
                 break
-        except:
+        except Exception:
             break
 
     all_df = pd.concat(all_markets)
@@ -140,23 +140,23 @@ def process_single_row(row, client):
 
     try:
         bids = pd.DataFrame(book.bids).astype(float)
-    except:
+    except (ValueError, TypeError, KeyError):
         pass
 
     try:
         asks = pd.DataFrame(book.asks).astype(float)
-    except:
+    except (ValueError, TypeError, KeyError):
         pass
 
 
     try:
         ret['best_bid'] = bids.iloc[-1]['price']
-    except:
+    except (IndexError, KeyError):
         ret['best_bid'] = 0
 
     try:
         ret['best_ask'] = asks.iloc[-1]['price']
-    except:
+    except (IndexError, KeyError):
         ret['best_ask'] = 0
 
     ret['midpoint'] = (ret['best_bid'] + ret['best_ask']) / 2
@@ -175,12 +175,12 @@ def process_single_row(row, client):
 
     try:
         bids_df = bids_df.merge(bids, on='price', how='left').fillna(0)
-    except:
+    except Exception:
         bids_df = pd.DataFrame()
 
     try:
         asks_df = asks_df.merge(asks, on='price', how='left').fillna(0)
-    except:
+    except Exception:
         asks_df = pd.DataFrame()
 
     best_bid_reward = 0
@@ -189,7 +189,7 @@ def process_single_row(row, client):
     try:
         ret_bid = add_formula_params(bids_df, ret['midpoint'], v, rate)
         best_bid_reward = round(ret_bid['reward_per_100'].max(), 2)
-    except:
+    except Exception:
         pass
 
     best_ask_reward = 0
@@ -198,7 +198,7 @@ def process_single_row(row, client):
     try:
         ret_ask = add_formula_params(asks_df, ret['midpoint'], v, rate)
         best_ask_reward = round(ret_ask['reward_per_100'].max(), 2)
-    except:
+    except Exception:
         pass
 
     ret['bid_reward_per_100'] = best_bid_reward
@@ -223,7 +223,7 @@ def get_all_results(all_df, client, max_workers=5):
         idx, row = args
         try:
             return process_single_row(row, client)
-        except:
+        except Exception:
             print("error fetching market")
             return None
 
@@ -300,7 +300,7 @@ def add_volatility_to_df(df, max_workers=3):
         try:
             ret = add_volatility(row.to_dict())
             return ret
-        except:
+        except Exception:
             print("Error fetching volatility")
             return None
 

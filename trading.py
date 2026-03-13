@@ -349,13 +349,13 @@ async def perform_trade(market):
                 # Calculate ratio of buy vs sell liquidity in the market
                 try:
                     overall_ratio = (deets['bid_sum_within_n_percent']) / (deets['ask_sum_within_n_percent'])
-                except:
+                except (ZeroDivisionError, KeyError, TypeError):
                     overall_ratio = 0
 
                 try:
                     second_best_bid = round(second_best_bid, round_length)
                     second_best_ask = round(second_best_ask, round_length)
-                except:
+                except (TypeError, ValueError):
                     pass
                 
                 top_bid = round(top_bid, round_length)
@@ -543,7 +543,7 @@ async def perform_trade(market):
 
                     try:
                         ratio = (n_deets['bid_sum_within_n_percent']) / (n_deets['ask_sum_within_n_percent'])
-                    except:
+                    except (ZeroDivisionError, KeyError, TypeError):
                         ratio = 0
 
                     pos_to_sell = sell_amount  # Amount to sell in risk-off scenario

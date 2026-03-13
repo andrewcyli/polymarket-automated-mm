@@ -235,25 +235,25 @@ def process_single_row(row, client):
     ret['rewards_daily_rate'] = rate
     try:
         book = client.get_order_book(token1)
-    except:
+    except Exception:
         book = type('obj', (object,), {'bids': [], 'asks': []})()
     bids = pd.DataFrame()
     asks = pd.DataFrame()
     try:
         bids = pd.DataFrame(book.bids).astype(float)
-    except:
+    except (ValueError, TypeError, KeyError):
         pass
     try:
         asks = pd.DataFrame(book.asks).astype(float)
-    except:
+    except (ValueError, TypeError, KeyError):
         pass
     try:
         ret['best_bid'] = bids.iloc[-1]['price'] if not bids.empty else 0
-    except:
+    except (IndexError, KeyError):
         ret['best_bid'] = 0
     try:
         ret['best_ask'] = asks.iloc[-1]['price'] if not asks.empty else 0
-    except:
+    except (IndexError, KeyError):
         ret['best_ask'] = 0
     ret['midpoint'] = (ret['best_bid'] + ret['best_ask']) / 2
     if ret['midpoint'] == 0 or pd.isna(ret['midpoint']):
@@ -284,13 +284,13 @@ def process_single_row(row, client):
     try:
         ret_bid = add_formula_params(bids_df, ret['midpoint'], v, rate)
         best_bid_reward = round(ret_bid['reward_per_100'].max(), 2) if not ret_bid.empty else 0
-    except:
+    except Exception:
         pass
     best_ask_reward = 0
     try:
         ret_ask = add_formula_params(asks_df, ret['midpoint'], v, rate)
         best_ask_reward = round(ret_ask['reward_per_100'].max(), 2) if not ret_ask.empty else 0
-    except:
+    except Exception:
         pass
     ret['bid_reward_per_100'] = best_bid_reward
     ret['ask_reward_per_100'] = best_ask_reward
@@ -385,7 +385,7 @@ def add_volatility_to_df(df, max_workers=3):
         try:
             ret = add_volatility(row.to_dict())
             return ret
-        except:
+        except Exception:
             logger.error(f"Error fetching volatility for row {idx}", exc_info=True)
             return None
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
